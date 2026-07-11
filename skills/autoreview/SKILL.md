@@ -35,7 +35,7 @@ Use when:
 - Do not kill a review just because it has been quiet for 2-5 minutes, or because it is still running under the 30-minute window. Inspect the process only after missing multiple expected heartbeats, after 30 minutes, or after an obviously failed subprocess; prefer letting the same helper command finish.
 - Tools are useful in review mode. Codex receives the validated bundle in an empty workspace so ignored files and linked-worktree metadata remain unreadable; web search stays available for dependency contracts and upstream docs.
 - Security perspective is always included, but it should not cripple legitimate functionality. Report security findings only when the change creates a concrete, actionable risk or removes an important safety check.
-- Reviewer subprocesses preserve authentication and proxy variables needed by headless or restricted-network environments while stripping process-injection and Git override variables.
+- Reviewer subprocesses preserve engine authentication and non-credentialed proxy variables needed by headless or restricted-network environments while stripping process-injection, Git override, and credentialed proxy values.
 - Review bundles fail closed before engine invocation when tracked or untracked paths look sensitive, patch text looks secret-like, or a Git diff exceeds the bundle limit. Redact/split the change; never accept a truncated patch as complete review proof.
 - For regression provenance, keep roles separate: blamed code author, blamed PR author, PR merger/committer, current PR author, and PR/date. If no blamed PR is traceable, use the blamed commit as the provenance: commit SHA, date, and author username. Do not guess a merger or frame missing PR metadata as a separate finding.
 - If the blamed PR was merged by `clawsweeper[bot]` or another automation, identify the human trigger when practical. Check timeline/comments first; if rate-limited, use gitcrawl/cache or public PR HTML. Look for maintainer commands such as `@clawsweeper automerge`, `/landpr`, or labels/status comments that armed automerge. Report `automerge triggered by @login`; if not found, say trigger unknown.
@@ -110,6 +110,27 @@ export AUTOREVIEW_HARNESS="$AGENTS_HOME/skills/autoreview/scripts/test-review-ha
 ```
 
 When using Claude Code, set `AGENTS_HOME="$HOME/.claude"` for global skills. Project-local skills live under `.claude/skills/` in the current repo.
+
+On native Windows, choose the matching pair:
+
+```powershell
+# Project-local skill in the current repo:
+$AUTOREVIEW = ".agents\skills\autoreview\scripts\autoreview"
+$AUTOREVIEW_HARNESS = ".agents\skills\autoreview\scripts\test-review-harness.ps1"
+```
+
+```powershell
+# Source checkout of openclaw/agent-skills:
+$AUTOREVIEW = "skills\autoreview\scripts\autoreview"
+$AUTOREVIEW_HARNESS = "skills\autoreview\scripts\test-review-harness.ps1"
+```
+
+```powershell
+# Global skill:
+$AgentsHome = if ($env:AGENTS_HOME) { $env:AGENTS_HOME } else { Join-Path $HOME ".agents" }
+$AUTOREVIEW = Join-Path $AgentsHome "skills\autoreview\scripts\autoreview"
+$AUTOREVIEW_HARNESS = Join-Path $AgentsHome "skills\autoreview\scripts\test-review-harness.ps1"
+```
 
 ## Pick Target
 
@@ -279,17 +300,17 @@ Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effo
 
 When autoreview runs inside the repository under review, external reviewer CLIs must not load project-local trust or configuration that the branch controls.
 
-| Engine       | Isolation flags                                                                                                                                           | Reference                                                                   |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **codex**    | Auth-only config overrides, isolated workspace, `exec --ignore-user-config --ignore-rules --skip-git-repo-check`, plus read-only sandbox                  | Codex CLI `exec --help`                                                     |
-| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*`; filesystem/shell tools disabled, optional web tools only (`v2.1.169+`) | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference)  |
-| **droid**    | Fails closed: current CLI cannot disable both project instructions and all tools                                                                          | Droid CLI `exec --help` and `--list-tools`                                  |
-| **copilot**  | Fails closed: repository read tools also expose ignored files outside the reviewed bundle                                                                 | GitHub Copilot CLI command reference                                        |
-| **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                   | Pi CLI `--help`; requires Pi `v0.79.0+`                                     |
-| **opencode** | Fails closed: project/global config isolation and private-network fetch denial are not both proven                                                        | OpenCode CLI contract                                                       |
-| **cursor**   | Fails closed: documented read permissions can target absolute host paths and no proven repository-only filesystem sandbox is exposed                      | Cursor CLI [permissions](https://cursor.com/docs/cli/reference/permissions) |
+| Engine       | Isolation flags                                                                                                                                        | Reference                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| **codex**    | Auth-only config overrides, isolated workspace, `exec --ignore-user-config --ignore-rules --skip-git-repo-check`, plus read-only sandbox               | Codex CLI `exec --help`                                                     |
+| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*`; filesystem/shell tools disabled, WebSearch by default (`v2.1.169+`) | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference)  |
+| **droid**    | Fails closed: current CLI cannot disable both project instructions and all tools                                                                       | Droid CLI `exec --help` and `--list-tools`                                  |
+| **copilot**  | Fails closed: repository read tools also expose ignored files outside the reviewed bundle                                                              | GitHub Copilot CLI command reference                                        |
+| **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                | Pi CLI `--help`; requires Pi `v0.79.0+`                                     |
+| **opencode** | Fails closed: project/global config isolation and private-network fetch denial are not both proven                                                     | OpenCode CLI contract                                                       |
+| **cursor**   | Fails closed: documented read permissions can target absolute host paths and no proven repository-only filesystem sandbox is exposed                   | Cursor CLI [permissions](https://cursor.com/docs/cli/reference/permissions) |
 
-Codex `--ignore-user-config` skips config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication usable without forwarding unrelated user configuration. Codex runs in an empty temporary workspace: the validated bundle is its sole repository input, ignored files and linked-worktree metadata remain unreadable, and the zero project-doc budget keeps workspace instructions out of the prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; autoreview supplies only WebSearch/WebFetch when web search is enabled and no filesystem or shell tools. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. Droid, Copilot, Cursor, and OpenCode fail closed because their current CLI contracts cannot isolate untrusted review input from host, project, or private-network trust surfaces.
+Codex `--ignore-user-config` skips config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication usable without forwarding unrelated user configuration. Codex runs in an empty temporary workspace: the validated bundle is its sole repository input, ignored files and linked-worktree metadata remain unreadable, and the zero project-doc budget keeps workspace instructions out of the prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; autoreview supplies WebSearch by default, permits only explicitly domain-constrained WebFetch rules, and exposes no filesystem or shell tools. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. Droid, Copilot, Cursor, and OpenCode fail closed because their current CLI contracts cannot isolate untrusted review input from host, project, or private-network trust surfaces.
 
 Codex uses a named permission profile that grants read access only to an empty temporary workspace. This is narrower than repository-root access, which would expose ignored credentials, and narrower than the legacy `read-only` sandbox, which permits reads across the host filesystem.
 
@@ -314,13 +335,13 @@ The smoke harness has thin shell wrappers over a shared Python implementation:
 On native Windows, invoke the extensionless Python helper through Python:
 
 ```powershell
-python skills\autoreview\scripts\autoreview --help
+python $AUTOREVIEW --help
 ```
 
 and the smoke harness:
 
 ```powershell
-skills\autoreview\scripts\test-review-harness.ps1 -Fixture benign -Engine codex
+& $AUTOREVIEW_HARNESS -Fixture benign -Engine codex
 ```
 
 The helper:
@@ -339,8 +360,8 @@ The helper:
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, plus per-engine `--model`, `--thinking`, and Claude `--fallback-model`
 - uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus `claude=claude-fable-5`; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
-- gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus optional web tools, and Pi receives the bundle with no tools
-- runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP disabled, web-only tools, and `--fallback-model` when set
+- gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools
+- runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP disabled, no filesystem/shell tools, and `--fallback-model` when set
 - refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
 - runs Pi `v0.79.0+` from neutral temporary directories with `--no-approve`, `--no-session`, disabled Pi context/resource loading, and `--no-tools` because its built-in read tools are not repository-confined
 - prints `review still running: <engine> elapsed=<seconds>s pid=<pid>` to stderr at long-running intervals while waiting for the selected review engine, unless streamed output or compact Codex activity has been visible recently

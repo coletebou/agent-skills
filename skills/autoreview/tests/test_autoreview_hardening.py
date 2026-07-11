@@ -59,8 +59,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
 
+    def test_powershell_harness_exposes_runnable_engines_only(self) -> None:
+        harness = SCRIPT.with_name("test-review-harness.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("[ValidateSet('codex', 'claude', 'pi')]", harness)
+        for disabled_engine in ("droid", "copilot", "opencode", "cursor"):
+            self.assertNotIn(f"'{disabled_engine}'", harness)
+
     def test_local_bundle_blocks_sensitive_untracked_file(self) -> None:
-        for rel in (".env", "tokens/session.dat"):
+        for rel in (".env", "tokens/session.dat", "secrets/local.py"):
             with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 path = repo / rel
@@ -79,6 +86,44 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertIn("## image.bin\n[binary file omitted]", bundle)
             self.assertFalse(truncated)
+
+    def test_untracked_files_respect_trusted_global_excludes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            home = root / "home"
+            home.mkdir()
+            excludes = root / "global-ignore"
+            excludes.write_text(
+                "ignored.local\n!settings.local\n",
+                encoding="utf-8",
+            )
+            (home / ".gitconfig").write_text(
+                f"[core]\n\texcludesFile = {excludes.as_posix()}\n",
+                encoding="utf-8",
+            )
+            (repo / "ignored.local").write_text("private notes\n", encoding="utf-8")
+            (repo / ".gitignore").write_text("settings.local\n", encoding="utf-8")
+            (repo / "settings.local").write_text("repo private\n", encoding="utf-8")
+            git(repo, "add", ".gitignore")
+            (repo / "visible.txt").write_text("review me\n", encoding="utf-8")
+            (repo / "hostile-gitconfig").write_text(
+                "[core]\n\texcludesFile = /does/not/exist\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(home),
+                    "USERPROFILE": str(home),
+                    "GIT_CONFIG_GLOBAL": str(repo / "hostile-gitconfig"),
+                },
+            ):
+                self.assertEqual(
+                    self.helper["safe_untracked_files"](repo),
+                    ["hostile-gitconfig", "visible.txt"],
+                )
 
     def test_oversized_text_is_rejected_without_scanning_binary_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -213,7 +258,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
-    def test_sensitive_named_source_directories_are_reviewable_untracked(self) -> None:
+    def test_sensitive_named_source_directories_are_blocked_untracked(self) -> None:
         for rel in (
             "credentials/prod.py",
             "secrets/runtime.ts",
@@ -221,7 +266,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "src/secrets/scanner.ts",
         ):
             with self.subTest(rel=rel):
-                self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
+                self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
 
     def test_tracked_env_variants_remain_sensitive(self) -> None:
         for rel in (
@@ -290,6 +335,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_handles_private_key_header_variants(self) -> None:
+        for content in (
+            "-----BEGIN " + "ENCRYPTED PRIVATE KEY-----",
+            "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_allows_dotted_config_keys(self) -> None:
         self.assertFalse(
             self.helper["secret_text_risk"](
@@ -318,6 +371,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "token = process.env.GITHUB_TOKEN",
             'token = os.environ["GITHUB_TOKEN"]',
             'password = payload.get("password")',
+            "token = auth_response.credentials.access_token",
+            "token = response.authentication.accessToken",
+            "password = account.credentials.password",
+            "api_key = client.settings.apiKey",
+            'token = "$GITHUB_TOKEN"',
+            'token = "$env:GITHUB_TOKEN"',
+            'token = "${{ secrets.GITHUB_TOKEN }}"',
             'token_endpoint = "https://accounts.example.com/oauth2/token"',
             'password_policy = "minimum-twelve-characters"',
         ):
@@ -349,6 +409,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "to" + "ken=prod.opaquecredentialvalue",
             "to" + "ken=TOKEN_FROM_ENVIRONMENT_SECRET",
             "to" + "ken: prod.A7f9K2m4Q8v6N3x5R1p0T9z8 (production)",
+            "pass" + "word=correct.horse.battery.password",
+            "pass" + "word=Correct.horse.battery.staple",
+            "pass" + "word=\"${{ 'Correct.horse.battery.staple' }}\"",
+            "pass" + "word=\"{{ 'Correct.horse.battery.staple' }}\"",
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
@@ -704,6 +768,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["OPENROUTER_API_KEY"] = "test-provider-key"
                 os.environ["GITHUB_TOKEN"] = "test-token-placeholder"
                 os.environ["HTTPS_PROXY"] = "http://proxy.example.invalid:8080"
+                os.environ["HTTP_PROXY"] = (
+                    "http://review-user:review-password@proxy.example.invalid:8080"
+                )
+                os.environ["ALL_PROXY"] = (
+                    "socks5://review-user:review-password@proxy.example.invalid:1080"
+                )
                 os.environ["DO_NOT_TRACK"] = "1"
                 os.environ["DISABLE_TELEMETRY"] = "1"
                 os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
@@ -734,6 +804,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertNotIn("COPILOT_ALLOW_ALL", env)
                 self.assertNotIn("GITHUB_TOKEN", env)
                 self.assertEqual(env["HTTPS_PROXY"], "http://proxy.example.invalid:8080")
+                self.assertNotIn("HTTP_PROXY", env)
+                self.assertNotIn("ALL_PROXY", env)
                 self.assertEqual(env["DO_NOT_TRACK"], "1")
                 self.assertEqual(env["DISABLE_TELEMETRY"], "1")
                 self.assertEqual(env["CODEX_HOME"], "/tmp/codex-auth")
@@ -783,6 +855,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+
+    def test_safe_proxy_url_accepts_credential_free_formats(self) -> None:
+        for value in (
+            "http://proxy.example.invalid:8080",
+            "proxy.example.invalid:8080",
+            "socks4://proxy.example.invalid",
+            "socks4a://proxy.example.invalid",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self.helper["safe_proxy_url"](value))
+
+        for value in (
+            "http://review-user:review-password@proxy.example.invalid:8080",
+            "socks5://review-user:review-password@proxy.example.invalid:1080",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self.helper["safe_proxy_url"](value))
 
     def test_codex_env_rejects_executable_dbus_transport(self) -> None:
         old = os.environ.copy()
@@ -1143,6 +1232,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         args.claude_allowed_tools = "Read"
         with self.assertRaisesRegex(SystemExit, "not read-only"):
+            self.helper["claude_tool_inventory"](args)
+
+        args.web_search = True
+        args.claude_allowed_tools = "WebFetch"
+        with self.assertRaisesRegex(SystemExit, "one explicit domain"):
             self.helper["claude_tool_inventory"](args)
 
     def test_self_test_shortcut_runs_deterministic_checks(self) -> None:
