@@ -859,6 +859,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_allows_short_spaced_calls(self) -> None:
+        self.assertFalse(
+            self.helper["secret_text_risk"]("to" + "ken = mint_token ()")
+        )
+
     def test_secret_detector_rejects_ambiguous_bare_values(self) -> None:
         for content in (
             "pass" + "word=CORRECTHORSEBATTERYSTAPLE",
