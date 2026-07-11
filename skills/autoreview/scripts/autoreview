@@ -22,7 +22,7 @@ from typing import Any, Callable
 ENGINES = ("codex", "claude", "droid", "copilot", "pi", "opencode", "cursor")
 ENGINE_ALIASES = {"cursor-agent": "cursor"}
 ENGINE_CHOICES = (*ENGINES, *ENGINE_ALIASES)
-ALL_REVIEWERS = ("codex", "claude", "pi", "opencode")
+ALL_REVIEWERS = ("codex", "claude", "pi")
 SAFE_GIT_CONFIG_ARGS = (
     "-c",
     "core.fsmonitor=false",
@@ -172,7 +172,26 @@ SECRET_PLACEHOLDER_VALUES = {
     "secret-token",
     "test-auth-token",
     "test-token-placeholder",
+    "token-oversized",
+    "clawrouter-e2e-secret",
+    "very-long-browser-token-0123456789",
 }
+QUOTED_SECRET_REFERENCE_PATTERNS = (
+    re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$"),
+    re.compile(r"^\{\{.+\}\}$"),
+    re.compile(r"^op://"),
+)
+UNQUOTED_SECRET_REFERENCE_PATTERNS = (
+    *QUOTED_SECRET_REFERENCE_PATTERNS,
+    re.compile(
+        r"^(?:process\.env|os\.environ|env|cfg|config|params|payload|provider)"
+        r"(?:[.\[].*)$"
+    ),
+)
+SECRET_ALLOWLIST_MARKERS = (
+    "pragma: allowlist secret",
+    "gitleaks:allow",
+)
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 MULTI_PROVIDER_CREDENTIAL_SUFFIXES = (
     "_ACCESS_TOKEN",
@@ -420,6 +439,17 @@ def external_env_path_value(repo: Path, key: str, value: str) -> bool:
     )
 
 
+def safe_dbus_session_address(repo: Path, value: str) -> bool:
+    match = re.fullmatch(
+        r"unix:path=(?P<path>[^,;%]+)(?:,guid=[0-9a-fA-F]+)?",
+        value,
+    )
+    if not match:
+        return False
+    path = match.group("path")
+    return Path(path).is_absolute() and external_env_path(repo, path)
+
+
 def safe_engine_env(
     repo: Path,
     extra_paths: list[Path] | None = None,
@@ -579,6 +609,12 @@ def safe_engine_env(
         if value and external_env_path(repo, value):
             env[key] = value
     if engine == "codex":
+        dbus_address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        if dbus_address and safe_dbus_session_address(repo, dbus_address):
+            env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
+        xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg_runtime_dir and external_env_path(repo, xdg_runtime_dir):
+            env["XDG_RUNTIME_DIR"] = xdg_runtime_dir
         for key in CODEX_TRUST_PATH_ENV_KEYS:
             value = os.environ.get(key)
             if value and external_env_path_value(repo, key, value):
@@ -722,10 +758,10 @@ def opencode_review_config(web_search: bool = True) -> dict[str, Any]:
     }
     if web_search:
         permission["websearch"] = "allow"
-        permission["webfetch"] = "allow"
     else:
         permission["websearch"] = "deny"
-        permission["webfetch"] = "deny"
+    # Generic fetches can reach loopback, private, link-local, or metadata endpoints.
+    permission["webfetch"] = "deny"
     return {
         "$schema": "https://opencode.ai/config.json",
         "autoupdate": False,
@@ -1110,11 +1146,22 @@ def secret_text_risk(text: str) -> bool:
     if any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS):
         return True
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line = text[line_start : line_end if line_end >= 0 else len(text)].lower()
+        if any(marker in line for marker in SECRET_ALLOWLIST_MARKERS):
+            continue
         raw_value = match.group("value")
         quoted = raw_value.startswith(("\"", "'"))
         value = raw_value.strip("\"'")
-        lowered = value.lower()
-        if lowered in SECRET_PLACEHOLDER_VALUES:
+        if value.lower() in SECRET_PLACEHOLDER_VALUES:
+            continue
+        reference_patterns = (
+            QUOTED_SECRET_REFERENCE_PATTERNS
+            if quoted
+            else UNQUOTED_SECRET_REFERENCE_PATTERNS
+        )
+        if any(pattern.fullmatch(value) for pattern in reference_patterns):
             continue
         call_target = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value)
         if not quoted and call_target and text[match.end() :].startswith("("):
@@ -1170,7 +1217,6 @@ def sensitive_repo_path_risk(rel: str) -> str | None:
     if (
         path_has_sensitive_part(normalized)
         or credential_store_path(normalized)
-        or secret_directory_path(normalized)
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
@@ -1195,16 +1241,30 @@ def credential_store_path(normalized: str) -> bool:
         TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part)
         for part in path.parts[:-1]
     )
-    return credential_directory and not skill_instruction_path(path)
-
-
-def secret_directory_path(normalized: str) -> bool:
-    path = Path(normalized)
-    secret_directory = any(
-        part.lower() == "secrets"
-        for part in path.parts[:-1]
-    )
-    return secret_directory and not skill_instruction_path(path)
+    credential_data_file = path.suffix.lower() not in {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".go",
+        ".h",
+        ".hpp",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".mjs",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".sh",
+        ".swift",
+        ".ts",
+        ".tsx",
+        ".vue",
+    }
+    return credential_directory and credential_data_file and not skill_instruction_path(path)
 
 
 def skill_instruction_path(path: Path) -> bool:
@@ -1224,7 +1284,6 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
         or parts & TRACKED_SENSITIVE_PATH_PARTS
         or credential_store_path(normalized)
-        or secret_directory_path(normalized)
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
@@ -1733,7 +1792,7 @@ def codex_auth_config_flags(repo: Path) -> list[str]:
 
 
 def codex_exec_isolation_flags() -> list[str]:
-    return ["--ignore-user-config", "--ignore-rules"]
+    return ["--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]
 
 
 def claude_review_isolation_flags() -> list[str]:
@@ -1916,12 +1975,13 @@ def codex_model_access_failure(result: subprocess.CompletedProcess[str], model: 
 
 def codex_command(
     args: argparse.Namespace,
-    repo: Path,
+    source_repo: Path,
+    review_root: Path,
     schema_path: Path,
     output_path: Path,
     model: str | None,
 ) -> list[str]:
-    cmd = [resolve_command(args.codex_bin, repo), "--ask-for-approval", "never"]
+    cmd = [resolve_command(args.codex_bin, source_repo), "--ask-for-approval", "never"]
     if args.web_search:
         cmd.append("--search")
     if model:
@@ -1936,8 +1996,8 @@ def codex_command(
     speed_override = codex_speed_override(args)
     if speed_override is not None:
         cmd.extend(["-c", speed_override])
-    cmd.extend(codex_config_isolation_flags(repo))
-    cmd.extend(codex_auth_config_flags(repo))
+    cmd.extend(codex_config_isolation_flags(review_root))
+    cmd.extend(codex_auth_config_flags(source_repo))
     cmd.append("exec")
     if args.stream_engine_output:
         cmd.append("--json")
@@ -1946,7 +2006,7 @@ def codex_command(
             *codex_exec_isolation_flags(),
             "--ephemeral",
             "-C",
-            str(repo),
+            str(review_root),
             "--output-schema",
             str(schema_path),
             "--output-last-message",
@@ -1969,45 +2029,58 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         models.append(fallback_model)
     primary_failure: subprocess.CompletedProcess[str] | None = None
     try:
-        for index, model in enumerate(models):
-            output_path.write_text("")
-            cmd = codex_command(args, repo, schema_path, output_path, model)
-            result = run_with_heartbeat(
-                cmd,
-                repo,
-                input_text=prompt,
-                label="codex",
-                stream_output=args.stream_engine_output,
-                stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
-                env=safe_engine_env(
+        # The validated bundle is the sole repository input. The empty
+        # workspace keeps ignored credentials and linked-worktree metadata
+        # outside the model's readable filesystem boundary.
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace.") as tempdir:
+            review_root = Path(tempdir)
+            for index, model in enumerate(models):
+                output_path.write_text("")
+                cmd = codex_command(
+                    args,
                     repo,
-                    [Path(cmd[0]).parent],
-                    engine="codex",
-                ),
-            )
-            output = output_path.read_text()
-            if result.returncode == 0:
-                return output or result.stdout
-            if (
-                index == 0
-                and len(models) > 1
-                and model
-                and codex_model_access_failure(result, model)
-            ):
-                primary_failure = result
-                print(
-                    f"codex model {model} is unavailable for this account; retrying with {models[1]}",
-                    file=sys.stderr,
+                    review_root,
+                    schema_path,
+                    output_path,
+                    model,
                 )
-                continue
-            detail = result.stderr or result.stdout
-            if primary_failure is not None:
-                primary_detail = primary_failure.stderr or primary_failure.stdout
-                raise SystemExit(
-                    f"codex engine failed with primary model ({primary_failure.returncode})\n{primary_detail}\n"
-                    f"codex fallback model failed ({result.returncode})\n{detail}"
+                result = run_with_heartbeat(
+                    cmd,
+                    review_root,
+                    input_text=prompt,
+                    label="codex",
+                    stream_output=args.stream_engine_output,
+                    stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+                    env=safe_engine_env(
+                        repo,
+                        [Path(cmd[0]).parent],
+                        engine="codex",
+                    ),
+                    resolve_root=repo,
                 )
-            raise SystemExit(f"codex engine failed ({result.returncode})\n{detail}")
+                output = output_path.read_text()
+                if result.returncode == 0:
+                    return output or result.stdout
+                if (
+                    index == 0
+                    and len(models) > 1
+                    and model
+                    and codex_model_access_failure(result, model)
+                ):
+                    primary_failure = result
+                    print(
+                        f"codex model {model} is unavailable for this account; retrying with {models[1]}",
+                        file=sys.stderr,
+                    )
+                    continue
+                detail = result.stderr or result.stdout
+                if primary_failure is not None:
+                    primary_detail = primary_failure.stderr or primary_failure.stdout
+                    raise SystemExit(
+                        f"codex engine failed with primary model ({primary_failure.returncode})\n{primary_detail}\n"
+                        f"codex fallback model failed ({result.returncode})\n{detail}"
+                    )
+                raise SystemExit(f"codex engine failed ({result.returncode})\n{detail}")
     finally:
         schema_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
@@ -2089,27 +2162,11 @@ def build_opencode_cmd(args: argparse.Namespace, repo: Path) -> list[str]:
 
 
 def run_opencode(args: argparse.Namespace, repo: Path, prompt: str) -> str:
-    if not args.tools:
-        raise SystemExit("--no-tools is not supported by the opencode engine")
-    cmd = build_opencode_cmd(args, repo)
-    with tempfile.TemporaryDirectory(prefix="autoreview-opencode-run.") as tempdir:
-        result = run_with_heartbeat(
-            cmd,
-            Path(tempdir),
-            input_text=prompt,
-            label="opencode",
-            stream_output=args.stream_engine_output,
-            env=safe_engine_env(
-                repo,
-                [Path(cmd[0]).parent],
-                opencode_review_env(args.web_search),
-                engine="opencode",
-            ),
-            resolve_root=repo,
-        )
-    if result.returncode != 0:
-        raise SystemExit(f"opencode engine failed ({result.returncode})\n{result.stderr or result.stdout}")
-    return result.stdout
+    raise SystemExit(
+        "opencode engine is unavailable: the current CLI contract does not prove "
+        "project-config isolation and its generic fetch tool cannot be restricted "
+        "away from private or metadata endpoints; use codex, claude, or pi"
+    )
 
 
 def cursor_local_mcp_paths(repo: Path) -> list[Path]:
@@ -3008,27 +3065,32 @@ def self_test_engine_isolation() -> int:
             run_codex(args, repo, "review hostile patch")
             codex_record = json.loads(record_path.read_text())
             codex_argv = codex_record["argv"]
-            expected_project_override = f"projects.{toml_quoted_key_segment(str(repo.resolve()))}.trust_level=\"untrusted\""
             for required in [
                 "--ignore-user-config",
                 "--ignore-rules",
                 "project_doc_max_bytes=0",
-                expected_project_override,
                 'cli_auth_credentials_store="auto"',
                 'forced_login_method="chatgpt"',
                 'forced_chatgpt_workspace_id=["workspace-one", "workspace-two"]',
                 'default_permissions="autoreview"',
                 'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
                 "--ephemeral",
-                str(repo),
             ]:
                 if required not in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: missing {required}")
             for forbidden in ["hostile-user-model", "read-only"]:
                 if forbidden in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: leaked {forbidden}")
-            if Path(codex_record["cwd"]).resolve() != repo.resolve():
-                raise SystemExit("codex isolation self-test failed: wrong cwd")
+            codex_cwd = Path(codex_record["cwd"]).resolve()
+            if codex_cwd == repo.resolve() or is_within(codex_cwd, repo.resolve()):
+                raise SystemExit("codex isolation self-test failed: review ran inside hostile repo")
+            if str(repo) in codex_argv:
+                raise SystemExit("codex isolation self-test failed: hostile repo granted to tools")
+            expected_project_override = (
+                f"projects.{toml_quoted_key_segment(str(codex_cwd))}.trust_level=\"untrusted\""
+            )
+            if expected_project_override not in codex_argv:
+                raise SystemExit("codex isolation self-test failed: isolated project override missing")
 
             run_claude(args, repo, "review hostile patch")
             claude_record = json.loads(record_path.read_text())
@@ -3067,31 +3129,17 @@ def self_test_engine_isolation() -> int:
                 if Path(entry["cwd"]).resolve() == repo.resolve():
                     raise SystemExit("pi isolation self-test failed: probe ran inside hostile repo")
 
-            run_opencode(args, repo, "review hostile patch")
-            opencode_record = json.loads(record_path.read_text())
-            opencode_argv = opencode_record["argv"]
-            for required in ["run", "--dir", str(repo), "--pure", "--format", "json"]:
-                if required not in opencode_argv:
-                    raise SystemExit(f"opencode isolation self-test failed: missing {required}")
-            if "--dangerously-skip-permissions" in opencode_argv:
-                raise SystemExit("opencode isolation self-test failed: skip-permissions present")
-            if Path(opencode_record["cwd"]).resolve() == repo.resolve():
-                raise SystemExit("opencode isolation self-test failed: review ran inside hostile repo")
-            if opencode_record["stdin"] != "review hostile patch":
-                raise SystemExit("opencode isolation self-test failed: prompt not delivered over stdin")
-            if "review hostile patch" in opencode_argv:
-                raise SystemExit("opencode isolation self-test failed: prompt leaked into argv")
-            opencode_env = opencode_record["env"]
-            if opencode_env.get("OPENCODE_DISABLE_PROJECT_CONFIG") != "1":
-                raise SystemExit("opencode isolation self-test failed: project config env missing")
-            if opencode_env.get("OPENCODE_DISABLE_AUTOUPDATE") != "1":
-                raise SystemExit("opencode isolation self-test failed: autoupdate env missing")
-            config = json.loads(opencode_env["OPENCODE_CONFIG_CONTENT"])
-            if config.get("instructions") != [] or config.get("plugin") != [] or config.get("command") != {}:
-                raise SystemExit("opencode isolation self-test failed: project-controlled extensions not cleared")
-            for disabled_tool in ("bash", "edit", "skill", "task", "todowrite", "write"):
-                if config.get("tools", {}).get(disabled_tool) is not False:
-                    raise SystemExit(f"opencode isolation self-test failed: {disabled_tool} tool not disabled")
+            if record_path.exists():
+                record_path.unlink()
+            try:
+                run_opencode(args, repo, "review hostile patch")
+            except SystemExit as exc:
+                if "opencode engine is unavailable" not in str(exc):
+                    raise
+            else:
+                raise SystemExit("opencode isolation self-test failed: unsafe engine was allowed")
+            if record_path.exists():
+                raise SystemExit("opencode isolation self-test failed: disabled engine was invoked")
             if hostile_ps_path.exists():
                 raise SystemExit("heartbeat metrics isolation self-test failed: repo-local ps executed")
 
@@ -3332,8 +3380,8 @@ def _assert_opencode_permission(web_search: bool) -> None:
     expected_web = "allow" if web_search else "deny"
     if permission.get("websearch") != expected_web:
         raise SystemExit(f"opencode isolation self-test failed: websearch must be {expected_web} when web_search={web_search}")
-    if permission.get("webfetch") != expected_web:
-        raise SystemExit(f"opencode isolation self-test failed: webfetch must be {expected_web} when web_search={web_search}")
+    if permission.get("webfetch") != "deny":
+        raise SystemExit("opencode isolation self-test failed: webfetch must stay denied")
 
 
 def self_test_opencode_isolation() -> None:

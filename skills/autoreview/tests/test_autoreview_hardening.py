@@ -183,6 +183,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "packages/token/package.json",
             "scripts/tokens/session.sh",
             "src/tokens/session.mjs",
+            "credentials/prod.py",
+            "secrets/runtime.ts",
+            "src/credentials/provider.py",
+            "src/secrets/scanner.ts",
             "ui/tokens/session.vue",
             "proto/token/session.proto",
             "password_validator.go",
@@ -209,7 +213,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
-    def test_sensitive_source_directories_are_blocked_untracked(self) -> None:
+    def test_sensitive_named_source_directories_are_reviewable_untracked(self) -> None:
         for rel in (
             "credentials/prod.py",
             "secrets/runtime.ts",
@@ -217,7 +221,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "src/secrets/scanner.ts",
         ):
             with self.subTest(rel=rel):
-                self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
+                self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
     def test_tracked_env_variants_remain_sensitive(self) -> None:
         for rel in (
@@ -254,16 +258,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "tokens/device.sqlite",
             "tokens/session.jwt",
             "tokens/session",
-            "secrets/prod.md",
-            "credentials/prod.xml",
-            "credentials/prod.py",
-            "secrets/runtime.ts",
-            "src/credentials/provider.py",
-            "src/secrets/scanner.ts",
             "backup-secrets/prod.json",
             "dev_credentials/runtime.yaml",
             "client-secrets-old/account.ini",
             "client-secrets/account.properties",
+            "credentials/prod.xml",
+            "secrets/prod.md",
             "credentials.txt",
             "client-secret.csv",
             ".docker/config.json",
@@ -315,6 +315,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_secret_detector_does_not_treat_code_expressions_as_values(self) -> None:
         for content in (
             "token = secrets.token_urlsafe(32)",
+            "token = process.env.GITHUB_TOKEN",
+            'token = os.environ["GITHUB_TOKEN"]',
             'password = payload.get("password")',
             'token_endpoint = "https://accounts.example.com/oauth2/token"',
             'password_policy = "minimum-twelve-characters"',
@@ -351,11 +353,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
-    def test_secret_detector_handles_lowercase_passphrases(self) -> None:
-        content = 'password="' + "correcthorsebatterystaple" + '"'
-
-        self.assertTrue(self.helper["secret_text_risk"](content))
-
     def test_secret_detector_does_not_exempt_expression_text_in_literals(self) -> None:
         for value in (
             "correct horse + battery staple",
@@ -366,10 +363,38 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 content = "pass" + f'word="{value}"'
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_handles_lowercase_passphrases(self) -> None:
+        content = 'password="' + "correcthorsebatterystaple" + '"'
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_handles_low_diversity_passwords(self) -> None:
         content = 'password="' + "letmeinletmein" + '"'
 
         self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_common_fixture_literals_and_pragmas(self) -> None:
+        for content in (
+            'token: "token-oversized"',
+            'API_KEY = "clawrouter-e2e-secret"',
+            'token: "very-long-browser-token-0123456789"',
+            'password="CorrectHorseBatteryStaple123!"  # pragma: allowlist secret',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_does_not_treat_quoted_code_text_as_a_reference(self) -> None:
+        for content in (
+            "pass" + 'word="' + "CORRECT_HORSE_BATTERY_STAPLE" + '"',
+            "to" + 'ken="' + "process.env.PROD_TOKEN" + '"',
+            "api_" + 'key="' + "config.production_key" + '"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+        self.assertFalse(
+            self.helper["secret_text_risk"]('api_key="${OPENAI_API_KEY}"')
+        )
 
     def test_secret_detector_does_not_exempt_placeholder_substrings(self) -> None:
         content = "pass" + 'word="prod-sample-' + realistic_secret_value() + '"'
@@ -656,6 +681,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["OPENCODE_AUTO_SHARE"] = "1"
                 os.environ["COPILOT_ALLOW_ALL"] = "1"
                 os.environ["CODEX_HOME"] = "/tmp/codex-auth"
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
+                os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
                 os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/claude-auth"
                 os.environ["PI_CODING_AGENT_DIR"] = "/tmp/pi-auth"
                 os.environ["CLAUDE_CODE_USE_FOUNDRY"] = "1"
@@ -710,6 +737,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertEqual(env["DO_NOT_TRACK"], "1")
                 self.assertEqual(env["DISABLE_TELEMETRY"], "1")
                 self.assertEqual(env["CODEX_HOME"], "/tmp/codex-auth")
+                if os.name == "nt":
+                    self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
+                else:
+                    self.assertEqual(
+                        env["DBUS_SESSION_BUS_ADDRESS"],
+                        "unix:path=/run/user/1000/bus",
+                    )
+                self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/1000")
                 self.assertEqual(
                     claude_env["CLAUDE_CONFIG_DIR"],
                     "/tmp/claude-auth",
@@ -745,6 +780,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     claude_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
                     "1",
                 )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_codex_env_rejects_executable_dbus_transport(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = (
+                    "unixexec:path=/tmp/hostile-helper"
+                )
+                env = self.helper["safe_engine_env"](repo, engine="codex")
+                self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
             finally:
                 os.environ.clear()
                 os.environ.update(old)

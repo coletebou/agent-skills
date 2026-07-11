@@ -125,22 +125,11 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 os.environ[key] = value
         cls.home_dir.cleanup()
 
-    def test_harness_opts_both_cursor_aliases_into_trusted_fixture(self) -> None:
+    def test_harness_rejects_disabled_cursor_engine(self) -> None:
         harness_path = SCRIPT_PATH.with_name("test-review-harness.py")
         namespace = runpy.run_path(str(harness_path))
-        commands: list[list[str]] = []
-        run_reviews = namespace["run_reviews"]
-        with mock.patch.dict(
-            run_reviews.__globals__,
-            {
-                "run": lambda command, _cwd: commands.append(command),
-                "validate_prompt_policy": lambda _repo, _autoreview: None,
-            },
-        ), tempfile.TemporaryDirectory(prefix="autoreview-harness-test.") as tmpdir:
-            run_reviews(Path(tmpdir), SCRIPT_PATH.parent, "benign", ["cursor", "cursor-agent"])
-        self.assertEqual(len(commands), 2)
-        for command in commands:
-            self.assertIn("--cursor-allow-workspace-instructions", command)
+        with self.assertRaises(SystemExit):
+            namespace["parse_args"](["--engine", "cursor"])
 
     def test_cursor_agent_bin_cli_alias(self) -> None:
         with mock.patch.object(
@@ -219,6 +208,62 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(json.loads(output), FINAL_REPORT)
         self.assertEqual(models, ["gpt-5.6-sol", "gpt-5.6-terra"])
+
+    def test_codex_runs_outside_repo_with_bundle_only_workspace(self) -> None:
+        args = argparse.Namespace(
+            codex_bin="codex",
+            codex_config=None,
+            codex_speed=None,
+            fallback_model=None,
+            model="gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
+            tools=True,
+            web_search=False,
+        )
+        observed: dict[str, object] = {}
+
+        def fake_run(
+            command: list[str],
+            cwd: Path,
+            *_args: object,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            observed["cwd"] = cwd
+            observed["command_cwd"] = Path(command[command.index("-C") + 1])
+            observed["workspace_entries"] = list(cwd.iterdir())
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text(json.dumps(FINAL_REPORT))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir:
+            repo = Path(tmpdir)
+            (repo / ".env").write_text("OPENAI_API_KEY=ignored-secret\n")
+            with mock.patch.object(
+                AUTOREVIEW,
+                "resolve_command",
+                return_value="/usr/bin/codex",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "codex_auth_config_flags",
+                return_value=[],
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_run,
+            ):
+                output = AUTOREVIEW.run_codex(args, repo, "review")
+
+            self.assertEqual(json.loads(output), FINAL_REPORT)
+            observed_cwd = observed["cwd"]
+            command_cwd = observed["command_cwd"]
+            self.assertIsInstance(observed_cwd, Path)
+            self.assertIsInstance(command_cwd, Path)
+            assert isinstance(observed_cwd, Path)
+            assert isinstance(command_cwd, Path)
+            self.assertNotEqual(observed_cwd.resolve(), repo.resolve())
+            self.assertEqual(observed_cwd, command_cwd)
+            self.assertEqual(observed["workspace_entries"], [])
 
     def test_codex_does_not_fallback_after_unrelated_failure(self) -> None:
         args = argparse.Namespace(
