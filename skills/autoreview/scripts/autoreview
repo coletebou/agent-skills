@@ -1813,7 +1813,97 @@ def safe_secret_assignment_suffix(text: str, end: int) -> bool:
     return True
 
 
-def safe_secret_call_suffix(text: str, end: int) -> bool:
+def split_top_level_call_arguments(text: str) -> list[str]:
+    arguments: list[str] = []
+    start = 0
+    stack: list[str] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            index += 2
+        elif char == "/" and next_char == "*":
+            block_comment = True
+            index += 2
+        elif char in {'"', "'", "`"}:
+            quote = char
+            index += 1
+        elif char in pairs:
+            stack.append(pairs[char])
+            index += 1
+        elif stack and char == stack[-1]:
+            stack.pop()
+            index += 1
+        elif char == "," and not stack:
+            arguments.append(text[start:index])
+            start = index + 1
+            index += 1
+        else:
+            index += 1
+    arguments.append(text[start:])
+    return arguments
+
+
+def safe_credential_lookup_argument(
+    call_target: str,
+    argument: str,
+    argument_index: int,
+) -> bool:
+    if argument_index != 0:
+        return False
+    normalized_target = call_target.replace("?.", ".")
+    if (
+        normalized_target not in {"os.getenv", "os.environ.get"}
+        and not normalized_target.endswith(".headers.get")
+    ):
+        return False
+    match = re.fullmatch(r"\s*([\"'])([^\"'\r\n]+)\1\s*", argument)
+    if match is None:
+        return False
+    key = match.group(2)
+    return (
+        re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", key) is not None
+        or key.casefold() in {"authorization", "proxy-authorization"}
+    )
+
+
+def call_arguments_risk(arguments: str, call_target: str) -> bool:
+    return any(
+        not safe_credential_lookup_argument(call_target, argument, index)
+        and fallback_secret_risk(argument)
+        for index, argument in enumerate(split_top_level_call_arguments(arguments))
+    )
+
+
+def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
     if end >= len(text) or text[end] != "(":
         return False
 
@@ -1874,33 +1964,43 @@ def safe_secret_call_suffix(text: str, end: int) -> bool:
                 index += 1
         return None
 
-    def safe_call_end(start: int) -> int | None:
+    def safe_call_end(start: int, target: str) -> int | None:
         cursor = balanced_end(start, "(", ")")
         if cursor is None:
             return None
         arguments = text[start + 1 : cursor - 1]
-        return None if fallback_secret_risk(arguments) else cursor
+        return None if call_arguments_risk(arguments, target) else cursor
 
-    cursor = safe_call_end(end)
+    cursor = safe_call_end(end, call_target)
     if cursor is None:
         return False
+    chained_target = "<call-result>"
     while True:
         match = re.match(r"\s*(?:\?\.|\.)[A-Za-z_][A-Za-z0-9_]*", text[cursor:])
         if match is not None:
+            member = re.search(r"[A-Za-z_][A-Za-z0-9_]*$", match.group(0))
+            assert member is not None
+            chained_target = (
+                f"{chained_target}.{member.group(0)}"
+                if chained_target
+                else member.group(0)
+            )
             cursor += match.end()
             continue
         whitespace = re.match(r"\s*", text[cursor:])
         assert whitespace is not None
         call_start = cursor + whitespace.end()
         if call_start < len(text) and text[call_start] == "(":
-            cursor = safe_call_end(call_start)
+            cursor = safe_call_end(call_start, chained_target)
             if cursor is None:
                 return False
+            chained_target = "<call-result>"
             continue
         if call_start < len(text) and text[call_start] == "[":
             cursor = balanced_end(call_start, "[", "]")
             if cursor is None:
                 return False
+            chained_target = "<call-result>"
             continue
         return safe_secret_assignment_suffix(text, cursor)
 
@@ -1972,7 +2072,7 @@ def secret_text_risk(text: str) -> bool:
             value,
         )
         if not quoted and call_target and text[match.end() :].startswith("("):
-            if safe_secret_call_suffix(text, match.end()):
+            if safe_secret_call_suffix(text, match.end(), value):
                 continue
             return True
         if any(pattern.fullmatch(value) for pattern in reference_patterns):

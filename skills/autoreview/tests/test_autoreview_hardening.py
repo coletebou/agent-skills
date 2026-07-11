@@ -642,14 +642,36 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self,
     ) -> None:
         literal_value = "actual-production-" + "secret"
+        opaque_value = "CORRECT" + "HORSEBATTERYSTAPLE"
         for content in (
             "pass"
             + f'word = credentialProvider?.getPassword("{literal_value}")',
             "to"
             + f'ken = provider.issue_token("{literal_value}").strip()',
+            "to"
+            + f'ken = provider.issue_token("scope", "{literal_value}")',
+            "pass"
+            + f'word = os.getenv("DATABASE_PASSWORD", "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(this.#scope, "{literal_value}")',
+            "to"
+            + f'ken = factory.get("DATABASE_PASSWORD")("{literal_value}")',
+            "pass"
+            + 'word = client.get("CORRECT'
+            + 'HORSEBATTERYSTAPLE")',
+            "pass" + f'word = OS.GETENV("{opaque_value}")',
+            "pass" + f'word = factory().os.getenv("{opaque_value}")',
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_credential_lookup_keys(self) -> None:
+        for content in (
+            'pass' + 'word = os.getenv("DATABASE_PASSWORD")',
+            'to' + 'ken = request.headers.get("Authorization")',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_rejects_short_reference_fallback_literals(self) -> None:
         for expression in ("env.TOKEN", "getToken()"):
