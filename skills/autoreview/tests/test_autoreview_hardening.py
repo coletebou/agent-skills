@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import runpy
 import subprocess
@@ -71,6 +72,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertIn("## image.bin\n[binary file omitted]", bundle)
             self.assertFalse(truncated)
+
+    def test_full_file_secret_scan_blocks_truncated_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            tail_secret = "\ntoken=" + "A" * 24 + "\n"
+            content = "x" * (64_000 * 3 - 4) + tail_secret
+
+            untracked = repo / "untracked.txt"
+            untracked.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["safe_untracked_files"](repo)
+
+            untracked.unlink()
+            binary = repo / "binary.bin"
+            binary.write_bytes(b"\0" + content.encode())
+            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["safe_untracked_files"](repo)
+
+            binary.unlink()
+            evidence = repo / "evidence.txt"
+            evidence.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["validate_evidence_file"](repo, "evidence.txt", "--dataset")
 
     def test_branch_bundle_rejects_unsafe_or_unknown_base_before_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -418,6 +442,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["GIT_CONFIG_COUNT"] = "99"
                 os.environ["DYLD_INSERT_LIBRARIES"] = "/tmp/unsafe.dylib"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+                os.environ["GITHUB_TOKEN"] = "test-token-placeholder"
+                os.environ["HTTPS_PROXY"] = "http://proxy.example.invalid:8080"
 
                 env = self.helper["safe_engine_env"](repo)
 
@@ -428,9 +454,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
                 self.assertNotIn("DYLD_INSERT_LIBRARIES", env)
                 self.assertNotIn("NODE_OPTIONS", env)
+                self.assertEqual(env["GITHUB_TOKEN"], "test-token-placeholder")
+                self.assertEqual(env["HTTPS_PROXY"], "http://proxy.example.invalid:8080")
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+
+    def test_codex_isolation_restricts_tool_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            flags = self.helper["codex_config_isolation_flags"](repo)
+
+        for required in (
+            'shell_environment_policy.inherit="core"',
+            "shell_environment_policy.ignore_default_excludes=false",
+            "shell_environment_policy.experimental_use_profile=false",
+            "allow_login_shell=false",
+        ):
+            self.assertIn(required, flags)
+        set_flag = next(
+            flag for flag in flags if flag.startswith("shell_environment_policy.set=")
+        )
+        for key, value in self.helper["codex_tool_git_env"]().items():
+            self.assertIn(f"{key}={json.dumps(value)}", set_flag)
 
     def test_safe_engine_env_excludes_repo_local_path_entries(self) -> None:
         old_path = os.environ.get("PATH", "")
