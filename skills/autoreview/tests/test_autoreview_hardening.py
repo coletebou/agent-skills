@@ -638,6 +638,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_rejects_literal_secrets_in_call_arguments(
+        self,
+    ) -> None:
+        literal_value = "actual-production-" + "secret"
+        for content in (
+            "pass"
+            + f'word = credentialProvider?.getPassword("{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token("{literal_value}").strip()',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_rejects_short_reference_fallback_literals(self) -> None:
         for expression in ("env.TOKEN", "getToken()"):
             content = (

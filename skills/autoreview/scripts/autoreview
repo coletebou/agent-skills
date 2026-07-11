@@ -1872,7 +1872,14 @@ def safe_secret_call_suffix(text: str, end: int) -> bool:
                 index += 1
         return None
 
-    cursor = balanced_end(end, "(", ")")
+    def safe_call_end(start: int) -> int | None:
+        cursor = balanced_end(start, "(", ")")
+        if cursor is None:
+            return None
+        arguments = text[start + 1 : cursor - 1]
+        return None if fallback_secret_risk(arguments) else cursor
+
+    cursor = safe_call_end(end)
     if cursor is None:
         return False
     while True:
@@ -1884,7 +1891,7 @@ def safe_secret_call_suffix(text: str, end: int) -> bool:
         assert whitespace is not None
         call_start = cursor + whitespace.end()
         if call_start < len(text) and text[call_start] == "(":
-            cursor = balanced_end(call_start, "(", ")")
+            cursor = safe_call_end(call_start)
             if cursor is None:
                 return False
             continue
