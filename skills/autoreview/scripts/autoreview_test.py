@@ -178,15 +178,89 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         args = argparse.Namespace(codex_config=['model_provider="private-value"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_provider"])
 
-    def test_codex_runs_single_model_without_fallback_retry(self) -> None:
+    def test_codex_retries_terra_after_sol_access_failure(self) -> None:
         args = argparse.Namespace(
             codex_bin="codex",
             codex_config=None,
             codex_speed=None,
-            fallback_model=None,
+            fallback_model="gpt-5.6-terra",
             model="gpt-5.6-sol",
             stream_engine_output=False,
-            thinking="xhigh",
+            thinking="high",
+            tools=True,
+            web_search=False,
+        )
+        models: list[str] = []
+
+        def fake_run(command: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            model = command[command.index("--model") + 1]
+            models.append(model)
+            if model == "gpt-5.6-sol":
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "The model `gpt-5.6-sol` does not exist or you do not have access to it.",
+                )
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text(json.dumps(FINAL_REPORT))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
+            AUTOREVIEW,
+            "resolve_command",
+            return_value="/usr/bin/codex",
+        ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
+            AUTOREVIEW,
+            "run_with_heartbeat",
+            side_effect=fake_run,
+        ):
+            output = AUTOREVIEW.run_codex(args, Path(tmpdir), "review")
+
+        self.assertEqual(json.loads(output), FINAL_REPORT)
+        self.assertEqual(models, ["gpt-5.6-sol", "gpt-5.6-terra"])
+
+    def test_codex_does_not_fallback_after_unrelated_failure(self) -> None:
+        args = argparse.Namespace(
+            codex_bin="codex",
+            codex_config=None,
+            codex_speed=None,
+            fallback_model="gpt-5.6-terra",
+            model="gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
+            tools=True,
+            web_search=False,
+        )
+        models: list[str] = []
+
+        def fake_run(command: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            models.append(command[command.index("--model") + 1])
+            return subprocess.CompletedProcess(command, 1, "", "network timeout")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
+            AUTOREVIEW,
+            "resolve_command",
+            return_value="/usr/bin/codex",
+        ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
+            AUTOREVIEW,
+            "run_with_heartbeat",
+            side_effect=fake_run,
+        ):
+            with self.assertRaisesRegex(SystemExit, "network timeout"):
+                AUTOREVIEW.run_codex(args, Path(tmpdir), "review")
+
+        self.assertEqual(models, ["gpt-5.6-sol"])
+
+    def test_codex_does_not_fallback_after_model_capacity_failure(self) -> None:
+        args = argparse.Namespace(
+            codex_bin="codex",
+            codex_config=None,
+            codex_speed=None,
+            fallback_model="gpt-5.6-terra",
+            model="gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
             tools=True,
             web_search=False,
         )
@@ -198,10 +272,10 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 command,
                 1,
                 "",
-                "The model `gpt-5.6-sol` does not exist or you do not have access to it.",
+                "model_not_available: gpt-5.6-sol is temporarily unavailable due to capacity",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-single.") as tmpdir, mock.patch.object(
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
             AUTOREVIEW,
             "resolve_command",
             return_value="/usr/bin/codex",
@@ -210,10 +284,46 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             "run_with_heartbeat",
             side_effect=fake_run,
         ):
-            with self.assertRaisesRegex(SystemExit, "codex engine failed"):
+            with self.assertRaisesRegex(SystemExit, "temporarily unavailable"):
                 AUTOREVIEW.run_codex(args, Path(tmpdir), "review")
 
         self.assertEqual(models, ["gpt-5.6-sol"])
+
+    def test_codex_access_fallback_ignores_structured_output_text(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["codex"],
+            1,
+            '{"type":"agent_message","text":"gpt-5.6-sol does not exist or you do not have access"}',
+            '{"type":"agent_message","message":"gpt-5.6-sol does not exist or you do not have access"}',
+        )
+
+        self.assertFalse(
+            AUTOREVIEW.codex_model_access_failure(result, "gpt-5.6-sol")
+        )
+
+    def test_codex_access_fallback_accepts_terminal_error_event(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["codex"],
+            1,
+            '{"type":"error","message":"gpt-5.6-sol does not exist or you do not have access"}',
+            "",
+        )
+
+        self.assertTrue(
+            AUTOREVIEW.codex_model_access_failure(result, "gpt-5.6-sol")
+        )
+
+    def test_codex_access_fallback_ignores_plain_stdout(self) -> None:
+        message = "gpt-5.6-sol does not exist or you do not have access"
+        stdout_result = subprocess.CompletedProcess(["codex"], 1, message, "")
+        stderr_result = subprocess.CompletedProcess(["codex"], 1, "", message)
+
+        self.assertFalse(
+            AUTOREVIEW.codex_model_access_failure(stdout_result, "gpt-5.6-sol")
+        )
+        self.assertTrue(
+            AUTOREVIEW.codex_model_access_failure(stderr_result, "gpt-5.6-sol")
+        )
 
     def test_extract_json_accepts_dict_result_payload(self) -> None:
         payload = {
@@ -225,32 +335,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         }
         self.assertEqual(AUTOREVIEW.extract_json(json.dumps(payload)), FINAL_REPORT)
 
-    def test_extract_json_accepts_result_string_with_preamble(self) -> None:
+    def test_extract_json_rejects_result_string_with_preamble(self) -> None:
         payload = {
             "type": "result",
             "subtype": "success",
             "result": "Inspecting the diff first.\n" + json.dumps(FINAL_REPORT),
         }
-        self.assertEqual(AUTOREVIEW.extract_json(json.dumps(payload)), FINAL_REPORT)
-
-    def test_extract_findings_json_from_text_prefers_last_findings_object(self) -> None:
-        later_report = {
-            "findings": [
-                {
-                    "title": "Later finding",
-                    "body": "later",
-                    "priority": "P2",
-                    "confidence": 0.8,
-                    "category": "bug",
-                    "code_location": {"file_path": "later.js", "line": 2},
-                }
-            ],
-            "overall_correctness": "patch is incorrect",
-            "overall_explanation": "later",
-            "overall_confidence": 0.8,
-        }
-        text = f"{json.dumps(FINAL_REPORT)} separator {json.dumps(later_report)}"
-        self.assertEqual(AUTOREVIEW.extract_findings_json_from_text(text), later_report)
+        with self.assertRaisesRegex(SystemExit, "result was not structured JSON"):
+            AUTOREVIEW.extract_json(json.dumps(payload))
 
     def test_retry_filter_only_matches_parse_failures(self) -> None:
         self.assertTrue(AUTOREVIEW.is_structured_output_failure("review engine returned non-JSON output: nope"))
@@ -272,7 +364,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             )
             with self.assertRaises(SystemExit) as exc_info:
                 AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("requires --cursor-allow-workspace-instructions", str(exc_info.exception))
+            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
 
     def test_cursor_local_mcp_requires_explicit_approval(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
@@ -290,7 +382,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             )
             with self.assertRaises(SystemExit) as exc_info:
                 AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine refused project-local MCP config", str(exc_info.exception))
+            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
 
     def test_cursor_local_hooks_are_always_refused(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
@@ -308,7 +400,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             )
             with self.assertRaises(SystemExit) as exc_info:
                 AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine refused project-local hooks", str(exc_info.exception))
+            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
 
     def test_cursor_local_permissions_are_always_refused(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
@@ -326,15 +418,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             )
             with self.assertRaises(SystemExit) as exc_info:
                 AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine refused project-local permission config", str(exc_info.exception))
+            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
 
-    def test_cursor_command_uses_current_print_contract(self) -> None:
+    def test_cursor_is_disabled_without_repo_only_read_sandbox(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
             root = Path(tmpdir)
             repo = root / "repo"
             repo.mkdir()
             cursor_bin = root / "cursor-agent"
-            record_path = root / "record.json"
             AUTOREVIEW.write_executable(cursor_bin, AUTOREVIEW.fake_cursor_script())
             args = argparse.Namespace(
                 thinking=None,
@@ -345,30 +436,11 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 model=None,
                 stream_engine_output=False,
             )
-            old_record = os.environ.get("AUTOREVIEW_FAKE_RECORD")
-            try:
-                os.environ["AUTOREVIEW_FAKE_RECORD"] = str(record_path)
-                with mock.patch.object(AUTOREVIEW, "cursor_global_hook_paths", return_value=[]):
+            with mock.patch.object(AUTOREVIEW, "cursor_global_hook_paths", return_value=[]):
+                with self.assertRaisesRegex(SystemExit, "Cursor read permissions"):
                     AUTOREVIEW.run_cursor(args, repo, "prompt")
-            finally:
-                if old_record is None:
-                    os.environ.pop("AUTOREVIEW_FAKE_RECORD", None)
-                else:
-                    os.environ["AUTOREVIEW_FAKE_RECORD"] = old_record
-            record = json.loads(record_path.read_text())
-            self.assertEqual(Path(record["cwd"]).resolve(), repo.resolve())
-            self.assertEqual(record["stdin"], "prompt")
-            self.assertIn("--print", record["argv"])
-            self.assertIn("--output-format", record["argv"])
-            self.assertIn("json", record["argv"])
-            self.assertIn("--mode", record["argv"])
-            self.assertIn("ask", record["argv"])
-            self.assertIn("--sandbox", record["argv"])
-            self.assertIn("enabled", record["argv"])
-            for unsupported in ("--workspace", "--trust"):
-                self.assertNotIn(unsupported, record["argv"])
 
-    def test_cursor_engine_runs_end_to_end_with_sanitized_environment(self) -> None:
+    def test_cursor_engine_fails_closed_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-cursor-e2e.") as tmpdir:
             root = Path(tmpdir)
             repo = root / "repo"
@@ -417,33 +489,9 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("autoreview clean: no accepted/actionable findings reported", result.stdout)
-            record = json.loads(record_path.read_text())
-            self.assertEqual(Path(record["cwd"]).resolve(), repo.resolve())
-            self.assertIn("diff --git a/example.txt b/example.txt", record["stdin"])
-            self.assertIn("-before", record["stdin"])
-            self.assertIn("+after", record["stdin"])
-            self.assertEqual(record["environment"]["GIT_CONFIG_GLOBAL"], None)
-            self.assertEqual(record["environment"]["NODE_OPTIONS"], None)
-            self.assertEqual(record["environment"]["PYTHONPATH"], None)
-            self.assertNotIn(str(repo), record["environment"]["PATH"].split(os.pathsep))
-            cursor_config_dir = Path(record["environment"]["CURSOR_CONFIG_DIR"])
-            self.assertFalse(cursor_config_dir.exists())
-            cursor_config = json.loads(record["cursor_config"])
-            self.assertEqual(cursor_config["permissions"]["allow"], ["Read(**)"])
-            self.assertEqual(
-                cursor_config["permissions"]["deny"],
-                ["Shell(*)", "Write(**)", "Write(/**)"],
-            )
-
-            invocations = [json.loads(line) for line in (root / "cursor-invocations.jsonl").read_text().splitlines()]
-            help_invocation = next(invocation for invocation in invocations if "--help" in invocation["argv"])
-            self.assertNotEqual(Path(help_invocation["cwd"]).resolve(), repo.resolve())
-            self.assertEqual(help_invocation["environment"]["GIT_CONFIG_GLOBAL"], None)
-            self.assertEqual(help_invocation["environment"]["NODE_OPTIONS"], None)
-            self.assertEqual(help_invocation["environment"]["PYTHONPATH"], None)
-            self.assertNotIn(str(repo), help_invocation["environment"]["PATH"].split(os.pathsep))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Cursor read permissions", result.stderr)
+            self.assertFalse(record_path.exists())
 
 
 if __name__ == "__main__":

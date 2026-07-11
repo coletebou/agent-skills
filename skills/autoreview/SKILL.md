@@ -1,13 +1,13 @@
 ---
 name: autoreview
-description: "Pre-commit/ship code review: Codex default; optional Claude, Pi, Droid, Copilot, Cursor, or OpenCode."
+description: "Pre-commit/ship code review: Codex default; optional Claude, Pi, or OpenCode."
 ---
 
 # Auto Review
 
 Run the bundled structured review helper as a closeout check. This is code review, not Guardian `auto_review` approval routing.
 
-Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `xhigh` reasoning and fast service tier by default. Claude review is optional and uses `claude-fable-5` by default.
+Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Claude review is optional and uses `claude-fable-5` by default.
 
 For user-visible behavior, pair autoreview with `behavior-validator`. Autoreview is source-aware and judges the change bundle; behavior validation is source-blind and judges the running product or tool against a behavior contract. A clean autoreview is not proof that a UI, CLI, API, or generated artifact works from the user's perspective.
 
@@ -29,7 +29,7 @@ Use when:
 - Keep going until structured review returns no accepted/actionable findings only while the work remains inside the original task scope.
 - If a review-triggered fix changes code, rerun focused tests and rerun the structured review helper.
 - For security-audit suppression changes, verify accepted findings remain auditable: suppressed findings stay in structured output, active output keeps an unsuppressible suppression notice, and aggregate findings cannot hide unrelated active risk.
-- Never switch or override the requested review engine/model. Capacity, access, rate-limit, and unrelated failures keep the same engine/model.
+- Never switch or override the requested review engine/model except for the documented Codex Sol-to-Terra account-access fallback. Capacity, rate-limit, and unrelated failures keep the same engine/model.
 - Be patient with large bundles. Structured review can take up to 30 minutes while the model call is active, especially with Codex tools or web search.
 - Treat heartbeat lines like `review still running: ... elapsed=... pid=...` as healthy progress, not a hang. Let the helper continue while heartbeats are advancing. Pass `--stream-engine-output` when live engine text is useful; Codex, Claude, and Cursor filter tool/file chatter, other engines pass raw output through.
 - Do not kill a review just because it has been quiet for 2-5 minutes, or because it is still running under the 30-minute window. Inspect the process only after missing multiple expected heartbeats, after 30 minutes, or after an obviously failed subprocess; prefer letting the same helper command finish.
@@ -187,13 +187,13 @@ Run multiple reviewers against one frozen bundle:
 Set reviewer models and thinking/effort explicitly:
 
 ```bash
-"$AUTOREVIEW" --reviewers codex,claude --model codex=gpt-5.6-sol --thinking codex=xhigh --model claude=claude-fable-5 --thinking claude=max
+"$AUTOREVIEW" --reviewers codex,claude --model codex=gpt-5.6-sol --thinking codex=high --model claude=claude-fable-5 --thinking claude=max
 ```
 
 Inline syntax is also supported for simple model IDs:
 
 ```bash
-"$AUTOREVIEW" --reviewers codex:gpt-5.6-sol:xhigh,claude:claude-fable-5:max
+"$AUTOREVIEW" --reviewers codex:gpt-5.6-sol:high,claude:claude-fable-5:max
 ```
 
 For models with slashes or extra colons, prefer keyed form:
@@ -201,13 +201,11 @@ For models with slashes or extra colons, prefer keyed form:
 ```bash
 "$AUTOREVIEW" --engine pi --model anthropic/claude-sonnet-4 --thinking high
 "$AUTOREVIEW" --engine opencode --model opencode/north-mini-code-free --thinking high
-"$AUTOREVIEW" --engine cursor --model auto --cursor-allow-workspace-instructions
 "$AUTOREVIEW" --reviewers codex,pi --model codex=gpt-5.6-sol --model pi=anthropic/claude-sonnet-4
 "$AUTOREVIEW" --reviewers codex,opencode --model codex=gpt-5.6-sol --model opencode=opencode/north-mini-code-free
-"$AUTOREVIEW" --reviewers codex,cursor --model codex=gpt-5.6-sol --model cursor=auto --cursor-allow-workspace-instructions
 ```
 
-`--reviewers all` covers Codex, Claude, Copilot, Pi, and OpenCode. Cursor requires both explicit selection (`--engine cursor` or named in `--reviewers`) and `--cursor-allow-workspace-instructions` because the current Cursor CLI does not document a per-run flag that ignores project-local instructions/config. Droid selection currently fails closed because its CLI cannot disable both project instructions and all tools.
+`--reviewers all` covers Codex, Claude, Pi, and OpenCode. Droid, Copilot, and Cursor selections fail closed because their current CLI contracts cannot confine all project instructions and filesystem reads to the review bundle.
 
 ## Models and thinking
 
@@ -217,19 +215,19 @@ Recommended model defaults:
 
 | Engine              | Default model                                      | Source note                                           |
 | ------------------- | -------------------------------------------------- | ----------------------------------------------------- |
-| **codex** (default) | `gpt-5.6-sol`                                      | OpenClaw org review default                           |
+| **codex** (default) | `gpt-5.6-sol` -> `gpt-5.6-terra` on access failure | OpenClaw org review default                           |
 | **claude**          | `claude-fable-5`                                   | Anthropic's most capable widely released Claude model |
 
 CLI flags and environment variables override these defaults. Droid, Copilot, Pi, Cursor, and OpenCode do not get built-in model defaults here because their provider catalogs are external to the Codex/Claude closeout path and may vary by installation.
 
 | Engine              | Model flag                 | Example model IDs                                                            | Thinking flag                 | Accepted levels                                        |
 | ------------------- | -------------------------- | ---------------------------------------------------------------------------- | ----------------------------- | ------------------------------------------------------ |
-| **codex** (default) | `codex --model X exec ...` | `gpt-5.6-sol`, `gpt-5.5`                                                     | `-c model_reasoning_effort=Y` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`    |
+| **codex** (default) | `codex --model X exec ...` | `gpt-5.6-sol`, then `gpt-5.6-terra` on Sol access failure                    | `-c model_reasoning_effort=Y` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`    |
 | **claude**          | `claude --model X`         | `claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5` | `--effort Y`                  | `low`, `medium`, `high`, `xhigh`, `max`                |
 | **droid**           | currently refused          | Factory model IDs                                                            | `-r, --reasoning-effort Y`    | `off`, `none`, `low`, `medium`, `high`, `xhigh`, `max` |
-| **copilot**         | `copilot --model X`        | `gpt-5.2`, Copilot model aliases                                             | not supported                 | n/a                                                    |
+| **copilot**         | currently refused          | Copilot model aliases                                                        | not supported                 | n/a                                                    |
 | **pi**              | `pi --model X`             | `anthropic/claude-sonnet-4`, `openai/gpt-4o`                                 | `--thinking Y`                | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`     |
-| **cursor**          | `cursor-agent --model X`   | `auto`, Cursor model aliases                                                 | not supported                 | n/a                                                    |
+| **cursor**          | currently refused          | Cursor model aliases                                                         | not supported                 | n/a                                                    |
 | **opencode**        | `opencode run -m X`        | `opencode/north-mini-code-free`, OpenCode provider/model IDs                 | `--variant Y`                 | `minimal`, `low`, `medium`, `high`, `max`              |
 
 Claude also supports `--fallback-model a,b` for availability-based fallback chains ([model-config](https://code.claude.com/docs/en/model-config)). Current Claude docs note that auth, billing, rate-limit, request-size, and transport errors do not trigger fallback, and the changelog documents interactive-session support in `v2.1.166`.
@@ -238,7 +236,7 @@ Examples matching current `main` behavior:
 
 ```bash
 # Codex with explicit model and reasoning
-"$AUTOREVIEW" --engine codex --model gpt-5.6-sol --thinking xhigh --codex-speed fast
+"$AUTOREVIEW" --engine codex --model gpt-5.6-sol --thinking high
 
 # Codex fast mode (priority service tier); needs a model whose catalog lists the tier, silently standard otherwise
 "$AUTOREVIEW" --engine codex --codex-speed fast
@@ -250,14 +248,8 @@ Examples matching current `main` behavior:
 "$AUTOREVIEW" --engine claude --model claude-fable-5 --thinking max
 "$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-4-8,claude-sonnet-4-6
 
-# GitHub Copilot (model only; no thinking knob)
-"$AUTOREVIEW" --engine copilot --model gpt-5.2
-
 # Pi with explicit model and thinking level
 "$AUTOREVIEW" --engine pi --model anthropic/claude-sonnet-4 --thinking high --pi-bin pi
-
-# Cursor print-mode review (`cursor-agent` remains a compatibility alias)
-"$AUTOREVIEW" --engine cursor --model auto --cursor-bin cursor-agent --cursor-allow-workspace-instructions
 
 # OpenCode with explicit provider/model and variant
 "$AUTOREVIEW" --engine opencode --model opencode/north-mini-code-free --thinking high
@@ -274,36 +266,34 @@ Store persistent personal defaults in your shell startup file or launcher
 environment. For repository-local defaults, use an existing local environment
 loader such as an untracked `.envrc`; the helper does not write a config file.
 
-| Variable                                         | Purpose                                                                                                                      |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| `AUTOREVIEW_MODEL`                               | Override the built-in default `--model` for all engines                                                                      |
-| `AUTOREVIEW_THINKING`                            | Default `--thinking` for all engines                                                                                         |
-| `AUTOREVIEW_FALLBACK_MODEL`                      | Default Claude `--fallback-model` chain                                                                                      |
-| `AUTOREVIEW_<ENGINE>_MODEL`                      | Per-engine model override, for example `AUTOREVIEW_CODEX_MODEL=gpt-5.6-sol`                                                  |
-| `AUTOREVIEW_<ENGINE>_THINKING`                   | Per-engine thinking override                                                                                                 |
-| `AUTOREVIEW_CODEX_CONFIG`                        | Default Codex `-c key=value` overrides, semicolon-separated, e.g. `service_tier="fast"`; isolation flags still win           |
-| `AUTOREVIEW_CODEX_SPEED`                         | Codex service tier override: `fast` (default), `flex`, or `default`; silently standard when the model does not list the tier |
-| `AUTOREVIEW_CLAUDE_FALLBACK_MODEL`               | Claude-only fallback chain                                                                                                   |
-| `AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS` | Required `1`/true opt-in for Cursor reviews of trusted repositories                                                          |
+| Variable                           | Purpose                                                                                                                      |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `AUTOREVIEW_MODEL`                 | Override the built-in default `--model` for all engines                                                                      |
+| `AUTOREVIEW_THINKING`              | Default `--thinking` for all engines                                                                                         |
+| `AUTOREVIEW_FALLBACK_MODEL`        | Default Claude `--fallback-model` chain                                                                                      |
+| `AUTOREVIEW_<ENGINE>_MODEL`        | Per-engine model override, for example `AUTOREVIEW_CODEX_MODEL=gpt-5.6-sol`                                                  |
+| `AUTOREVIEW_<ENGINE>_THINKING`     | Per-engine thinking override                                                                                                 |
+| `AUTOREVIEW_CODEX_CONFIG`          | Default Codex `-c key=value` overrides, semicolon-separated, e.g. `service_tier="fast"`; isolation flags still win           |
+| `AUTOREVIEW_CODEX_SPEED`           | Codex service tier override: `fast` (priority), `flex`, or `default`; silently standard when the model does not list the tier |
+| `AUTOREVIEW_CLAUDE_FALLBACK_MODEL` | Claude-only fallback chain                                                                                                   |
 
-Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Droid maps thinking to `-r, --reasoning-effort`. Pi maps thinking to `--thinking`. OpenCode maps thinking to `--variant`. Copilot and Cursor reject `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored.
+Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. OpenCode maps thinking to `--variant`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored.
 
 ## Review engine isolation
 
 When autoreview runs inside the repository under review, external reviewer CLIs must not load project-local trust or configuration that the branch controls.
 
-| Engine       | Isolation flags                                                                                                                                                                                                       | Reference                                                                                                                                                                                                                                                                      |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **codex**    | Auth-only config overrides, `-c project_doc_max_bytes=0`, repo `trust_level="untrusted"`, `exec --ignore-user-config --ignore-rules`, plus read-only sandbox                                                          | Codex CLI `exec --help`                                                                                                                                                                                                                                                        |
-| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*` plus explicit `--allowedTools` (`--safe-mode` requires Claude Code `v2.1.169+`)                                                     | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference)                                                                                                                                                                                                     |
-| **droid**    | Fails closed: current CLI cannot disable both project instructions and all tools                                                                                                                                      | Droid CLI `exec --help` and `--list-tools`                                                                                                                                                                                                                                     |
-| **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                                                                               | Pi CLI `--help`; requires Pi `v0.79.0+`                                                                                                                                                                                                                                        |
-| **opencode** | `opencode run --dir <repo> --pure --format json`, prompt over stdin, neutral subprocess cwd, injected deny-by-default permissions, project config disabled                                                            | OpenCode CLI `--help`                                                                                                                                                                                                                                                          |
-| **cursor**   | `cursor-agent --print --mode ask --sandbox enabled` with `json` or `stream-json` output, prompt over stdin, temporary read-only permission config, help-probed flags, and mandatory explicit trusted-workspace opt-in | Cursor CLI [headless mode](https://cursor.com/docs/cli/headless), [output format](https://cursor.com/docs/cli/reference/output-format), [permissions](https://cursor.com/docs/cli/reference/permissions), [configuration](https://cursor.com/docs/cli/reference/configuration) |
+| Engine       | Isolation flags                                                                                                                                                        | Reference                                                                   |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| **codex**    | Auth-only config overrides, `-c project_doc_max_bytes=0`, repo `trust_level="untrusted"`, `exec --ignore-user-config --ignore-rules`, plus read-only sandbox           | Codex CLI `exec --help`                                                     |
+| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*`; filesystem/shell tools disabled, optional web tools only (`v2.1.169+`)              | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference)  |
+| **droid**    | Fails closed: current CLI cannot disable both project instructions and all tools                                                                                       | Droid CLI `exec --help` and `--list-tools`                                  |
+| **copilot**  | Fails closed: repository read tools also expose ignored files outside the reviewed bundle                                                                              | GitHub Copilot CLI command reference                                        |
+| **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                                | Pi CLI `--help`; requires Pi `v0.79.0+`                                     |
+| **opencode** | `opencode run --dir <repo> --pure --format json`, prompt over stdin, neutral subprocess cwd, project config disabled, filesystem tools denied, optional web tools only | OpenCode CLI `--help`                                                       |
+| **cursor**   | Fails closed: documented read permissions can target absolute host paths and no proven repository-only filesystem sandbox is exposed                                   | Cursor CLI [permissions](https://cursor.com/docs/cli/reference/permissions) |
 
-Codex `--ignore-user-config` skips config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication and workspace restrictions usable without forwarding unrelated user configuration. The explicit repo trust override and zero project-doc budget keep reviewed-repo `AGENTS.md` and `.codex/` trust surfaces out of the review prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md while preserving normal authentication, model selection, built-in tools, and permissions; managed settings policy can still apply. `--setting-sources user` avoids project/local settings from the reviewed checkout, and current Claude Code docs note the project-skill blocking behavior was fixed in `v2.1.69`. `--strict-mcp-config` and `--disallowedTools mcp__*` keep MCP unavailable to the review run. `--bare` is not used here because Claude's headless docs say it skips OAuth and keychain reads. Droid fails closed because its CLI cannot disable reviewed-repository `AGENTS.md` loading and all tools in the same run. Pi `--no-approve` ignores project-local files for one run; the helper requires Pi `v0.79.0+` plus help output that advertises every required isolation flag because older legacy binaries can ignore unknown flags. The current package is `@earendil-works/pi-coding-agent`; deprecated `@mariozechner/pi-coding-agent` `0.73.x` is intentionally rejected. Pi version/help probes and the review command run from neutral temporary directories, not the reviewed repo. Pi `--no-context-files` removes `AGENTS.md`/`CLAUDE.md`, the resource-disable flags keep `.pi` extensions, skills, prompts, and themes out of the run, `--no-session` avoids writing review sessions, and `--no-tools` prevents built-in read tools from escaping the repository through absolute paths. OpenCode starts from a neutral temporary directory, points at the reviewed repo with `--dir`, disables project config through `OPENCODE_DISABLE_PROJECT_CONFIG=1`, and injects `OPENCODE_CONFIG_CONTENT`; permissions default to deny, allow read/grep/glob, preserve OpenCode's `.env` ask rules, and gate `websearch`/`webfetch` with `--no-web-search`. The injected config also clears command/instruction/plugin arrays and disables write/edit/bash/task/skill/todowrite tools without changing user auth storage. Cursor's documented headless path is print mode with JSON output and workspace-relative project-resource discovery. Because the CLI exposes no per-run flag that disables every current and future project instruction surface, autoreview requires `--cursor-allow-workspace-instructions` (or its environment equivalent) for every Cursor run. Project-local Cursor/Claude hook settings, project MCP config, and global Cursor MCP config remain hard refusals because hooks execute host commands and MCP tools cannot be constrained to read-only review access. Cursor capability probes run from neutral temporary directories with the sanitized engine environment. Review runs set documented `CURSOR_CONFIG_DIR` to an ephemeral configuration that allows workspace reads while denying shell commands and relative or absolute writes. The helper sends review prompts to OpenCode and Cursor over stdin rather than argv and extracts final structured JSON from terminal result/text events. OpenCode and Cursor reject `--no-tools`; Cursor also rejects `--no-web-search` because the CLI does not expose a documented per-run web-search disable flag.
-
-Claude `--tools` restricts the built-in tool inventory to the configured read/search set, while matching `--allowedTools` entries approve that set. Cursor user-level hooks in `~/.cursor/hooks.json` and Claude-compatible user settings are hard refusals alongside project hooks because they can execute host commands outside the temporary review config.
+Codex `--ignore-user-config` skips config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication and workspace restrictions usable without forwarding unrelated user configuration. The explicit repo trust override and zero project-doc budget keep reviewed-repo `AGENTS.md` and `.codex/` trust surfaces out of the review prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; autoreview supplies only WebSearch/WebFetch when web search is enabled and no filesystem or shell tools. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. OpenCode runs from a neutral temporary directory with project config disabled, filesystem tools denied, and web tools gated by `--no-web-search`. Droid, Copilot, and Cursor fail closed because their current CLI contracts cannot isolate untrusted review input from host/project trust surfaces.
 
 Codex uses a named permission profile that grants read access only to the active repository workspace root. This is narrower than the legacy `read-only` sandbox, which permits reads across the host filesystem.
 
@@ -344,21 +334,20 @@ The helper:
 - otherwise uses current PR base if `gh pr view` works
 - otherwise uses `origin/main` for non-main branches
 - does not fetch automatically during branch review; the selected base ref must already resolve locally
-- recognizes `--engine droid` only to fail closed with an isolation error; runnable engines are `codex`, `claude`, `copilot`, `pi`, `opencode`, and `cursor`; default is `AUTOREVIEW_ENGINE` or `codex`
+- recognizes `--engine droid`, `copilot`, and `cursor` only to fail closed with isolation errors; runnable engines are `codex`, `claude`, `pi`, and `opencode`; default is `AUTOREVIEW_ENGINE` or `codex`
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit relative `--*-bin` paths are resolved from the reviewed repository root
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
 - writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
 - supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
-- supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex, Claude, and Cursor hide tool/file event details, emit compact activity summaries, and report usage at turn completion
+- supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, plus per-engine `--model`, `--thinking`, and Claude `--fallback-model`
-- uses built-in defaults `codex=gpt-5.6-sol` with `xhigh` reasoning and fast service tier, plus `claude=claude-fable-5`; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
-- allows read-only tools and web search by default where the selected CLI supports them; forbids nested review in the prompt; Codex is run through `codex exec` with auth-only user settings, read-only sandbox, reviewed-repo instruction/config/rule isolation flags, and structured output
-- runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP disabled, explicit allowed tools, and `--fallback-model` when set, so reviewed-repo hooks/skills/MCP do not affect the review run while normal auth still works; managed settings policy can still apply
-- refuses Droid reviews until the CLI exposes a complete project-instruction and tool-isolation contract
+- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus `claude=claude-fable-5`; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
+- allows repository-scoped read tools only for Codex; Claude and OpenCode receive the bundle plus optional web tools, and Pi receives the bundle with no tools
+- runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP disabled, web-only tools, and `--fallback-model` when set
+- refuses Droid, Copilot, and Cursor reviews until their CLIs expose complete project-instruction and repository-only filesystem isolation
 - runs Pi `v0.79.0+` from neutral temporary directories with `--no-approve`, `--no-session`, disabled Pi context/resource loading, and `--no-tools` because its built-in read tools are not repository-confined
-- runs OpenCode with `opencode run --dir <repo> --pure --format json` from a neutral temporary directory, forwards `--model` and `--variant`, injects deny-by-default permissions, disables project config loading, and passes the review prompt over stdin
-- runs Cursor only with mandatory trusted-workspace opt-in, uses `cursor-agent --print --mode ask --sandbox enabled --output-format json`, forwards `--model`, passes the review prompt over stdin, and always refuses project-local hooks/MCP
+- runs OpenCode with `opencode run --dir <repo> --pure --format json` from a neutral temporary directory, denies filesystem tools, forwards `--model` and `--variant`, disables project config loading, and passes the review prompt over stdin
 - prints `review still running: <engine> elapsed=<seconds>s pid=<pid>` to stderr at long-running intervals while waiting for the selected review engine, unless streamed output or compact Codex activity has been visible recently
 - prints `autoreview clean: no accepted/actionable findings reported` when the selected review command exits 0
 - exits nonzero when accepted/actionable findings are present

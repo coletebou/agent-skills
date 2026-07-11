@@ -51,6 +51,10 @@ def init_repo(tempdir: Path) -> Path:
     return repo
 
 
+def realistic_secret_value() -> str:
+    return "A7f9K2m4Q8v6" + "N3x5R1p0T9z8"
+
+
 class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
@@ -76,7 +80,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIn("## image.bin\n[binary file omitted]", bundle)
             self.assertFalse(truncated)
 
-    def test_full_file_secret_scan_blocks_truncated_tail(self) -> None:
+    def test_oversized_text_is_rejected_without_scanning_binary_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             tail_secret = "\ntoken=" + "A" * 24 + "\n"
@@ -84,19 +88,21 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             untracked = repo / "untracked.txt"
             untracked.write_text(content, encoding="utf-8")
-            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            with self.assertRaisesRegex(SystemExit, "file too large to scan safely"):
                 self.helper["safe_untracked_files"](repo)
 
             untracked.unlink()
             binary = repo / "binary.bin"
             binary.write_bytes(b"\0" + content.encode())
-            with self.assertRaisesRegex(SystemExit, "secret-like content"):
-                self.helper["safe_untracked_files"](repo)
+            self.assertEqual(
+                self.helper["safe_untracked_files"](repo),
+                ["binary.bin"],
+            )
 
             binary.unlink()
             evidence = repo / "evidence.txt"
             evidence.write_text(content, encoding="utf-8")
-            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            with self.assertRaisesRegex(SystemExit, "file too large to scan safely"):
                 self.helper["validate_evidence_file"](repo, "evidence.txt", "--dataset")
 
     def test_branch_bundle_rejects_unsafe_or_unknown_base_before_diff(self) -> None:
@@ -110,6 +116,26 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["branch_bundle"](repo, "--help")
             with self.assertRaisesRegex(SystemExit, "unknown base ref"):
                 self.helper["branch_bundle"](repo, "origin/main")
+
+    def test_commit_bundle_rejects_merge_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / "base.txt").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "base.txt")
+            git(repo, "commit", "-q", "-m", "base")
+            base_branch = git(repo, "branch", "--show-current").strip()
+            git(repo, "checkout", "-q", "-b", "side")
+            (repo / "side.txt").write_text("side\n", encoding="utf-8")
+            git(repo, "add", "side.txt")
+            git(repo, "commit", "-q", "-m", "side")
+            git(repo, "checkout", "-q", base_branch)
+            (repo / "main.txt").write_text("main\n", encoding="utf-8")
+            git(repo, "add", "main.txt")
+            git(repo, "commit", "-q", "-m", "main")
+            git(repo, "merge", "-q", "--no-ff", "side", "-m", "merge")
+
+            with self.assertRaisesRegex(SystemExit, "does not accept merge commits"):
+                self.helper["commit_bundle"](repo, "HEAD")
 
     def test_git_path_list_preserves_newline_filenames(self) -> None:
         if os.name == "nt":
@@ -162,6 +188,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "password_validator.go",
             ".env.example",
             "private/parser.py",
+            ".agents/skills/openclaw-secret-scanning-maintainer/SKILL.md",
             "design-tokens/colors.json",
             "token_count/generated.py",
             ".docker/Dockerfile",
@@ -181,6 +208,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
+
+    def test_sensitive_source_directories_are_blocked_untracked(self) -> None:
+        for rel in (
+            "credentials/prod.py",
+            "secrets/runtime.ts",
+            "src/credentials/provider.py",
+            "src/secrets/scanner.ts",
+        ):
+            with self.subTest(rel=rel):
+                self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
 
     def test_tracked_env_variants_remain_sensitive(self) -> None:
         for rel in (
@@ -217,6 +254,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "tokens/device.sqlite",
             "tokens/session.jwt",
             "tokens/session",
+            "secrets/prod.md",
+            "credentials/prod.xml",
+            "credentials/prod.py",
+            "secrets/runtime.ts",
+            "src/credentials/provider.py",
+            "src/secrets/scanner.ts",
+            "backup-secrets/prod.json",
+            "dev_credentials/runtime.yaml",
+            "client-secrets-old/account.ini",
+            "client-secrets/account.properties",
             "credentials.txt",
             "client-secret.csv",
             ".docker/config.json",
@@ -228,7 +275,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
 
     def test_secret_detector_handles_quoted_json_keys(self) -> None:
-        content = '{"' + 'api_key": "' + "a" * 24 + '"}'
+        content = '{"' + 'api_key": "' + realistic_secret_value() + '"}'
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
@@ -276,7 +323,56 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_handles_bare_call_keyword_values(self) -> None:
-        content = "client(api_key=" + "a" * 24 + ")"
+        content = "client(api_" + "key=" + realistic_secret_value() + ")"
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_handles_unquoted_underscore_tokens(self) -> None:
+        content = "token=prod_" + realistic_secret_value()
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_dotted_calls(self) -> None:
+        for content in (
+            "token=secrets.token_urlsafe(32)",
+            "token = provider.issue_token()",
+            "token = generate_secure_token()",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_ambiguous_bare_values(self) -> None:
+        for content in (
+            "pass" + "word=CORRECTHORSEBATTERYSTAPLE",
+            "to" + "ken=prod.opaquecredentialvalue",
+            "to" + "ken=TOKEN_FROM_ENVIRONMENT_SECRET",
+            "to" + "ken: prod.A7f9K2m4Q8v6N3x5R1p0T9z8 (production)",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_handles_lowercase_passphrases(self) -> None:
+        content = 'password="' + "correcthorsebatterystaple" + '"'
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_does_not_exempt_expression_text_in_literals(self) -> None:
+        for value in (
+            "correct horse + battery staple",
+            "prefix-${credential}-suffix",
+            "secret.format(value)",
+        ):
+            with self.subTest(value=value):
+                content = "pass" + f'word="{value}"'
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_handles_low_diversity_passwords(self) -> None:
+        content = 'password="' + "letmeinletmein" + '"'
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_does_not_exempt_placeholder_substrings(self) -> None:
+        content = "pass" + 'word="prod-sample-' + realistic_secret_value() + '"'
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
@@ -329,7 +425,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_secret_detector_handles_compound_json_keys(self) -> None:
         for key in ("client_secret", "refresh_token"):
-            content = '{"' + key + '": "' + "a" * 24 + '"}'
+            content = '{"' + key + '": "' + realistic_secret_value() + '"}'
             with self.subTest(key=key):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
@@ -342,7 +438,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             git(repo, "commit", "-q", "-m", "base")
             base = git(repo, "rev-parse", "HEAD").strip()
 
-            path.write_text("api" + "_key=" + "a" * 24 + "\n", encoding="utf-8")
+            path.write_text(
+                "api" + "_key=" + realistic_secret_value() + "\n",
+                encoding="utf-8",
+            )
             git(repo, "add", "settings.txt")
             with self.assertRaisesRegex(SystemExit, "secret-like content"):
                 self.helper["local_bundle"](repo)
@@ -467,7 +566,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ,
                 {"HOME": str(root), "USERPROFILE": str(root)},
             ):
-                with self.assertRaisesRegex(SystemExit, "cursor engine refused global MCP config"):
+                with self.assertRaisesRegex(SystemExit, "cursor engine is unavailable"):
                     self.helper["run_cursor"](args, repo, "prompt")
 
     def test_cursor_refuses_user_level_hooks(self) -> None:
@@ -488,7 +587,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ,
                 {"HOME": str(root), "USERPROFILE": str(root)},
             ):
-                with self.assertRaisesRegex(SystemExit, "cursor engine refused user-level hooks"):
+                with self.assertRaisesRegex(SystemExit, "cursor engine is unavailable"):
                     self.helper["run_cursor"](args, repo, "prompt")
 
             settings.write_text('{"permissions":{"allow":["Read(**)"]}}\n', encoding="utf-8")
@@ -546,11 +645,45 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["GIT_CONFIG_COUNT"] = "99"
                 os.environ["DYLD_INSERT_LIBRARIES"] = "/tmp/unsafe.dylib"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+                os.environ["NODE_PATH"] = "/tmp/unsafe-node"
+                os.environ["LD_AUDIT"] = "/tmp/unsafe-audit.so"
+                os.environ["LD_LIBRARY_PATH"] = "/tmp/unsafe-lib"
+                os.environ["RUBYOPT"] = "-r/tmp/unsafe.rb"
+                os.environ["PERL5OPT"] = "-Munsafe"
+                os.environ["BUN_OPTIONS"] = "--preload=/tmp/unsafe.js"
+                os.environ["OPENCODE_CONFIG"] = "/tmp/unsafe-opencode.json"
+                os.environ["OPENCODE_PERMISSION"] = "allow"
+                os.environ["OPENCODE_AUTO_SHARE"] = "1"
                 os.environ["COPILOT_ALLOW_ALL"] = "1"
+                os.environ["CODEX_HOME"] = "/tmp/codex-auth"
+                os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/claude-auth"
+                os.environ["PI_CODING_AGENT_DIR"] = "/tmp/pi-auth"
+                os.environ["CLAUDE_CODE_USE_FOUNDRY"] = "1"
+                os.environ["CLOUD_ML_REGION"] = "us-east5"
+                os.environ["ANTHROPIC_AUTH_TOKEN"] = "test-auth-token"
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = "test-token-placeholder"
+                os.environ["ANTHROPIC_BEDROCK_BASE_URL"] = (
+                    "https://bedrock.example.invalid"
+                )
+                os.environ["ANTHROPIC_VERTEX_BASE_URL"] = (
+                    "https://vertex.example.invalid"
+                )
+                os.environ["AWS_PROFILE"] = "review-profile"
+                os.environ["AWS_CONFIG_FILE"] = "/tmp/unsafe-aws-config"
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+                    "/tmp/unsafe-google-credentials"
+                )
+                os.environ["GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"] = "1"
+                os.environ["OPENROUTER_API_KEY"] = "test-provider-key"
                 os.environ["GITHUB_TOKEN"] = "test-token-placeholder"
                 os.environ["HTTPS_PROXY"] = "http://proxy.example.invalid:8080"
+                os.environ["DO_NOT_TRACK"] = "1"
+                os.environ["DISABLE_TELEMETRY"] = "1"
+                os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
-                env = self.helper["safe_engine_env"](repo)
+                env = self.helper["safe_engine_env"](repo, engine="codex")
+                claude_env = self.helper["safe_engine_env"](repo, engine="claude")
+                pi_env = self.helper["safe_engine_env"](repo, engine="pi")
 
                 self.assertNotEqual(env.get("GIT_DIR"), "/tmp/unsafe-git-dir")
                 self.assertEqual(
@@ -559,12 +692,248 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
                 self.assertNotIn("DYLD_INSERT_LIBRARIES", env)
                 self.assertNotIn("NODE_OPTIONS", env)
+                for key in (
+                    "NODE_PATH",
+                    "LD_AUDIT",
+                    "LD_LIBRARY_PATH",
+                    "RUBYOPT",
+                    "PERL5OPT",
+                    "BUN_OPTIONS",
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_PERMISSION",
+                    "OPENCODE_AUTO_SHARE",
+                ):
+                    self.assertNotIn(key, env)
                 self.assertNotIn("COPILOT_ALLOW_ALL", env)
-                self.assertEqual(env["GITHUB_TOKEN"], "test-token-placeholder")
+                self.assertNotIn("GITHUB_TOKEN", env)
                 self.assertEqual(env["HTTPS_PROXY"], "http://proxy.example.invalid:8080")
+                self.assertEqual(env["DO_NOT_TRACK"], "1")
+                self.assertEqual(env["DISABLE_TELEMETRY"], "1")
+                self.assertEqual(env["CODEX_HOME"], "/tmp/codex-auth")
+                self.assertEqual(
+                    claude_env["CLAUDE_CONFIG_DIR"],
+                    "/tmp/claude-auth",
+                )
+                self.assertEqual(pi_env["PI_CODING_AGENT_DIR"], "/tmp/pi-auth")
+                self.assertEqual(claude_env["CLAUDE_CODE_USE_FOUNDRY"], "1")
+                self.assertEqual(claude_env["CLOUD_ML_REGION"], "us-east5")
+                self.assertEqual(
+                    claude_env["ANTHROPIC_AUTH_TOKEN"],
+                    "test-auth-token",
+                )
+                self.assertEqual(
+                    claude_env["AWS_BEARER_TOKEN_BEDROCK"],
+                    "test-token-placeholder",
+                )
+                self.assertEqual(
+                    claude_env["ANTHROPIC_BEDROCK_BASE_URL"],
+                    "https://bedrock.example.invalid",
+                )
+                self.assertEqual(
+                    claude_env["ANTHROPIC_VERTEX_BASE_URL"],
+                    "https://vertex.example.invalid",
+                )
+                self.assertEqual(claude_env["AWS_PROFILE"], "review-profile")
+                self.assertNotIn("AWS_CONFIG_FILE", env)
+                self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", env)
+                self.assertNotIn(
+                    "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+                    env,
+                )
+                self.assertNotIn("OPENROUTER_API_KEY", env)
+                self.assertEqual(
+                    claude_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
+                    "1",
+                )
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+
+    def test_multi_provider_engines_preserve_provider_auth(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            try:
+                os.environ["DEEPSEEK_API_KEY"] = "test-token-placeholder"
+                os.environ["CEREBRAS_API_KEY"] = "test-token-placeholder"
+                os.environ["CLOUDFLARE_ACCOUNT_ID"] = "test-account"
+                os.environ["CLOUDFLARE_API_TOKEN"] = "test-token-placeholder"
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+                    str(root / "provider-credentials.json")
+                )
+                os.environ["AWS_ROLE_ARN"] = (
+                    "arn:aws:iam::123456789012:role/autoreview"
+                )
+                os.environ["AWS_WEB_IDENTITY_TOKEN_FILE"] = str(
+                    root / "web-identity",
+                )
+                os.environ["AWS_CONFIG_FILE"] = str(root / "aws-config")
+                os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(
+                    root / "aws-credentials",
+                )
+                os.environ["NODE_EXTRA_CA_CERTS"] = str(root / "corporate-ca.pem")
+                os.environ["SSL_CERT_FILE"] = str(root / "tls-ca.pem")
+                os.environ["SSL_CERT_DIR"] = str(root / "tls-ca")
+                os.environ["SNOWFLAKE_ACCOUNT"] = "test-account"
+                os.environ["SNOWFLAKE_CORTEX_TOKEN"] = "test-token-placeholder"
+                os.environ["AZURE_RESOURCE_NAME"] = "test-resource"
+                os.environ["ANTHROPIC_OAUTH_TOKEN"] = "test-token-placeholder"
+                os.environ["AWS_BEDROCK_FORCE_HTTP1"] = "1"
+                os.environ["AWS_BEDROCK_SKIP_AUTH"] = "1"
+                os.environ["AZURE_CLIENT_ID"] = "test-client"
+                os.environ["AZURE_CLIENT_SECRET"] = "test-token-placeholder"
+                os.environ["AZURE_TENANT_ID"] = "test-tenant"
+                os.environ["GCLOUD_PROJECT"] = "test-project"
+                os.environ["GOOGLE_CLOUD_PROJECT"] = "test-project"
+                os.environ["CODEX_API_KEY"] = "test-token-placeholder"
+                os.environ["CODEX_CA_CERTIFICATE"] = str(root / "codex-ca.pem")
+                os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+                os.environ["GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"] = "1"
+                os.environ["XDG_DATA_HOME"] = str(root / "opencode-auth")
+
+                for engine in ("opencode", "pi"):
+                    with self.subTest(engine=engine):
+                        env = self.helper["safe_engine_env"](repo, engine=engine)
+                        for key in (
+                            "AWS_ROLE_ARN",
+                            "AWS_BEDROCK_FORCE_HTTP1",
+                            "AWS_BEDROCK_SKIP_AUTH",
+                            "AWS_CONFIG_FILE",
+                            "AWS_SHARED_CREDENTIALS_FILE",
+                            "AWS_WEB_IDENTITY_TOKEN_FILE",
+                            "CEREBRAS_API_KEY",
+                            "CLOUDFLARE_ACCOUNT_ID",
+                            "CLOUDFLARE_API_TOKEN",
+                            "DEEPSEEK_API_KEY",
+                            "GOOGLE_APPLICATION_CREDENTIALS",
+                            "NODE_EXTRA_CA_CERTS",
+                            "SSL_CERT_DIR",
+                            "SSL_CERT_FILE",
+                            "SNOWFLAKE_ACCOUNT",
+                            "SNOWFLAKE_CORTEX_TOKEN",
+                            "AZURE_RESOURCE_NAME",
+                            "ANTHROPIC_OAUTH_TOKEN",
+                        ):
+                            self.assertEqual(env[key], os.environ[key])
+                        self.assertNotIn("NODE_OPTIONS", env)
+                        self.assertNotIn(
+                            "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
+                            env,
+                        )
+                        if engine == "opencode":
+                            self.assertEqual(
+                                env["XDG_DATA_HOME"],
+                                str(root / "opencode-auth"),
+                            )
+
+                claude_env = self.helper["safe_engine_env"](repo, engine="claude")
+                for key in (
+                    "AZURE_CLIENT_ID",
+                    "AZURE_CLIENT_SECRET",
+                    "AZURE_TENANT_ID",
+                    "GCLOUD_PROJECT",
+                    "GOOGLE_CLOUD_PROJECT",
+                    "AWS_ROLE_ARN",
+                    "AWS_CONFIG_FILE",
+                    "AWS_SHARED_CREDENTIALS_FILE",
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    "NODE_EXTRA_CA_CERTS",
+                    "SSL_CERT_DIR",
+                    "SSL_CERT_FILE",
+                ):
+                    self.assertEqual(claude_env[key], os.environ[key])
+                self.assertNotIn("DEEPSEEK_API_KEY", claude_env)
+                self.assertNotIn("NODE_OPTIONS", claude_env)
+                codex_env = self.helper["safe_engine_env"](repo, engine="codex")
+                for key in (
+                    "CODEX_API_KEY",
+                    "CODEX_CA_CERTIFICATE",
+                    "SSL_CERT_DIR",
+                    "SSL_CERT_FILE",
+                ):
+                    self.assertEqual(codex_env[key], os.environ[key])
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_opencode_rejects_repo_local_xdg_auth_store(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["XDG_DATA_HOME"] = str(repo / ".opencode-data")
+                os.environ["AWS_CONFIG_FILE"] = str(repo / ".aws-config")
+                os.environ["NODE_EXTRA_CA_CERTS"] = str(repo / "ca.pem")
+                os.environ["SSL_CERT_FILE"] = str(repo / "tls-ca.pem")
+                os.environ["SSL_CERT_DIR"] = os.pathsep.join(
+                    (str(repo.parent / "tls-ca"), str(repo / "tls-ca")),
+                )
+                env = self.helper["safe_engine_env"](repo, engine="opencode")
+                self.assertNotIn("XDG_DATA_HOME", env)
+                self.assertNotIn("AWS_CONFIG_FILE", env)
+                self.assertNotIn("NODE_EXTRA_CA_CERTS", env)
+                self.assertNotIn("SSL_CERT_FILE", env)
+                self.assertNotIn("SSL_CERT_DIR", env)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_engines_reject_repo_local_config_roots(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["CLAUDE_CONFIG_DIR"] = str(repo / ".claude")
+                os.environ["CODEX_HOME"] = str(repo / ".codex")
+                os.environ["PI_CODING_AGENT_DIR"] = str(repo / ".pi")
+                os.environ["CODEX_CA_CERTIFICATE"] = str(repo / "codex-ca.pem")
+                os.environ["SSL_CERT_FILE"] = str(repo / "tls-ca.pem")
+                os.environ["HOME"] = str(repo)
+                os.environ["USERPROFILE"] = str(repo)
+                claude_env = self.helper["safe_engine_env"](repo, engine="claude")
+                codex_env = self.helper["safe_engine_env"](repo, engine="codex")
+                pi_env = self.helper["safe_engine_env"](repo, engine="pi")
+                self.assertNotIn("CLAUDE_CONFIG_DIR", claude_env)
+                self.assertNotIn("CODEX_HOME", codex_env)
+                self.assertNotIn("CODEX_CA_CERTIFICATE", codex_env)
+                self.assertNotIn("SSL_CERT_FILE", codex_env)
+                self.assertNotIn("PI_CODING_AGENT_DIR", pi_env)
+                self.assertNotIn("HOME", claude_env)
+                self.assertNotIn("USERPROFILE", claude_env)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_codex_auth_config_ignores_repo_local_home(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            config_dir = repo / ".codex"
+            config_dir.mkdir()
+            (config_dir / "config.toml").write_text(
+                'forced_login_method = "api"\n',
+                encoding="utf-8",
+            )
+            try:
+                os.environ["CODEX_HOME"] = str(config_dir)
+                self.assertEqual(self.helper["codex_auth_config_flags"](repo), [])
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_opencode_web_search_preserves_explicit_exa_opt_in(self) -> None:
+        old = os.environ.copy()
+        try:
+            os.environ["OPENCODE_ENABLE_EXA"] = "1"
+            enabled = self.helper["opencode_review_env"](True)
+            disabled = self.helper["opencode_review_env"](False)
+            self.assertEqual(enabled["OPENCODE_ENABLE_EXA"], "1")
+            self.assertNotIn("OPENCODE_ENABLE_EXA", disabled)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
 
     def test_codex_isolation_restricts_tool_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -592,7 +961,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             repo = init_repo(Path(tempdir))
             os.environ["PATH"] = f"{repo}{os.pathsep}{old_path}"
             try:
-                env = self.helper["safe_engine_env"](repo)
+                env = self.helper["safe_engine_env"](repo, engine="codex")
             finally:
                 os.environ["PATH"] = old_path
 
@@ -648,7 +1017,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             try:
                 with mock.patch.object(Path, "exists", fake_exists):
-                    env = self.helper["safe_engine_env"](repo)
+                    env = self.helper["safe_engine_env"](repo, engine="codex")
             finally:
                 os.environ["PATH"] = old_path
 
@@ -670,35 +1039,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("\ufffd", result.stdout)
 
-    def test_large_repo_relative_evidence_file_is_truncated(self) -> None:
+    def test_large_repo_relative_evidence_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             evidence = repo / "evidence.txt"
             evidence.write_text("x" * 600_000, encoding="utf-8")
 
-            _, content, truncated = self.helper["validate_evidence_file"](repo, "evidence.txt", "--dataset")
+            with self.assertRaisesRegex(SystemExit, "file too large to scan safely"):
+                self.helper["validate_evidence_file"](
+                    repo,
+                    "evidence.txt",
+                    "--dataset",
+                )
 
-            self.assertIn("[truncated at 180000 characters]", content)
-            self.assertTrue(truncated)
-
-    def test_copilot_allows_web_fetch_only_when_web_search_is_enabled(self) -> None:
-        captured: list[list[str]] = []
-        prompts: list[str] = []
-
-        def fake_run_with_heartbeat(
-            cmd: list[str],
-            cwd: Path,
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
-            captured.append(cmd)
-            prompts.append((cwd / "prompt.txt").read_text())
-            self.assertTrue((cwd / "repo").is_dir())
-            return subprocess.CompletedProcess(cmd, 0, '{"findings":[]}', "")
-
-        self.helper["run_copilot"].__globals__["run_with_heartbeat"] = fake_run_with_heartbeat
-        self.helper["run_copilot"].__globals__["resolve_command"] = (
-            lambda command, repo: f"/resolved/{command}"
-        )
+    def test_copilot_fails_closed_without_repo_only_read_sandbox(self) -> None:
         args = argparse.Namespace(
             copilot_bin="copilot",
             thinking=None,
@@ -710,44 +1064,35 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            self.helper["run_copilot"](args, repo, "Repository root: .\n\nprompt")
+            with self.assertRaisesRegex(SystemExit, "ignored repository secrets"):
+                self.helper["run_copilot"](
+                    args,
+                    repo,
+                    "Repository root: .\n\nprompt",
+                )
 
-        self.assertNotIn("--allow-tool=web_fetch", captured[-1])
-        self.assertFalse(any(arg == "--allow-all-urls" for arg in captured[-1]))
-        self.assertIn("--add-dir=./repo", captured[-1])
-        self.assertIn("Repository root: ./repo", prompts[-1])
-        self.assertNotIn(str(repo), prompts[-1])
-
-        args.web_search = True
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            self.helper["run_copilot"](args, repo, "Repository root: .\n\nprompt")
-
-        self.assertIn("--allow-tool=web_fetch", captured[-1])
-        self.assertIn("--allow-all-urls", captured[-1])
-
-    def test_claude_inventory_preserves_scoped_permission_rules(self) -> None:
+    def test_claude_inventory_is_bundle_and_web_only(self) -> None:
         args = argparse.Namespace(
-            claude_allowed_tools="Read,Grep,WebFetch(domain:docs.example.com),Bash(git diff *)",
+            claude_allowed_tools="WebFetch(domain:docs.example.com),WebSearch",
             web_search=True,
         )
 
         self.assertEqual(
             self.helper["claude_allowed_tools"](args),
-            "Read,Grep,WebFetch(domain:docs.example.com),Bash(git diff *)",
+            "WebFetch(domain:docs.example.com),WebSearch",
         )
         self.assertEqual(
             self.helper["claude_tool_inventory"](args),
-            "Read,Grep,WebFetch,Bash",
+            "WebFetch,WebSearch",
         )
 
         args.web_search = False
         self.assertEqual(
             self.helper["claude_allowed_tools"](args),
-            "Read,Grep,Bash(git diff *)",
+            "",
         )
 
-        args.claude_allowed_tools = "Read,Edit"
+        args.claude_allowed_tools = "Read"
         with self.assertRaisesRegex(SystemExit, "not read-only"):
             self.helper["claude_tool_inventory"](args)
 
