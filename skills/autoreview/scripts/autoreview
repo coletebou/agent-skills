@@ -228,6 +228,10 @@ BACKTICK_SECRET_REFERENCE_PATTERNS = (
         r")$"
     ),
 )
+BACKTICK_TEMPLATE_INTERPOLATION_PATTERN = re.compile(r"\$\{([^{}\r\n]+)\}")
+BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN = re.compile(
+    r"(?i)(?:(?:Bearer|Basic)[ \t]+|[ \t:./,_-]*)"
+)
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 # Keep this explicit: suffix matching leaks unrelated process credentials such
 # as package-registry and telemetry tokens into reviewer subprocesses.
@@ -1892,6 +1896,29 @@ def safe_secret_call_suffix(text: str, end: int) -> bool:
         return safe_secret_assignment_suffix(text, cursor)
 
 
+def safe_backtick_secret_template(value: str) -> bool:
+    cursor = 0
+    found_interpolation = False
+    for match in BACKTICK_TEMPLATE_INTERPOLATION_PATTERN.finditer(value):
+        literal = value[cursor : match.start()]
+        if BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN.fullmatch(literal) is None:
+            return False
+        expression = match.group(1).strip()
+        quoted_reference = "${" + expression + "}"
+        if not any(
+            pattern.fullmatch(quoted_reference)
+            for pattern in QUOTED_SECRET_REFERENCE_PATTERNS
+        ):
+            return False
+        found_interpolation = True
+        cursor = match.end()
+    literal = value[cursor:]
+    return (
+        found_interpolation
+        and BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN.fullmatch(literal) is not None
+    )
+
+
 def secret_text_risk(text: str) -> bool:
     if any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS):
         return True
@@ -1912,9 +1939,12 @@ def secret_text_risk(text: str) -> bool:
             continue
         if (
             match.group("backtick_value") is not None
-            and any(
-                pattern.fullmatch(value)
-                for pattern in BACKTICK_SECRET_REFERENCE_PATTERNS
+            and (
+                any(
+                    pattern.fullmatch(value)
+                    for pattern in BACKTICK_SECRET_REFERENCE_PATTERNS
+                )
+                or safe_backtick_secret_template(value)
             )
             and safe_secret_assignment_suffix(text, match.end())
         ):

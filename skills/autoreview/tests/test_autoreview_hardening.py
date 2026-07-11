@@ -523,6 +523,31 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_allows_safe_backtick_interpolation(self) -> None:
+        for content in (
+            "to" + "ken = `Bearer ${process.env.TOKEN}`",
+            "pass"
+            + "word = `${user.credentials.password}:${config.passwordSalt}`",
+            "api_" + "key = `${config.primary.apiKey}-${config.secondary.apiKey}`",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_backtick_interpolation_with_literal_secret(
+        self,
+    ) -> None:
+        literal_secret = "hardcoded" + "credential"
+        for content in (
+            "to" + f"ken = `{literal_secret}-${{process.env.TOKEN}}`",
+            "pass"
+            + f"word = `${{user.credentials.password}}-{literal_secret}`",
+            "to"
+            + f'ken = `Bearer ${{process.env.TOKEN || "{literal_secret}"}}`',
+            "pass" + "word = `p@ssw0rd-${process.env.PASSWORD}`",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_rejects_op_backtick_shell_fallbacks(self) -> None:
         content = (
             "pass"
