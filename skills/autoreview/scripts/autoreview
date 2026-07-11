@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import concurrent.futures
 import copy
 import json
@@ -15,7 +16,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 
@@ -59,7 +60,10 @@ SENSITIVE_PATH_PARTS = {
     "private",
     "secrets",
 }
-TRACKED_SENSITIVE_PATH_PARTS = SENSITIVE_PATH_PARTS - {"private", ".docker"}
+TRACKED_SENSITIVE_PATH_PARTS = SENSITIVE_PATH_PARTS - {
+    "private",
+    ".docker",
+}
 TRACKED_CREDENTIAL_DIR_PATTERN = re.compile(
     r"^(?:.*[._-])?"
     r"(secret|secrets|credential|credentials|service[-_]?account|private[-_]?key|api[-_]?key)"
@@ -93,6 +97,46 @@ TRACKED_SENSITIVE_NAME_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
+TRACKED_TOKEN_CREDENTIAL_STEMS = {
+    "access",
+    "account",
+    "auth",
+    "cache",
+    "credentials",
+    "credential",
+    "default",
+    "device",
+    "id",
+    "prod",
+    "production",
+    "refresh",
+    "secret",
+    "secrets",
+    "session",
+    "store",
+    "token",
+    "tokens",
+    "user",
+}
+TRACKED_TOKEN_CREDENTIAL_EXTENSIONS = {
+    "",
+    ".conf",
+    ".config",
+    ".csv",
+    ".dat",
+    ".db",
+    ".enc",
+    ".ini",
+    ".json",
+    ".jsonl",
+    ".jwt",
+    ".sqlite",
+    ".sqlite3",
+    ".txt",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
 SECRET_VALUE_PATTERNS = [
     re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
     re.compile(
@@ -113,8 +157,10 @@ SECRET_VALUE_PATTERNS = [
     re.compile(r"\b(?:A3T|AKIA|ASIA)[A-Z0-9]{16}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
     re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 ]
 MAX_BUNDLE_TEXT_BYTES = 180_000
+MAX_REVIEW_PROMPT_BYTES = 512_000
 SECRET_SCAN_CHUNK_CHARS = 64_000
 SECRET_SCAN_OVERLAP_CHARS = 512
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
@@ -122,6 +168,7 @@ DEFAULT_MODEL_BY_ENGINE = {
     "codex": "gpt-5.6-sol",
     "claude": "claude-fable-5",
 }
+DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
 }
@@ -295,6 +342,7 @@ def safe_engine_env(
 ) -> dict[str, str]:
     blocked_exact = {
         "BASH_ENV",
+        "COPILOT_ALLOW_ALL",
         "ENV",
         "GIT_CONFIG",
         "GIT_CONFIG_GLOBAL",
@@ -893,11 +941,21 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
 
 def sensitive_repo_path_risk(rel: str) -> str | None:
     normalized = rel.replace(os.sep, "/")
-    if path_has_sensitive_part(normalized):
+    if path_has_sensitive_part(normalized) or token_credential_store_path(normalized):
         return "sensitive path"
     if any(pattern.search(normalized) for pattern in SENSITIVE_NAME_PATTERNS):
         return "sensitive filename"
     return None
+
+
+def token_credential_store_path(normalized: str) -> bool:
+    path = Path(normalized)
+    parts = {part.lower() for part in path.parts}
+    return (
+        bool(parts & {"token", "tokens"})
+        and path.stem.lower() in TRACKED_TOKEN_CREDENTIAL_STEMS
+        and path.suffix.lower() in TRACKED_TOKEN_CREDENTIAL_EXTENSIONS
+    )
 
 
 def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
@@ -913,6 +971,7 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
         or parts & TRACKED_SENSITIVE_PATH_PARTS
         or credential_dir
+        or token_credential_store_path(normalized)
     ):
         return "sensitive path"
     if any(pattern.search(normalized) for pattern in TRACKED_SENSITIVE_NAME_PATTERNS):
@@ -1246,7 +1305,7 @@ def build_prompt(repo: Path, target: str, target_ref: str | None, bundle: str, e
     target_line = f"{target} {target_ref}" if target_ref else target
     branch = current_branch(repo)
     scope_policy = review_scope_policy()
-    return textwrap.dedent(
+    prompt = textwrap.dedent(
         f"""
         You are a senior code reviewer. Review the provided git change bundle only.
 
@@ -1268,7 +1327,7 @@ def build_prompt(repo: Path, target: str, target_ref: str | None, bundle: str, e
 
         Review target: {target_line}
         Current branch: {branch}
-        Repository: {repo}
+        Repository root: .
 
         {scope_policy}
 
@@ -1280,6 +1339,13 @@ def build_prompt(repo: Path, target: str, target_ref: str | None, bundle: str, e
         {bundle}
         """
     ).strip()
+    prompt_bytes = len(prompt.encode("utf-8"))
+    if prompt_bytes > MAX_REVIEW_PROMPT_BYTES:
+        raise SystemExit(
+            f"review input is {prompt_bytes} bytes, exceeding the {MAX_REVIEW_PROMPT_BYTES}-byte aggregate limit; "
+            "reduce the change, prompt files, or datasets"
+        )
+    return prompt
 
 
 def write_json_temp(data: dict[str, Any]) -> Path:
@@ -1315,6 +1381,10 @@ def codex_config_isolation_flags(repo: Path) -> list[str]:
         "shell_environment_policy.experimental_use_profile=false",
         "-c",
         "allow_login_shell=false",
+        "-c",
+        'default_permissions="autoreview"',
+        "-c",
+        'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
     ]
 
 
@@ -1456,7 +1526,7 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
         )
     help_result = run([claude_bin, "--help"], repo, check=False, env=engine_env)
     help_text = f"{help_result.stdout}\n{help_result.stderr}"
-    required_flags = ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--disallowedTools"]
+    required_flags = ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--disallowedTools", "--tools"]
     missing = [flag for flag in required_flags if flag not in help_text]
     if help_result.returncode != 0 or missing:
         detail = ", ".join(missing) if missing else "--help failed"
@@ -1528,6 +1598,21 @@ def codex_speed_override(args: argparse.Namespace) -> str | None:
     return f'service_tier="{speed}"'
 
 
+def codex_model_access_failure(result: subprocess.CompletedProcess[str], model: str) -> bool:
+    text = f"{result.stderr}\n{result.stdout}".lower()
+    if model.lower() not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "does not exist or you do not have access",
+            "do not have access to",
+            "don't have access to",
+            "not supported when using codex",
+        )
+    )
+
+
 def codex_command(
     args: argparse.Namespace,
     repo: Path,
@@ -1561,8 +1646,6 @@ def codex_command(
             "--ephemeral",
             "-C",
             str(repo),
-            "-s",
-            "read-only",
             "--output-schema",
             str(schema_path),
             "--output-last-message",
@@ -1579,25 +1662,51 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     schema_path = write_json_temp(SCHEMA)
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as output_file:
         output_path = Path(output_file.name)
+    models = [args.model]
+    fallback_model = getattr(args, "fallback_model", None)
+    if fallback_model and fallback_model != args.model:
+        models.append(fallback_model)
+    primary_failure: subprocess.CompletedProcess[str] | None = None
     try:
-        cmd = codex_command(args, repo, schema_path, output_path, args.model)
-        result = run_with_heartbeat(
-            cmd,
-            repo,
-            input_text=prompt,
-            label="codex",
-            stream_output=args.stream_engine_output,
-            stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
-            env=safe_engine_env(repo, [Path(cmd[0]).parent]),
-        )
-        output = output_path.read_text()
-        if result.returncode == 0:
-            return output or result.stdout
-        detail = result.stderr or result.stdout
-        raise SystemExit(f"codex engine failed ({result.returncode})\n{detail}")
+        for index, model in enumerate(models):
+            output_path.write_text("")
+            cmd = codex_command(args, repo, schema_path, output_path, model)
+            result = run_with_heartbeat(
+                cmd,
+                repo,
+                input_text=prompt,
+                label="codex",
+                stream_output=args.stream_engine_output,
+                stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+                env=safe_engine_env(repo, [Path(cmd[0]).parent]),
+            )
+            output = output_path.read_text()
+            if result.returncode == 0:
+                return output or result.stdout
+            if (
+                index == 0
+                and len(models) > 1
+                and model
+                and codex_model_access_failure(result, model)
+            ):
+                primary_failure = result
+                print(
+                    f"codex model {model} is unavailable for this account; retrying with {models[1]}",
+                    file=sys.stderr,
+                )
+                continue
+            detail = result.stderr or result.stdout
+            if primary_failure is not None:
+                primary_detail = primary_failure.stderr or primary_failure.stdout
+                raise SystemExit(
+                    f"codex engine failed with primary model ({primary_failure.returncode})\n{primary_detail}\n"
+                    f"codex fallback model failed ({result.returncode})\n{detail}"
+                )
+            raise SystemExit(f"codex engine failed ({result.returncode})\n{detail}")
     finally:
         schema_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
+    raise AssertionError("unreachable")
 
 
 def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
@@ -1613,7 +1722,8 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         json.dumps(SCHEMA),
     ]
     if args.tools:
-        cmd.extend(["--allowedTools", claude_allowed_tools(args)])
+        allowed_tools = claude_allowed_tools(args)
+        cmd.extend(["--tools", claude_tool_inventory(args), "--allowedTools", allowed_tools])
     else:
         cmd.extend(["--tools", ""])
     if args.stream_engine_output:
@@ -1653,13 +1763,62 @@ def run_copilot(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     # Copilot child processes can briefly retain this cwd on Windows after a
     # successful review. Cleanup failure must not replace the review result.
     with tempfile.TemporaryDirectory(prefix="autoreview-copilot.", ignore_cleanup_errors=True) as tempdir:
-        prompt_path = Path(tempdir) / "prompt.txt"
-        prompt_path.write_text(prompt)
+        temp_root = Path(tempdir)
+        repo_alias = temp_root / "repo"
+        try:
+            repo_alias.symlink_to(repo, target_is_directory=True)
+        except OSError as exc:
+            if os.name != "nt":
+                raise SystemExit(f"copilot engine could not create the temporary repository alias: {exc}") from exc
+            import ctypes
+
+            buffer = ctypes.create_unicode_buffer(32_768)
+            length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
+            if length == 0 or length >= len(buffer):
+                raise SystemExit("copilot engine could not resolve the Windows system directory") from exc
+            powershell = Path(buffer.value) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+            if not powershell.is_file() or is_within(powershell.resolve(), repo.resolve()):
+                raise SystemExit("copilot engine could not resolve a trusted Windows PowerShell executable") from exc
+            alias_literal = str(repo_alias).replace("'", "''")
+            repo_literal = str(repo).replace("'", "''")
+            script = (
+                f"New-Item -ItemType Junction -LiteralPath '{alias_literal}' "
+                f"-Target '{repo_literal}' -ErrorAction Stop | Out-Null"
+            )
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            result = subprocess.run(
+                [
+                    str(powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                cwd=temp_root,
+                env=safe_engine_env(repo, [powershell.parent]),
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0 or not repo_alias.is_dir():
+                raise SystemExit(
+                    "copilot engine could not create the temporary repository junction: "
+                    + (result.stderr or result.stdout)
+                )
+        root_marker = "Repository root: ."
+        copilot_prompt = prompt.replace(root_marker, "Repository root: ./repo", 1)
+        if root_marker not in prompt:
+            copilot_prompt = f"Repository root: ./repo\n\n{prompt}"
+        prompt_path = temp_root / "prompt.txt"
+        prompt_path.write_text(copilot_prompt)
         os.chmod(prompt_path, 0o600)
         cmd = [
             resolve_command(args.copilot_bin, repo),
             "-C",
             tempdir,
+            "--add-dir=./repo",
             "-p",
             "Read ./prompt.txt and follow it exactly. Return only the requested JSON object.",
             "--output-format",
@@ -1742,7 +1901,7 @@ def cursor_local_mcp_paths(repo: Path) -> list[Path]:
     return [path for path in candidates if path.exists()]
 
 
-def cursor_global_mcp_paths() -> list[Path]:
+def cursor_home_candidates() -> set[Path]:
     home_candidates = [Path.home()]
     for name in ("HOME", "USERPROFILE"):
         if value := os.environ.get(name):
@@ -1750,8 +1909,38 @@ def cursor_global_mcp_paths() -> list[Path]:
     if drive := os.environ.get("HOMEDRIVE"):
         if home_path := os.environ.get("HOMEPATH"):
             home_candidates.append(Path(f"{drive}{home_path}"))
-    paths = {home / ".cursor" / "mcp.json" for home in home_candidates}
+    return set(home_candidates)
+
+
+def cursor_global_mcp_paths() -> list[Path]:
+    paths = {home / ".cursor" / "mcp.json" for home in cursor_home_candidates()}
     return sorted((path for path in paths if path.exists()), key=str)
+
+
+def json_file_declares_hooks(path: Path) -> bool:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("hooks"):
+        return True
+    enabled_plugins = parsed.get("enabledPlugins")
+    return isinstance(enabled_plugins, dict) and any(bool(enabled) for enabled in enabled_plugins.values())
+
+
+def cursor_global_hook_paths() -> list[Path]:
+    paths: set[Path] = set()
+    for home in cursor_home_candidates():
+        cursor_hooks = home / ".cursor" / "hooks.json"
+        if cursor_hooks.exists():
+            paths.add(cursor_hooks)
+        for name in ("settings.json", "settings.local.json"):
+            claude_settings = home / ".claude" / name
+            if claude_settings.exists() and json_file_declares_hooks(claude_settings):
+                paths.add(claude_settings)
+    return sorted(paths, key=str)
 
 
 def cursor_local_hook_paths(repo: Path) -> list[Path]:
@@ -1875,6 +2064,7 @@ def run_cursor(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     local_mcp_paths = cursor_local_mcp_paths(repo)
     global_mcp_paths = cursor_global_mcp_paths()
     local_hook_paths = cursor_local_hook_paths(repo)
+    global_hook_paths = cursor_global_hook_paths()
     local_permission_paths = cursor_local_permission_paths(repo)
     if not args.cursor_allow_workspace_instructions:
         raise SystemExit(
@@ -1886,6 +2076,10 @@ def run_cursor(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             "cursor engine refused project-local hooks: "
             + format_repo_paths(repo, local_hook_paths)
             + ". Cursor hooks execute host commands outside review tool permissions."
+        )
+    if global_hook_paths:
+        raise SystemExit(
+            "cursor engine refused user-level hooks because Cursor can execute them outside the temporary review config."
         )
     if local_mcp_paths:
         raise SystemExit(
@@ -2177,11 +2371,36 @@ def format_cursor_usage(usage: Any) -> str:
     return "cursor usage: " + " ".join(parts) if parts else "cursor usage: unavailable"
 
 
-def claude_allowed_tools(args: argparse.Namespace) -> str:
+def claude_tool_name(rule: str) -> str:
+    match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)(?:\(|$)", rule)
+    if not match:
+        raise SystemExit(f"invalid Claude tool rule: {rule}")
+    return match.group(1)
+
+
+def claude_tool_rules(args: argparse.Namespace) -> list[str]:
     tools = [tool.strip() for tool in args.claude_allowed_tools.split(",") if tool.strip()]
     if not args.web_search:
-        tools = [tool for tool in tools if tool not in {"WebSearch", "WebFetch"}]
-    return ",".join(tools)
+        tools = [tool for tool in tools if claude_tool_name(tool) not in {"WebSearch", "WebFetch"}]
+    return tools
+
+
+def claude_allowed_tools(args: argparse.Namespace) -> str:
+    return ",".join(claude_tool_rules(args))
+
+
+def claude_tool_inventory(args: argparse.Namespace) -> str:
+    safe_tools = {"Bash", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}
+    names: list[str] = []
+    for rule in claude_tool_rules(args):
+        name = claude_tool_name(rule)
+        if name not in safe_tools:
+            raise SystemExit(f"Claude review tool is not read-only: {name}")
+        if name == "Bash" and not rule.startswith("Bash("):
+            raise SystemExit("Claude review Bash access must use a scoped Bash(...) rule")
+        if name not in names:
+            names.append(name)
+    return ",".join(names)
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -2454,7 +2673,7 @@ if "--version" in args or "-v" in args:
     print(os.environ.get("AUTOREVIEW_FAKE_CLAUDE_VERSION", "2.1.170 (Claude Code)"))
     raise SystemExit(0)
 if "--help" in args or "-h" in args:
-    print("--safe-mode\n--setting-sources\n--strict-mcp-config\n--disallowedTools\n--print\n--json-schema")
+    print("--safe-mode\n--setting-sources\n--strict-mcp-config\n--disallowedTools\n--tools\n--print\n--json-schema")
     raise SystemExit(0)
 record = os.environ["AUTOREVIEW_FAKE_RECORD"]
 Path(record).write_text(json.dumps({"argv": args, "cwd": os.getcwd(), "stdin": sys.stdin.read()}))
@@ -2670,13 +2889,14 @@ def self_test_engine_isolation() -> int:
                 'cli_auth_credentials_store="auto"',
                 'forced_login_method="chatgpt"',
                 'forced_chatgpt_workspace_id=["workspace-one", "workspace-two"]',
+                'default_permissions="autoreview"',
+                'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
                 "--ephemeral",
                 str(repo),
-                "read-only",
             ]:
                 if required not in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: missing {required}")
-            for forbidden in ["hostile-user-model"]:
+            for forbidden in ["hostile-user-model", "read-only"]:
                 if forbidden in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: leaked {forbidden}")
             if Path(codex_record["cwd"]).resolve() != repo.resolve():
@@ -2686,6 +2906,10 @@ def self_test_engine_isolation() -> int:
             claude_record = json.loads(record_path.read_text())
             claude_argv = claude_record["argv"]
             for required in claude_review_isolation_flags():
+                if required not in claude_argv:
+                    raise SystemExit(f"claude isolation self-test failed: missing {required}")
+            allowed_tools = claude_allowed_tools(args)
+            for required in ["--tools", allowed_tools, "--allowedTools"]:
                 if required not in claude_argv:
                     raise SystemExit(f"claude isolation self-test failed: missing {required}")
             if Path(claude_record["cwd"]).resolve() != repo.resolve():
@@ -2792,6 +3016,17 @@ def self_test_engine_isolation() -> int:
             else:
                 raise SystemExit("cursor isolation self-test failed: local permission config should be refused")
             (repo / ".cursor" / "cli.json").unlink()
+            user_hooks = test_home / ".cursor" / "hooks.json"
+            user_hooks.parent.mkdir()
+            user_hooks.write_text("{}\n")
+            try:
+                run_cursor(args, repo, "review hostile patch")
+            except SystemExit as exc:
+                if "user-level hooks" not in str(exc):
+                    raise
+            else:
+                raise SystemExit("cursor isolation self-test failed: user-level hooks should be refused")
+            user_hooks.unlink()
             run_cursor(args, repo, "review hostile patch")
             cursor_record = json.loads(record_path.read_text())
             cursor_argv = cursor_record["argv"]
@@ -3242,12 +3477,20 @@ def validate_report(report: dict[str, Any], repo: Path, changed_paths: set[str],
         location = finding.get("code_location")
         if not isinstance(location, dict):
             raise SystemExit(f"finding {index} missing code_location")
-        rel = str(location.get("file_path", "")).strip()
-        line = location.get("line")
-        if not rel or not isinstance(line, int) or line < 1:
+        raw_rel = str(location.get("file_path", "")).strip()
+        if not raw_rel:
             raise SystemExit(f"finding {index} has invalid location: {location}")
-        if Path(rel).is_absolute() or ".." in Path(rel).parts:
+        normalized_rel = raw_rel if raw_rel in changed_paths else raw_rel.replace("\\", "/")
+        while normalized_rel.startswith("./"):
+            normalized_rel = normalized_rel[2:]
+        rel_path = PurePosixPath(normalized_rel)
+        rel = rel_path.as_posix()
+        line = location.get("line")
+        if not isinstance(line, int) or line < 1:
+            raise SystemExit(f"finding {index} has invalid location: {location}")
+        if rel_path.is_absolute() or ".." in rel_path.parts or re.match(r"^[A-Za-z]:/", rel):
             raise SystemExit(f"finding {index} uses invalid file path: {rel}")
+        location["file_path"] = rel
         if rel not in changed_paths:
             ignored_findings.append((index, finding, rel, line))
             continue
@@ -3343,7 +3586,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol, claude=claude-fable-5.",
+        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol with an access-only gpt-5.6-terra retry, claude=claude-fable-5.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh. Claude: low, medium, high, xhigh, max. Droid: off, none, low, medium, high. Pi: off, minimal, low, medium, high, xhigh. OpenCode: minimal, low, medium, high, max. Cursor: none.")
     parser.add_argument(
@@ -3585,6 +3828,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
                 or env_fallback_by_engine.get(engine)
                 or env_global_fallback
             )
+        elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
+            fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
         else:
             fallback_model = None
         if thinking and thinking not in THINKING_LEVELS_BY_ENGINE[engine]:
@@ -3751,9 +3996,14 @@ def self_test_config_defaults() -> None:
         default_codex = reviewer_args(reviewer_test_args(engine="codex"))[0]
         if default_codex.model != "gpt-5.6-sol":
             raise SystemExit(f"self-test config defaults failed: default codex model={default_codex.model!r}")
-        if default_codex.fallback_model is not None:
+        if default_codex.fallback_model != "gpt-5.6-terra":
             raise SystemExit(
                 f"self-test config defaults failed: default codex fallback={default_codex.fallback_model!r}"
+            )
+        explicit_sol = reviewer_args(reviewer_test_args(engine="codex", model=["gpt-5.6-sol"]))[0]
+        if explicit_sol.fallback_model != "gpt-5.6-terra":
+            raise SystemExit(
+                f"self-test config defaults failed: explicit Sol access fallback={explicit_sol.fallback_model!r}"
             )
         if default_codex.thinking != "high":
             raise SystemExit(f"self-test config defaults failed: default codex thinking={default_codex.thinking!r}")
@@ -3850,9 +4100,9 @@ def self_test_fallback_scope() -> None:
         reviewers = reviewer_args(base)
         codex = next(r for r in reviewers if r.engine == "codex")
         claude = next(r for r in reviewers if r.engine == "claude")
-        if codex.fallback_model is not None:
+        if codex.fallback_model != "gpt-5.6-terra":
             raise SystemExit(
-                f"self-test fallback scope failed: codex fallback={codex.fallback_model!r}"
+                f"self-test fallback scope failed: codex access fallback={codex.fallback_model!r}"
             )
         if claude.fallback_model != "env-claude-fallback":
             raise SystemExit(f"self-test fallback scope failed: claude fallback={claude.fallback_model!r}")
@@ -3877,7 +4127,7 @@ def self_test_fallback_scope() -> None:
         panel = reviewer_args(reviewer_test_args(reviewers="codex,claude", fallback_model=["cli-global"]))
         panel_codex = next(r for r in panel if r.engine == "codex")
         panel_claude = next(r for r in panel if r.engine == "claude")
-        if panel_codex.fallback_model is not None or panel_claude.fallback_model != "cli-global":
+        if panel_codex.fallback_model != "gpt-5.6-terra" or panel_claude.fallback_model != "cli-global":
             raise SystemExit("self-test fallback scope failed: CLI global fallback should apply only to Claude panel reviewers")
         try:
             reviewer_args(reviewer_test_args(engine="codex", fallback_model=["cli-global"]))

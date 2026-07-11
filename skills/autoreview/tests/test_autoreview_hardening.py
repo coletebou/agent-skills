@@ -56,12 +56,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.helper = load_helper()
 
     def test_local_bundle_blocks_sensitive_untracked_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            (repo / ".env").write_text("placeholder=true\n", encoding="utf-8")
+        for rel in (".env", "tokens/session.dat"):
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("placeholder=true\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(SystemExit, "untracked sensitive files"):
-                self.helper["local_bundle"](repo)
+                with self.assertRaisesRegex(SystemExit, "untracked sensitive files"):
+                    self.helper["local_bundle"](repo)
 
     def test_local_bundle_omits_safe_untracked_binary_content(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -148,6 +151,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
         for rel in (
             "tokenizer.py",
             "token_count.ts",
+            "src/token/parser.py",
+            "src/token/session.ts",
+            "internal/tokens/types.go",
+            "packages/token/package.json",
+            "scripts/tokens/session.sh",
+            "src/tokens/session.mjs",
+            "ui/tokens/session.vue",
+            "proto/token/session.proto",
             "password_validator.go",
             ".env.example",
             "private/parser.py",
@@ -158,6 +169,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["tracked_sensitive_repo_path_risk"](rel))
+
+    def test_untracked_token_source_paths_remain_reviewable(self) -> None:
+        for rel in (
+            "src/token/parser.py",
+            "src/token/session.ts",
+            "scripts/tokens/session.sh",
+            "src/tokens/session.mjs",
+            "ui/tokens/session.vue",
+            "proto/token/session.proto",
+        ):
+            with self.subTest(rel=rel):
+                self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
     def test_tracked_env_variants_remain_sensitive(self) -> None:
         for rel in (
@@ -186,6 +209,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "credentials/prod.json",
             "prod-credentials/client.conf",
             "client-secrets/account.ini",
+            "token/production.json",
+            "tokens/production.json",
+            "tokens/session.dat",
+            "tokens/cache.json",
+            "token/user.json",
+            "tokens/device.sqlite",
+            "tokens/session.jwt",
+            "tokens/session",
             "credentials.txt",
             "client-secret.csv",
             ".docker/config.json",
@@ -200,6 +231,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
         content = '{"' + 'api_key": "' + "a" * 24 + '"}'
 
         self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_handles_raw_jwt(self) -> None:
+        content = ".".join(
+            (
+                "eyJhbGciOiJIUzI1NiJ9",
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                "signatureplaceholder",
+            )
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_dotted_config_keys(self) -> None:
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                'permissions.autoreview.filesystem={":minimal"="read"}'
+            )
+        )
 
     def test_secret_detector_handles_punctuation_and_multiline_diff_values(self) -> None:
         value = "Correct-Horse!" + "@Battery$Staple"
@@ -383,6 +432,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIn("# Prompt file: review.md", prompt)
             self.assertFalse(truncated)
 
+    def test_build_prompt_omits_absolute_repo_path_and_caps_aggregate_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            prompt = self.helper["build_prompt"](repo, "local", None, "diff", "", "")
+
+            self.assertIn("Repository root: .", prompt)
+            self.assertNotIn(str(repo), prompt)
+            with self.assertRaisesRegex(SystemExit, "aggregate limit"):
+                self.helper["build_prompt"](
+                    repo,
+                    "local",
+                    None,
+                    "x" * self.helper["MAX_REVIEW_PROMPT_BYTES"],
+                    "",
+                    "",
+                )
+
     def test_cursor_refuses_global_mcp_config(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -397,9 +463,47 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 cursor_allow_workspace_instructions=True,
             )
 
-            with mock.patch.object(Path, "home", return_value=root):
+            with mock.patch.object(Path, "home", return_value=root), mock.patch.dict(
+                os.environ,
+                {"HOME": str(root), "USERPROFILE": str(root)},
+            ):
                 with self.assertRaisesRegex(SystemExit, "cursor engine refused global MCP config"):
                     self.helper["run_cursor"](args, repo, "prompt")
+
+    def test_cursor_refuses_user_level_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            settings = root / ".claude" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text('{"hooks":{"PreToolUse":[{"command":"unsafe"}]}}\n', encoding="utf-8")
+            args = argparse.Namespace(
+                thinking=None,
+                tools=True,
+                web_search=True,
+                cursor_allow_workspace_instructions=True,
+            )
+
+            with mock.patch.object(Path, "home", return_value=root), mock.patch.dict(
+                os.environ,
+                {"HOME": str(root), "USERPROFILE": str(root)},
+            ):
+                with self.assertRaisesRegex(SystemExit, "cursor engine refused user-level hooks"):
+                    self.helper["run_cursor"](args, repo, "prompt")
+
+            settings.write_text('{"permissions":{"allow":["Read(**)"]}}\n', encoding="utf-8")
+            with mock.patch.object(Path, "home", return_value=root), mock.patch.dict(
+                os.environ,
+                {"HOME": str(root), "USERPROFILE": str(root)},
+            ):
+                self.assertEqual(self.helper["cursor_global_hook_paths"](), [])
+
+            settings.write_text('{"enabledPlugins":{"review-hooks@example":true}}\n', encoding="utf-8")
+            with mock.patch.object(Path, "home", return_value=root), mock.patch.dict(
+                os.environ,
+                {"HOME": str(root), "USERPROFILE": str(root)},
+            ):
+                self.assertEqual(self.helper["cursor_global_hook_paths"](), [settings])
 
     def test_read_text_truncates_without_scanning_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -442,6 +546,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["GIT_CONFIG_COUNT"] = "99"
                 os.environ["DYLD_INSERT_LIBRARIES"] = "/tmp/unsafe.dylib"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+                os.environ["COPILOT_ALLOW_ALL"] = "1"
                 os.environ["GITHUB_TOKEN"] = "test-token-placeholder"
                 os.environ["HTTPS_PROXY"] = "http://proxy.example.invalid:8080"
 
@@ -454,6 +559,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
                 self.assertNotIn("DYLD_INSERT_LIBRARIES", env)
                 self.assertNotIn("NODE_OPTIONS", env)
+                self.assertNotIn("COPILOT_ALLOW_ALL", env)
                 self.assertEqual(env["GITHUB_TOKEN"], "test-token-placeholder")
                 self.assertEqual(env["HTTPS_PROXY"], "http://proxy.example.invalid:8080")
             finally:
@@ -470,6 +576,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "shell_environment_policy.ignore_default_excludes=false",
             "shell_environment_policy.experimental_use_profile=false",
             "allow_login_shell=false",
+            'default_permissions="autoreview"',
+            'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
         ):
             self.assertIn(required, flags)
         set_flag = next(
@@ -489,6 +597,40 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["PATH"] = old_path
 
             self.assertNotIn(str(repo.resolve()), env["PATH"].split(os.pathsep))
+
+    def test_validate_report_normalizes_relative_finding_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            report = {
+                "findings": [
+                    {
+                        "title": "Finding",
+                        "body": "Body",
+                        "priority": "P1",
+                        "confidence": 0.9,
+                        "category": "bug",
+                        "code_location": {"file_path": r".\src\index.ts", "line": 1},
+                    }
+                ],
+                "overall_correctness": "patch is incorrect",
+                "overall_explanation": "Explanation",
+                "overall_confidence": 0.9,
+            }
+
+            self.helper["validate_report"](report, repo, {"src/index.ts"}, [])
+
+            self.assertEqual(report["findings"][0]["code_location"]["file_path"], "src/index.ts")
+
+            report["findings"][0]["code_location"]["file_path"] = r"src\index.ts"
+            self.helper["validate_report"](report, repo, {r"src\index.ts"}, [])
+            self.assertEqual(
+                report["findings"][0]["code_location"]["file_path"],
+                r"src\index.ts",
+            )
+
+            report["findings"][0]["code_location"]["file_path"] = " "
+            with self.assertRaisesRegex(SystemExit, "invalid location"):
+                self.helper["validate_report"](report, repo, {"src/index.ts"}, [])
 
     def test_safe_engine_env_ignores_inaccessible_path_entries(self) -> None:
         old_path = os.environ.get("PATH", "")
@@ -541,6 +683,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_copilot_allows_web_fetch_only_when_web_search_is_enabled(self) -> None:
         captured: list[list[str]] = []
+        prompts: list[str] = []
 
         def fake_run_with_heartbeat(
             cmd: list[str],
@@ -548,6 +691,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             captured.append(cmd)
+            prompts.append((cwd / "prompt.txt").read_text())
+            self.assertTrue((cwd / "repo").is_dir())
             return subprocess.CompletedProcess(cmd, 0, '{"findings":[]}', "")
 
         self.helper["run_copilot"].__globals__["run_with_heartbeat"] = fake_run_with_heartbeat
@@ -563,16 +708,48 @@ class AutoreviewHardeningTests(unittest.TestCase):
             stream_engine_output=False,
         )
 
-        self.helper["run_copilot"](args, Path("/repo"), "prompt")
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            self.helper["run_copilot"](args, repo, "Repository root: .\n\nprompt")
 
         self.assertNotIn("--allow-tool=web_fetch", captured[-1])
         self.assertFalse(any(arg == "--allow-all-urls" for arg in captured[-1]))
+        self.assertIn("--add-dir=./repo", captured[-1])
+        self.assertIn("Repository root: ./repo", prompts[-1])
+        self.assertNotIn(str(repo), prompts[-1])
 
         args.web_search = True
-        self.helper["run_copilot"](args, Path("/repo"), "prompt")
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            self.helper["run_copilot"](args, repo, "Repository root: .\n\nprompt")
 
         self.assertIn("--allow-tool=web_fetch", captured[-1])
         self.assertIn("--allow-all-urls", captured[-1])
+
+    def test_claude_inventory_preserves_scoped_permission_rules(self) -> None:
+        args = argparse.Namespace(
+            claude_allowed_tools="Read,Grep,WebFetch(domain:docs.example.com),Bash(git diff *)",
+            web_search=True,
+        )
+
+        self.assertEqual(
+            self.helper["claude_allowed_tools"](args),
+            "Read,Grep,WebFetch(domain:docs.example.com),Bash(git diff *)",
+        )
+        self.assertEqual(
+            self.helper["claude_tool_inventory"](args),
+            "Read,Grep,WebFetch,Bash",
+        )
+
+        args.web_search = False
+        self.assertEqual(
+            self.helper["claude_allowed_tools"](args),
+            "Read,Grep,Bash(git diff *)",
+        )
+
+        args.claude_allowed_tools = "Read,Edit"
+        with self.assertRaisesRegex(SystemExit, "not read-only"):
+            self.helper["claude_tool_inventory"](args)
 
     def test_self_test_shortcut_runs_deterministic_checks(self) -> None:
         command = [str(SCRIPT), "--self-test"]
