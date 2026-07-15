@@ -328,8 +328,9 @@ Examples matching current `main` behavior:
 # Codex with explicit model and reasoning
 "$AUTOREVIEW" --engine codex --model gpt-5.6-sol --thinking high
 
-# Codex fast mode (priority service tier); needs a model whose catalog lists the tier, silently standard otherwise
-"$AUTOREVIEW" --engine codex --codex-speed fast
+# ChatGPT auth selects fast mode by default; explicitly restore standard service when desired
+"$AUTOREVIEW" --engine codex --codex-auth chatgpt
+"$AUTOREVIEW" --engine codex --codex-auth chatgpt --codex-speed default
 
 # Safe Codex model/response tuning overrides (--codex-speed wins over a service_tier here)
 "$AUTOREVIEW" --engine codex --codex-config 'service_tier="fast"'
@@ -372,7 +373,7 @@ loader such as an untracked `.envrc`; the helper does not write a config file.
 | `AUTOREVIEW_<ENGINE>_MODEL`         | Per-engine model override, for example `AUTOREVIEW_CODEX_MODEL=gpt-5.6-sol`                                                      |
 | `AUTOREVIEW_<ENGINE>_THINKING`      | Per-engine thinking override                                                                                                     |
 | `AUTOREVIEW_CODEX_CONFIG`           | Safe Codex model/response tuning overrides, semicolon-separated, e.g. `service_tier="fast"`; capability-bearing keys fail closed |
-| `AUTOREVIEW_CODEX_SPEED`            | Codex service tier override: `fast` (priority), `flex`, or `default`; silently standard when the model does not list the tier    |
+| `AUTOREVIEW_CODEX_SPEED`            | Codex service tier override: `fast`, `flex`, or `default`; ChatGPT auth otherwise defaults to fast, provider profiles do not   |
 | `AUTOREVIEW_CODEX_PROFILE`          | Named Codex config profile staged into the isolated runtime; currently supports `amazon-bedrock` with env credentials            |
 | `AUTOREVIEW_CODEX_AUTH`             | `default` preserves API/provider env; `chatgpt` removes it and forces the stored ChatGPT login                                   |
 | `AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA` | Disable Codex CLI strict schema enforcement; automatically disabled for non-OpenAI profiles                                      |
@@ -380,8 +381,25 @@ loader such as an untracked `.envrc`; the helper does not write a config file.
 | `AUTOREVIEW_CLAUDE_BEDROCK_REGION`  | Required AWS region for explicit Claude Bedrock auth unless `AWS_REGION` or `AWS_DEFAULT_REGION` is already set                  |
 | `AUTOREVIEW_CLAUDE_FALLBACK_MODEL`  | Claude-only fallback chain                                                                                                       |
 | `AUTOREVIEW_PROVIDER_ENV_ALLOW`     | Comma-separated custom Pi/OpenCode credential variable names; names must end in a recognized credential suffix                   |
+| `AUTOREVIEW_RUN_LOG_DIR`            | Private history root; defaults to `$XDG_STATE_HOME/autoreview` or `~/.local/state/autoreview`                                   |
+| `AUTOREVIEW_RUN_LOG`                | Set to `0` to disable persistent run history                                                                                    |
+| `AUTOREVIEW_RUN_LOG_BUNDLE`         | Set to `1` to opt into persisting exact scanner-approved bundle and report artifacts; disabled by default                       |
 
 Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored. Use `--codex-auth chatgpt` to prevent ambient API keys or relays from overriding Codex's stored ChatGPT login. Use `--claude-auth subscription` for the Claude Code login, or `--claude-auth bedrock --claude-bedrock-region REGION` to route Claude through AWS credentials without loading user settings that can override the provider.
+
+## Run History
+
+Every non-dry review writes owner-only metadata to a unique run directory outside the reviewed repository. Opt-in artifact logging additionally writes the exact scanner-approved `bundle.txt` and final `report.json`. Metadata includes target/ref, bundle hash and size, changed paths, prompt-pass sizes, reviewer model/reasoning/auth/profile/requested speed, per-reviewer duration and usable-review outcome, individual model attempts, refusal retries/fallbacks, finding counts, test status, total duration, and exit status. Requested speed records what autoreview passed to Codex; a provider may silently use standard service when that model does not support the requested tier. The history summary separates model-call success from validated-review success. Credentials, environment values, full finding bodies, prompts beyond explicitly logged artifacts, and raw engine output are never in default metadata history. `autoreview-history` reads the independent atomic metadata files directly, so concurrent runs do not share a writable index.
+
+Inspect longitudinal model and speed results with:
+
+```bash
+"$(dirname "$AUTOREVIEW")/autoreview-history"
+"$(dirname "$AUTOREVIEW")/autoreview-history" --last 50 --engine codex
+"$(dirname "$AUTOREVIEW")/autoreview-history" --json
+```
+
+Use `--run-log-dir PATH` to choose another external history root, `--log-bundle` to persist the validated bundle and report artifacts, or `--no-run-log` to disable history for one run. `--no-log-bundle` overrides an environment opt-in. Explicit paths and their writes fail closed; paths inside the reviewed repository are rejected so generated review artifacts cannot be committed accidentally. The implicit default is best-effort: if its XDG/home location is unavailable or overlaps the repository (for example, a home-root dotfiles checkout), autoreview tries a private per-user system-temp root, then continues the review with a warning if history is still unavailable.
 
 ## Review engine isolation
 
@@ -445,8 +463,8 @@ The helper:
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
 - scans safe Git patches in full, recognizes synthetic fixture values tied to their credential field, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
-- writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
-- supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
+- writes owner-only run history outside the repository by default; `--no-run-log` disables it, while `--output`, `--json-output`, and live streamed engine stderr remain explicit
+- supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, run-history controls, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
 - uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-5[1m]`/`high` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
