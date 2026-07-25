@@ -12454,30 +12454,40 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or global_model
             or env_model_by_engine.get(engine)
             or env_global_model
-            or (
+        )
+        if model is None:
+            model = (
                 None
                 if engine == "codex" and codex_profile is not None
-                else DEFAULT_MODEL_BY_ENGINE.get(engine)
+                else (
+                    DEFAULT_CLAUDE_BEDROCK_MODEL
+                    if engine == "claude" and claude_auth == "bedrock"
+                    else DEFAULT_MODEL_BY_ENGINE.get(engine)
+                )
             )
-        )
         if (
             engine == "claude"
             and claude_auth == "bedrock"
-            and model == DEFAULT_MODEL_BY_ENGINE["claude"]
+            and model in {"claude-fable-5", "claude-opus-4-8", "claude-opus-5"}
         ):
-            model = DEFAULT_CLAUDE_BEDROCK_MODEL
+            model = f"global.anthropic.{model}"
         thinking = (
             inline_thinking
             or thinking_by_engine.get(engine)
             or global_thinking
             or env_thinking_by_engine.get(engine)
             or env_global_thinking
-            or (
+        )
+        if thinking is None:
+            thinking = (
                 None
                 if engine == "codex" and codex_profile is not None
-                else DEFAULT_THINKING_BY_ENGINE.get(engine)
+                else (
+                    DEFAULT_CLAUDE_BEDROCK_THINKING
+                    if engine == "claude" and claude_auth == "bedrock"
+                    else DEFAULT_THINKING_BY_ENGINE.get(engine)
+                )
             )
-        )
         if engine == "claude":
             fallback_model = (
                 fallback_by_engine.get(engine)
@@ -12776,6 +12786,27 @@ def self_test_config_defaults() -> None:
         if bedrock_claude.model != DEFAULT_CLAUDE_BEDROCK_MODEL:
             raise SystemExit(
                 "self-test config defaults failed: Claude Bedrock model was not mapped"
+            )
+        if bedrock_claude.thinking != DEFAULT_CLAUDE_BEDROCK_THINKING:
+            raise SystemExit(
+                "self-test config defaults failed: Claude Bedrock thinking was not mapped"
+            )
+        bedrock_claude_override = reviewer_args(
+            reviewer_test_args(
+                engine="claude",
+                claude_auth="bedrock",
+                claude_bedrock_region="us-east-1",
+                model=["claude-fable-5"],
+                thinking=["max"],
+            )
+        )[0]
+        if (
+            bedrock_claude_override.model != "global.anthropic.claude-fable-5"
+            or bedrock_claude_override.thinking != "max"
+        ):
+            raise SystemExit(
+                "self-test config defaults failed: explicit Claude Bedrock "
+                "model/thinking did not override auth defaults"
             )
         chatgpt_codex = reviewer_args(
             reviewer_test_args(engine="codex", codex_auth="chatgpt")
