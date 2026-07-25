@@ -7,7 +7,7 @@ description: "Pre-commit/ship code review: Codex default; optional Claude or Pi.
 
 Run the bundled structured review helper as a closeout check. This is code review, not Guardian `auto_review` approval routing.
 
-Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, selects the `fast` service tier when `--codex-auth chatgpt` or `AUTOREVIEW_CODEX_AUTH=chatgpt` is set, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Default/provider auth is never guessed, and provider profiles stay on their configured tier. Claude review is optional. Subscription/default auth uses `claude-fable-5` with `high` effort; Bedrock auth uses `global.anthropic.claude-opus-5[1m]` with `xhigh` effort.
+Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, selects the `fast` service tier when `--codex-auth chatgpt` or `AUTOREVIEW_CODEX_AUTH=chatgpt` is set, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Default/provider auth is never guessed, and provider profiles stay on their configured tier. Claude review is optional. Subscription/default auth uses `claude-fable-5` with `high` effort; Bedrock auth uses `global.anthropic.claude-opus-5[1m]` with the same `high` effort; bare `claude-*` aliases are routed through the `global.` inference profile, while an ARN or an explicit `us.`/`eu.`/`us-gov.`/`global.` profile is passed through unchanged.
 
 For user-visible behavior, pair autoreview with `behavior-validator`. Autoreview is source-aware and judges the change bundle; behavior validation is source-blind and judges the running product or tool against a behavior contract. A clean autoreview is not proof that a UI, CLI, API, or generated artifact works from the user's perspective.
 
@@ -300,7 +300,7 @@ Recommended model defaults:
 | Engine              | Default model                                      | Source note                                           |
 | ------------------- | -------------------------------------------------- | ----------------------------------------------------- |
 | **codex** (default) | `gpt-5.6-sol` -> `gpt-5.6-terra` on access failure | High reasoning; ChatGPT auth uses fast tier          |
-| **claude**          | `claude-fable-5`; Bedrock: `global.anthropic.claude-opus-5[1m]` | Auth-aware defaults: Fable/high for subscription, Opus/xhigh for Bedrock |
+| **claude**          | `claude-fable-5`; Bedrock: `global.anthropic.claude-opus-5[1m]` | Auth-aware model default: Fable for subscription, Opus 5 for Bedrock; `high` effort for both |
 
 CLI flags and environment variables override these defaults. Pi does not get a built-in model default because its provider catalog may vary by installation. Droid, Copilot, Cursor, and OpenCode are currently refused.
 
@@ -339,7 +339,7 @@ Examples matching current `main` behavior:
 "$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-5,claude-sonnet-4-6
 
 # Mixed auth: Codex uses its stored ChatGPT login while Claude uses Amazon Bedrock.
-# Bedrock defaults to global.anthropic.claude-opus-5[1m] at xhigh effort;
+# Bedrock defaults to global.anthropic.claude-opus-5[1m] at high effort;
 # explicit --model and --thinking values still win (including Fable when requested).
 "$AUTOREVIEW" --panel --codex-auth chatgpt --claude-auth bedrock --claude-bedrock-region us-east-1
 
@@ -449,7 +449,7 @@ The helper:
 - supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
-- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-5[1m]`/`xhigh` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
+- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-5[1m]`/`high` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles, automatically drops Codex CLI schema enforcement for those non-OpenAI runs, and disables model-controlled process tools so provider credentials remain outside the model-visible tool boundary
 - supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock` to force Claude Code login or AWS Bedrock routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-5`/`max` fallback after the second refusal
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools

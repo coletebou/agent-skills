@@ -795,7 +795,6 @@ DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
 # `claude --model`, so it is on the harness side and must keep the suffix or
 # large-diff reviews silently cap at 200k.
 DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-5[1m]"
-DEFAULT_CLAUDE_BEDROCK_THINKING = "xhigh"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
     "claude": "high",
@@ -12465,10 +12464,19 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
                     else DEFAULT_MODEL_BY_ENGINE.get(engine)
                 )
             )
+        # Bedrock needs a routed model id, not a bare CLI alias. Only a BARE
+        # `claude-*` alias is ambiguous, so route just those through the
+        # cross-region `global.` inference profile. Anything the caller already
+        # routed is passed through untouched: an ARN, an application- or
+        # geo-inference profile (`us.`, `eu.`, `apac.`, `us-gov.`), or an
+        # explicit `global.` id. A hand-maintained model allowlist was wrong
+        # here - it silently missed `claude-sonnet-4-6` and `claude-haiku-4-5`,
+        # both documented Claude choices, sending them to Bedrock bare.
         if (
             engine == "claude"
             and claude_auth == "bedrock"
-            and model in {"claude-fable-5", "claude-opus-4-8", "claude-opus-5"}
+            and model is not None
+            and re.fullmatch(r"claude-[A-Za-z0-9._-]+", model) is not None
         ):
             model = f"global.anthropic.{model}"
         thinking = (
@@ -12482,11 +12490,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             thinking = (
                 None
                 if engine == "codex" and codex_profile is not None
-                else (
-                    DEFAULT_CLAUDE_BEDROCK_THINKING
-                    if engine == "claude" and claude_auth == "bedrock"
-                    else DEFAULT_THINKING_BY_ENGINE.get(engine)
-                )
+                else DEFAULT_THINKING_BY_ENGINE.get(engine)
             )
         if engine == "claude":
             fallback_model = (
@@ -12787,9 +12791,9 @@ def self_test_config_defaults() -> None:
             raise SystemExit(
                 "self-test config defaults failed: Claude Bedrock model was not mapped"
             )
-        if bedrock_claude.thinking != DEFAULT_CLAUDE_BEDROCK_THINKING:
+        if bedrock_claude.thinking != DEFAULT_THINKING_BY_ENGINE["claude"]:
             raise SystemExit(
-                "self-test config defaults failed: Claude Bedrock thinking was not mapped"
+                "self-test config defaults failed: Claude Bedrock thinking left the engine default"
             )
         bedrock_claude_override = reviewer_args(
             reviewer_test_args(
