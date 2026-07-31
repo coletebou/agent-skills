@@ -13317,15 +13317,21 @@ class RunTelemetry:
             if entry is None or entry["status"] != "running":
                 return
             started = self.reviewer_started.pop(reviewer_id)
-            entry.update(
-                {
-                    "finished_at": utc_timestamp(),
-                    "duration_seconds": round(time.monotonic() - started, 3),
-                    "status": status,
-                    "findings": findings,
-                    "structured_output_attempts": structured_output_attempts,
+            result: dict[str, Any] = {
+                "finished_at": utc_timestamp(),
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "status": status,
+                "findings": findings,
+                "structured_output_attempts": structured_output_attempts,
+            }
+            if findings is not None:
+                result["finding_disposition"] = {
+                    "confirmed": 0,
+                    "false_positive": 0,
+                    "not_actionable": 0,
+                    "pending": findings,
                 }
-            )
+            entry.update(result)
             self.persist_locked()
 
     def record_result(

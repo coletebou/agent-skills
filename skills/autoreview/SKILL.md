@@ -392,6 +392,19 @@ Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effo
 
 Every non-dry review writes owner-only metadata to a unique run directory outside the reviewed repository. Opt-in artifact logging additionally writes the exact scanner-approved `bundle.txt` and final `report.json`. Metadata includes target/ref, bundle hash and size, changed paths, prompt-pass sizes, reviewer model/reasoning/auth/profile/requested speed, per-reviewer duration and usable-review outcome, individual model attempts, refusal retries/fallbacks, finding counts, test status, total duration, and exit status. Requested speed records what autoreview passed to Codex; a provider may silently use standard service when that model does not support the requested tier. The history summary separates model-call success from validated-review success. Credentials, environment values, full finding bodies, prompts beyond explicitly logged artifacts, and raw engine output are never in default metadata history. `autoreview-history` reads the independent atomic metadata files directly, so concurrent runs do not share a writable index.
 
+After verifying a review finding against the real code, record aggregate dispositions on that reviewer run:
+
+```bash
+"$(dirname "$AUTOREVIEW")/autoreview-history" \
+  --record-disposition RUN_ID \
+  --reviewer-run-id 2 \
+  --confirmed 1 \
+  --false-positive 0 \
+  --not-actionable 0
+```
+
+`confirmed` means the finding is technically valid, whether or not code changes follow; independently reported duplicates are confirmed for each reviewer. `false-positive` means its technical claim is invalid. `not-actionable` means the finding was deliberately left technically unrated because it is outside the review's scope or ownership boundary. Findings not yet categorized remain `pending`. Omitted category flags preserve their previous counts, and the helper rejects totals above the reviewer-reported finding count. The history summary reports these counts per reviewer configuration plus confirmation and false-positive rates over technically rated findings only; `not-actionable` and `pending` findings are excluded from that denominator. Dispositions are explicit coordinator judgments, never inferred from whether code changed.
+
 Inspect longitudinal model and speed results with:
 
 ```bash

@@ -452,6 +452,15 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             self.assertEqual(metadata["reviewers"][0]["speed_requested"], "fast")
             self.assertEqual(metadata["bundle"]["changed_paths"], ["example.txt"])
             self.assertEqual(metadata["attempts"][0]["status"], "completed")
+            self.assertEqual(
+                metadata["reviewer_runs"][0]["finding_disposition"],
+                {
+                    "confirmed": 0,
+                    "false_positive": 0,
+                    "not_actionable": 0,
+                    "pending": 0,
+                },
+            )
             self.assertEqual(metadata["result"]["outcome"], "clean")
             self.assertEqual((telemetry.run_dir / "bundle.txt").read_text(), "diff --git a/example.txt b/example.txt\n")
             self.assertTrue((telemetry.run_dir / "report.json").is_file())
@@ -844,6 +853,168 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         self.assertEqual(by_engine["pi"]["attempts"], 0)
         self.assertEqual(by_engine["pi"]["review_completed"], 1)
         self.assertEqual(by_engine["pi"]["speed_requested"], "n/a")
+
+    def test_history_summarizes_verified_finding_dispositions(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        reviewer = {
+            "engine": "claude",
+            "model": "global.anthropic.claude-opus-5[1m]",
+            "thinking": "medium",
+            "auth": "bedrock",
+            "profile": None,
+            "status": "completed",
+            "duration_seconds": 10.0,
+        }
+        summary = history["summarize"](
+            [
+                {
+                    "status": "completed",
+                    "result": {"outcome": "findings"},
+                    "attempts": [],
+                    "reviewer_runs": [
+                        {
+                            **reviewer,
+                            "findings": 3,
+                            "finding_disposition": {
+                                "confirmed": 1,
+                                "false_positive": 1,
+                                "not_actionable": 0,
+                                "pending": 1,
+                            },
+                        },
+                        {
+                            **reviewer,
+                            "findings": 2,
+                        },
+                    ],
+                }
+            ],
+            None,
+        )
+
+        row = summary["configurations"][0]
+        self.assertEqual(row["findings_reported"], 5)
+        self.assertEqual(row["findings_confirmed"], 1)
+        self.assertEqual(row["findings_false_positive"], 1)
+        self.assertEqual(row["findings_not_actionable"], 0)
+        self.assertEqual(row["findings_pending"], 3)
+        self.assertEqual(row["confirmation_rate"], 0.5)
+        self.assertEqual(row["false_positive_rate"], 0.5)
+
+    def test_history_records_finding_disposition_atomically(self) -> None:
+        history_path = SCRIPT_PATH.with_name("autoreview-history")
+        history = runpy.run_path(str(history_path))
+        with tempfile.TemporaryDirectory(prefix="autoreview-disposition-test.") as tempdir:
+            root = Path(tempdir) / "history"
+            run_dir = root / "runs" / "run-1"
+            run_dir.mkdir(parents=True)
+            root.chmod(0o700)
+            (root / "runs").chmod(0o700)
+            run_dir.chmod(0o700)
+            metadata_path = run_dir / "metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-1",
+                        "status": "completed",
+                        "reviewer_runs": [
+                            {
+                                "reviewer_run_id": 7,
+                                "engine": "claude",
+                                "model": "claude-opus-5",
+                                "thinking": "medium",
+                                "findings": 3,
+                                "status": "completed",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata_path.chmod(0o600)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(history_path),
+                    "--log-dir",
+                    str(root),
+                    "--record-disposition",
+                    "run-1",
+                    "--reviewer-run-id",
+                    "7",
+                    "--confirmed",
+                    "1",
+                    "--false-positive",
+                    "1",
+                    "--json",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["pending"], 1)
+            updated = history["record_finding_disposition"](
+                [root],
+                "run-1",
+                7,
+                confirmed=None,
+                false_positive=None,
+                not_actionable=1,
+            )
+            self.assertEqual(updated["confirmed"], 1)
+            self.assertEqual(updated["false_positive"], 1)
+            self.assertEqual(updated["not_actionable"], 1)
+            self.assertEqual(updated["pending"], 0)
+            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+            disposition = saved["reviewer_runs"][0]["finding_disposition"]
+            self.assertEqual(disposition["confirmed"], 1)
+            self.assertEqual(disposition["false_positive"], 1)
+            self.assertEqual(disposition["not_actionable"], 1)
+            self.assertEqual(disposition["pending"], 0)
+            self.assertRegex(disposition["updated_at"], r"Z$")
+            self.assertEqual(metadata_path.stat().st_mode & 0o777, 0o600)
+
+    def test_history_rejects_dispositions_above_reported_findings(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-disposition-test.") as tempdir:
+            root = Path(tempdir) / "history"
+            run_dir = root / "runs" / "run-2"
+            run_dir.mkdir(parents=True)
+            root.chmod(0o700)
+            (root / "runs").chmod(0o700)
+            run_dir.chmod(0o700)
+            metadata_path = run_dir / "metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-2",
+                        "status": "completed",
+                        "reviewer_runs": [
+                            {
+                                "reviewer_run_id": 1,
+                                "engine": "codex",
+                                "findings": 1,
+                                "status": "completed",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata_path.chmod(0o600)
+
+            with self.assertRaisesRegex(SystemExit, "exceeds"):
+                history["record_finding_disposition"](
+                    [root],
+                    "run-2",
+                    1,
+                    confirmed=1,
+                    false_positive=1,
+                    not_actionable=None,
+                )
 
     def test_history_loads_runs_by_high_resolution_start_time(self) -> None:
         history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
