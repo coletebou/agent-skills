@@ -802,6 +802,12 @@ DEFAULT_CODEX_SPEED = "fast"
 # large-diff reviews silently cap at 200k.
 DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-5[1m]"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "xhigh"
+# Mantle uses the anthropic.* namespace WITHOUT the global. prefix Bedrock
+# Runtime needs. Passing a bare alias (claude-fable-5) or a Runtime-style
+# us.anthropic.*/global.anthropic.* id fails closed at the provider with
+# "data retention mode 'default' is not available for this model".
+DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-5[1m]"
+DEFAULT_CLAUDE_MANTLE_THINKING = "xhigh"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
     "claude": "high",
@@ -884,6 +890,34 @@ CLAUDE_BEDROCK_ENV_EXCLUDES = {
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+}
+# Mirror of the Bedrock excludes, inverted: strip CLAUDE_CODE_USE_BEDROCK so
+# Bedrock Runtime cannot win the provider race, but keep AWS_BEARER_TOKEN_BEDROCK
+# and ANTHROPIC_BEDROCK_MANTLE_BASE_URL because Mantle authenticates with the
+# same bearer and may need an endpoint override.
+CLAUDE_MANTLE_ENV_EXCLUDES = {
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_VERTEX",
 }
 CLAUDE_SAFE_MODE_MIN_VERSION = (2, 1, 169)
@@ -10046,7 +10080,11 @@ def claude_review_isolation_flags(
     args: argparse.Namespace | None = None,
 ) -> list[str]:
     setting_sources = "user"
-    if args is not None and claude_auth_mode(args) in {"subscription", "bedrock"}:
+    if args is not None and claude_auth_mode(args) in {
+        "subscription",
+        "bedrock",
+        "mantle",
+    }:
         setting_sources = ""
     return [
         "--safe-mode",
@@ -10079,14 +10117,15 @@ def parse_cli_version(text: str) -> tuple[int, int, int] | None:
 
 def claude_auth_mode(args: argparse.Namespace) -> str:
     mode = (getattr(args, "claude_auth", None) or "default").strip().lower()
-    if mode not in {"default", "subscription", "bedrock"}:
+    if mode not in {"default", "subscription", "bedrock", "mantle"}:
         raise SystemExit(
-            f"invalid Claude auth mode: {mode!r} (valid: default, subscription, bedrock)"
+            f"invalid Claude auth mode: {mode!r} "
+            "(valid: default, subscription, bedrock, mantle)"
         )
     return mode
 
 
-def claude_bedrock_region(args: argparse.Namespace) -> str:
+def claude_bedrock_region(args: argparse.Namespace, label: str = "Bedrock") -> str:
     region = (
         (getattr(args, "claude_bedrock_region", None) or "").strip()
         or os.environ.get("AUTOREVIEW_CLAUDE_BEDROCK_REGION", "").strip()
@@ -10095,11 +10134,11 @@ def claude_bedrock_region(args: argparse.Namespace) -> str:
     )
     if not region:
         raise SystemExit(
-            "Claude Bedrock auth requires --claude-bedrock-region, "
+            f"Claude {label} auth requires --claude-bedrock-region, "
             "AUTOREVIEW_CLAUDE_BEDROCK_REGION, or AWS_REGION"
         )
     if not re.fullmatch(r"[a-z0-9-]+", region):
-        raise SystemExit(f"invalid Claude Bedrock region: {region!r}")
+        raise SystemExit(f"invalid Claude {label} region: {region!r}")
     return region
 
 
@@ -10118,6 +10157,13 @@ def claude_engine_env(
     if auth_mode == "subscription":
         for key in CLAUDE_SUBSCRIPTION_ENV_EXCLUDES:
             env.pop(key, None)
+    elif auth_mode == "mantle":
+        for key in CLAUDE_MANTLE_ENV_EXCLUDES:
+            env.pop(key, None)
+        region = claude_bedrock_region(args, "Mantle")
+        env["CLAUDE_CODE_USE_MANTLE"] = "1"
+        env["AWS_REGION"] = region
+        env["AWS_DEFAULT_REGION"] = region
     elif auth_mode == "bedrock":
         for key in CLAUDE_BEDROCK_ENV_EXCLUDES:
             env.pop(key, None)
@@ -12600,14 +12646,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument(
         "--claude-auth",
-        choices=["default", "subscription", "bedrock"],
+        choices=["default", "subscription", "bedrock", "mantle"],
         default=os.environ.get("AUTOREVIEW_CLAUDE_AUTH", "default"),
-        help="Claude authentication source: default preserves provider env; subscription forces Claude Code login; bedrock forces AWS Bedrock routing with isolated settings. Env default: AUTOREVIEW_CLAUDE_AUTH.",
+        help="Claude authentication source: default preserves provider env; subscription forces Claude Code login; bedrock forces AWS Bedrock Runtime routing with isolated settings; mantle forces AWS Bedrock Mantle routing with isolated settings. Bedrock and Mantle are mutually exclusive providers, so each mode strips the other's enable flag. Mantle needs a Mantle-namespaced model (anthropic.claude-opus-5), not a Bedrock us.anthropic.* id. Env default: AUTOREVIEW_CLAUDE_AUTH.",
     )
     parser.add_argument(
         "--claude-bedrock-region",
         default=os.environ.get("AUTOREVIEW_CLAUDE_BEDROCK_REGION", "").strip() or None,
-        help="AWS region for --claude-auth bedrock. Env default: AUTOREVIEW_CLAUDE_BEDROCK_REGION; falls back to AWS_REGION/AWS_DEFAULT_REGION.",
+        help="AWS region for --claude-auth bedrock or --claude-auth mantle. Env default: AUTOREVIEW_CLAUDE_BEDROCK_REGION; falls back to AWS_REGION/AWS_DEFAULT_REGION.",
     )
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
@@ -12894,15 +12940,19 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
                 else (
                     DEFAULT_CLAUDE_BEDROCK_MODEL
                     if engine == "claude" and claude_auth == "bedrock"
+                    else DEFAULT_CLAUDE_MANTLE_MODEL
+                    if engine == "claude" and claude_auth == "mantle"
                     else DEFAULT_MODEL_BY_ENGINE.get(engine)
                 )
             )
         if (
             engine == "claude"
-            and claude_auth == "bedrock"
+            and claude_auth in {"bedrock", "mantle"}
             and model in {"claude-fable-5", "claude-opus-4-8", "claude-opus-5"}
         ):
-            model = f"global.anthropic.{model}"
+            # Mantle resolves anthropic.*; Bedrock Runtime needs global.anthropic.*.
+            prefix = "anthropic." if claude_auth == "mantle" else "global.anthropic."
+            model = f"{prefix}{model}"
         thinking = (
             inline_thinking
             or thinking_by_engine.get(engine)
@@ -12917,6 +12967,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
                 else (
                     DEFAULT_CLAUDE_BEDROCK_THINKING
                     if engine == "claude" and claude_auth == "bedrock"
+                    else DEFAULT_CLAUDE_MANTLE_THINKING
+                    if engine == "claude" and claude_auth == "mantle"
                     else DEFAULT_THINKING_BY_ENGINE.get(engine)
                 )
             )
@@ -13065,6 +13117,8 @@ def reviewer_configuration(args: argparse.Namespace) -> dict[str, Any]:
         config["auth"] = auth
         if auth == "bedrock":
             config["region"] = claude_bedrock_region(args)
+        elif auth == "mantle":
+            config["region"] = claude_bedrock_region(args, "Mantle")
     return config
 
 
@@ -13791,6 +13845,70 @@ def self_test_config_defaults() -> None:
                 "self-test config defaults failed: explicit Claude Bedrock "
                 "model/thinking did not override auth defaults"
             )
+        mantle_claude = reviewer_args(
+            reviewer_test_args(
+                engine="claude",
+                claude_auth="mantle",
+                claude_bedrock_region="us-east-1",
+            )
+        )[0]
+        if mantle_claude.claude_auth != "mantle":
+            raise SystemExit("self-test config defaults failed: Claude Mantle auth was not preserved")
+        if mantle_claude.model != DEFAULT_CLAUDE_MANTLE_MODEL:
+            raise SystemExit(
+                "self-test config defaults failed: Claude Mantle model was not mapped"
+            )
+        if mantle_claude.thinking != DEFAULT_CLAUDE_MANTLE_THINKING:
+            raise SystemExit(
+                "self-test config defaults failed: Claude Mantle thinking was not mapped"
+            )
+        mantle_claude_override = reviewer_args(
+            reviewer_test_args(
+                engine="claude",
+                claude_auth="mantle",
+                claude_bedrock_region="us-east-1",
+                model=["claude-opus-5"],
+                thinking=["max"],
+            )
+        )[0]
+        if (
+            mantle_claude_override.model != "anthropic.claude-opus-5"
+            or mantle_claude_override.thinking != "max"
+        ):
+            raise SystemExit(
+                "self-test config defaults failed: explicit Claude Mantle "
+                "model/thinking did not map to the anthropic.* namespace"
+            )
+        # Bedrock Runtime and Mantle are mutually exclusive providers. Each mode
+        # must strip the other's enable flag, or a host configured for one
+        # silently overrides the requested one and the review never reaches a model.
+        for mode, enabled, disabled in (
+            ("bedrock", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_MANTLE"),
+            ("mantle", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_BEDROCK"),
+        ):
+            probe_env = os.environ.copy()
+            try:
+                os.environ[disabled] = "1"
+                os.environ["AWS_REGION"] = "us-east-1"
+                resolved = claude_engine_env(
+                    reviewer_test_args(
+                        engine="claude",
+                        claude_auth=mode,
+                        claude_bedrock_region="us-east-1",
+                    ),
+                    Path.cwd(),
+                )
+            finally:
+                os.environ.clear()
+                os.environ.update(probe_env)
+            if resolved.get(enabled) != "1":
+                raise SystemExit(
+                    f"self-test config defaults failed: {mode} auth did not set {enabled}"
+                )
+            if disabled in resolved:
+                raise SystemExit(
+                    f"self-test config defaults failed: {mode} auth did not strip {disabled}"
+                )
         chatgpt_codex = reviewer_args(
             reviewer_test_args(engine="codex", codex_auth="chatgpt")
         )[0]
