@@ -349,6 +349,12 @@ Examples matching current `main` behavior:
 # its model/effort defaults come from that profile, while Claude keeps its normal auth.
 "$AUTOREVIEW" --panel --codex-profile bedrock --claude-auth subscription
 
+# Mantle defaults to anthropic.claude-opus-5[1m] at xhigh effort. Mantle and Bedrock
+# Runtime are mutually exclusive providers, so each mode strips the other's enable
+# flag; a host configured for one cannot silently capture a review requesting the
+# other. Mantle needs the anthropic.* namespace, NOT Runtime's us./global.anthropic.*.
+"$AUTOREVIEW" --panel --codex-profile bedrock --claude-auth mantle --claude-bedrock-region us-east-1
+
 # Pi with explicit model and thinking level
 "$AUTOREVIEW" --engine pi --model anthropic/claude-sonnet-4 --thinking high --pi-bin pi
 
@@ -378,7 +384,7 @@ loader such as an untracked `.envrc`; the helper does not write a config file.
 | `AUTOREVIEW_CODEX_PROFILE`          | Named Codex config profile staged into the isolated runtime; currently supports `amazon-bedrock` with env credentials            |
 | `AUTOREVIEW_CODEX_AUTH`             | `default` preserves API/provider env; `chatgpt` removes it and forces the stored ChatGPT login                                   |
 | `AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA` | Disable Codex CLI strict schema enforcement; automatically disabled for non-OpenAI profiles                                      |
-| `AUTOREVIEW_CLAUDE_AUTH`            | `default` preserves provider env; `subscription` forces Claude Code login; `bedrock` forces isolated AWS Bedrock routing         |
+| `AUTOREVIEW_CLAUDE_AUTH`            | `default` preserves provider env; `subscription` forces Claude Code login; `bedrock` forces isolated AWS Bedrock Runtime routing; `mantle` forces isolated AWS Bedrock Mantle routing |
 | `AUTOREVIEW_CLAUDE_BEDROCK_REGION`  | Required AWS region for explicit Claude Bedrock auth unless `AWS_REGION` or `AWS_DEFAULT_REGION` is already set                  |
 | `AUTOREVIEW_CLAUDE_FALLBACK_MODEL`  | Claude-only fallback chain                                                                                                       |
 | `AUTOREVIEW_PROVIDER_ENV_ALLOW`     | Comma-separated custom Pi/OpenCode credential variable names; names must end in a recognized credential suffix                   |
@@ -386,7 +392,7 @@ loader such as an untracked `.envrc`; the helper does not write a config file.
 | `AUTOREVIEW_RUN_LOG`                | Set to `0` to disable persistent run history                                                                                    |
 | `AUTOREVIEW_RUN_LOG_BUNDLE`         | Set to `1` to opt into persisting exact scanner-approved bundle and report artifacts; disabled by default                       |
 
-Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored. Use `--codex-auth chatgpt` to prevent ambient API keys or relays from overriding Codex's stored ChatGPT login. Use `--claude-auth subscription` for the Claude Code login, or `--claude-auth bedrock --claude-bedrock-region REGION` to route Claude through AWS credentials without loading user settings that can override the provider.
+Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored. Use `--codex-auth chatgpt` to prevent ambient API keys or relays from overriding Codex's stored ChatGPT login. Use `--claude-auth subscription` for the Claude Code login, or `--claude-auth bedrock --claude-bedrock-region REGION` to route Claude through AWS credentials without loading user settings that can override the provider. Use `--claude-auth mantle --claude-bedrock-region REGION` for Bedrock Mantle; it authenticates with the same `AWS_BEARER_TOKEN_BEDROCK` but resolves the `anthropic.*` model namespace rather than Runtime's `us.`/`global.anthropic.*`, and each of the two modes strips the other's enable flag so a host configured for one cannot capture a review requesting the other.
 
 ## Run History
 
@@ -483,7 +489,7 @@ The helper:
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
 - uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-5[1m]`/`xhigh` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles, automatically drops Codex CLI schema enforcement for those non-OpenAI runs, and disables model-controlled process tools so provider credentials remain outside the model-visible tool boundary
-- supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock` to force Claude Code login or AWS Bedrock routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-5`/`max` fallback after the second refusal
+- supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock|mantle` to force Claude Code login, AWS Bedrock Runtime, or AWS Bedrock Mantle routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-5`/`max` fallback after the second refusal
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools
 - runs Claude with `--safe-mode` (`v2.1.169+`), user-only settings for default auth or no settings for explicit subscription/Bedrock auth, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
 - refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
