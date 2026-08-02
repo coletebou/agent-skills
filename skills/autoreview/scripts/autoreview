@@ -12591,6 +12591,10 @@ def parse_args() -> argparse.Namespace:
         argument == "--codex-auth" or argument.startswith("--codex-auth=")
         for argument in sys.argv[1:]
     )
+    codex_profile_explicit = any(
+        argument == "--codex-profile" or argument.startswith("--codex-profile=")
+        for argument in sys.argv[1:]
+    )
     parser = argparse.ArgumentParser(
         description="Bundle-driven AI code review.",
         allow_abbrev=False,
@@ -12753,6 +12757,7 @@ def parse_args() -> argparse.Namespace:
     args.reviewer_selection_explicit = reviewer_selection_explicit
     args.claude_auth_explicit = claude_auth_explicit
     args.codex_auth_explicit = codex_auth_explicit
+    args.codex_profile_explicit = codex_profile_explicit
     args.engine = normalize_engine(args.engine)
     if args.cursor_allow_workspace_instructions is None:
         args.cursor_allow_workspace_instructions = env_truthy("AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS")
@@ -12897,10 +12902,42 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     if codex_profile is not None and "codex" not in selected_engines:
         raise SystemExit("--codex-profile is only supported for codex; no codex reviewer selected")
     if codex_auth != "default" and codex_profile is not None:
-        if getattr(args, "codex_auth_explicit", False):
+        auth_explicit = getattr(args, "codex_auth_explicit", False)
+        profile_explicit = getattr(args, "codex_profile_explicit", False)
+        if auth_explicit and profile_explicit:
             raise SystemExit("--codex-auth chatgpt cannot be combined with --codex-profile")
-        # A profile is an explicit provider route. Let it override a personal
-        # AUTOREVIEW_CODEX_AUTH default without requiring callers to unset it.
+        if auth_explicit:
+            # An explicitly requested auth mode must never be silently replaced by
+            # an ambient AUTOREVIEW_CODEX_PROFILE. Reporting the reviewer as ChatGPT
+            # while actually routing through a provider profile is an invisible
+            # auth-provenance change, so fail closed and name the remedy.
+            raise SystemExit(
+                "--codex-auth "
+                f"{codex_auth} conflicts with AUTOREVIEW_CODEX_PROFILE="
+                f"{codex_profile}; unset it for this run "
+                "(env -u AUTOREVIEW_CODEX_PROFILE autoreview ...) "
+                "or drop --codex-auth to use the profile"
+            )
+        # A profile is an explicit provider route, so it still wins over a personal
+        # AUTOREVIEW_CODEX_AUTH default without requiring callers to unset it. That
+        # precedence is intentional, but it CHANGES which provider and credentials
+        # review the bundle, so it must never be silent: an ambient or stale profile
+        # would otherwise reroute the reviewer with no output at all.
+        if profile_explicit:
+            override_source = f"--codex-profile={codex_profile}"
+            remedy = f"Drop --codex-profile to use {codex_auth} auth."
+        else:
+            override_source = f"AUTOREVIEW_CODEX_PROFILE={codex_profile}"
+            remedy = (
+                "Unset AUTOREVIEW_CODEX_PROFILE to use "
+                f"{codex_auth} auth (env -u AUTOREVIEW_CODEX_PROFILE autoreview ...)."
+            )
+        print(
+            f"codex auth: AUTOREVIEW_CODEX_AUTH={codex_auth} overridden by "
+            f"{override_source}; reviewing via the profile's provider route. "
+            f"{remedy}",
+            file=sys.stderr,
+        )
         codex_auth = "default"
     if (
         codex_auth != "default"
@@ -13988,11 +14025,32 @@ def self_test_config_defaults() -> None:
                     codex_profile="bedrock",
                     codex_auth="chatgpt",
                     codex_auth_explicit=True,
+                    codex_profile_explicit=True,
                 )
             )
             raise SystemExit("self-test config defaults failed: ChatGPT auth accepted with Bedrock profile")
         except SystemExit as error:
             if "cannot be combined" not in str(error):
+                raise
+        # An explicitly requested auth mode must fail closed against an AMBIENT
+        # profile too, rather than being silently downgraded to the profile's
+        # provider route. A stale AUTOREVIEW_CODEX_PROFILE otherwise reroutes the
+        # reviewer while the run still reports the requested auth mode.
+        try:
+            reviewer_args(
+                reviewer_test_args(
+                    engine="codex",
+                    codex_profile="bedrock",
+                    codex_auth="chatgpt",
+                    codex_auth_explicit=True,
+                )
+            )
+            raise SystemExit(
+                "self-test config defaults failed: explicit ChatGPT auth silently "
+                "downgraded by ambient Codex profile"
+            )
+        except SystemExit as error:
+            if "conflicts with AUTOREVIEW_CODEX_PROFILE" not in str(error):
                 raise
         bedrock_override = reviewer_args(
             reviewer_test_args(
