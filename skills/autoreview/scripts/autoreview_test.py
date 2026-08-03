@@ -363,7 +363,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         self.assertEqual(reviewers[1].claude_bedrock_region, "us-east-1")
         self.assertEqual(
             reviewers[1].model,
-            "global.anthropic.claude-opus-5[1m]",
+            "global.anthropic.claude-opus-4-8[1m]",
         )
         self.assertEqual(reviewers[1].thinking, "xhigh")
 

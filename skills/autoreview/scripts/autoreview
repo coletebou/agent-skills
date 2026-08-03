@@ -800,13 +800,13 @@ DEFAULT_CODEX_SPEED = "fast"
 # a >200k prompt ("Prompt is too long" without it). autoreview shells out to
 # `claude --model`, so it is on the harness side and must keep the suffix or
 # large-diff reviews silently cap at 200k.
-DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-5[1m]"
+DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-4-8[1m]"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "xhigh"
 # Mantle uses the anthropic.* namespace WITHOUT the global. prefix Bedrock
 # Runtime needs. Passing a bare alias (claude-fable-5) or a Runtime-style
 # us.anthropic.*/global.anthropic.* id fails closed at the provider with
 # "data retention mode 'default' is not available for this model".
-DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-5[1m]"
+DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-4-8[1m]"
 DEFAULT_CLAUDE_MANTLE_THINKING = "xhigh"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
@@ -10727,7 +10727,7 @@ def claude_uses_fable_model(model: str | None) -> bool:
 
 def claude_refusal_fallback_model(args: argparse.Namespace) -> str:
     if claude_auth_mode(args) != "bedrock":
-        return "claude-opus-5"
+        return "claude-opus-4-8"
     model = args.model or ""
     # Preserve the caller's routing prefix when swapping Fable -> Opus, and
     # handle the optional `[1m]` harness suffix (the configured Fable default
@@ -10747,9 +10747,9 @@ def claude_refusal_fallback_model(args: argparse.Namespace) -> str:
         # Fable either, so a gov caller can never request the Fable model that
         # this refusal fallback triggers on. Kept so the mapping stays correct
         # if gov ever gains Fable.
-        target = "claude-opus-4-8" if scope.startswith("us-gov.") else "claude-opus-5"
+        target = "claude-opus-4-8"
         return f"{scope}anthropic.{target}{brk}{tail}"
-    return "global.anthropic.claude-opus-5[1m]"
+    return "global.anthropic.claude-opus-4-8[1m]"
 
 
 def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
@@ -12611,7 +12611,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry; Claude subscription/default auth=claude-fable-5/high; Claude Bedrock auth=global.anthropic.claude-opus-5[1m]/xhigh.",
+        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry; Claude subscription/default auth=claude-fable-5/high; Claude Bedrock auth=global.anthropic.claude-opus-4-8[1m]/xhigh.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max. Claude: low, medium, high, xhigh, max. Droid: off, none, low, medium, high. Pi: off, minimal, low, medium, high, xhigh. OpenCode: minimal, low, medium, high, max. Cursor: none.")
     parser.add_argument(
