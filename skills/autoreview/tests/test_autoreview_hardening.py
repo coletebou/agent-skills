@@ -5312,6 +5312,37 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     )
                 )
 
+    def _isolation_flags_with_managed_config(self, present: bool) -> list:
+        # claude_review_isolation_flags() resolves the detector by bare name in
+        # ITS module globals, which runpy.run_path returns a *copy* of — so the
+        # function's __globals__ is the live namespace to patch, not self.helper.
+        flags_fn = self.helper["claude_review_isolation_flags"]
+        module_globals = flags_fn.__globals__
+        original = module_globals["claude_enterprise_mcp_config_present"]
+        module_globals["claude_enterprise_mcp_config_present"] = lambda: present
+        try:
+            return flags_fn()
+        finally:
+            module_globals["claude_enterprise_mcp_config_present"] = original
+
+    def test_claude_isolation_omits_strict_mcp_when_managed_config_present(self) -> None:
+        # Claude Code rejects --strict-mcp-config when an endpoint-managed MCP
+        # config exists; autoreview must omit the flag in that case while
+        # keeping the rest of the isolation set authoritative.
+        flags = self._isolation_flags_with_managed_config(True)
+        self.assertNotIn("--strict-mcp-config", flags)
+        self.assertIn("--safe-mode", flags)
+        self.assertIn("--disallowedTools", flags)
+        disallow_index = flags.index("--disallowedTools")
+        self.assertEqual(flags[disallow_index + 1], "mcp__*")
+
+    def test_claude_isolation_keeps_strict_mcp_without_managed_config(self) -> None:
+        flags = self._isolation_flags_with_managed_config(False)
+        self.assertIn("--strict-mcp-config", flags)
+        self.assertIn("--safe-mode", flags)
+        disallow_index = flags.index("--disallowedTools")
+        self.assertEqual(flags[disallow_index + 1], "mcp__*")
+
     def test_codex_chatgpt_auth_ignores_api_environment(self) -> None:
         old = os.environ.copy()
         with tempfile.TemporaryDirectory() as tempdir:
@@ -6330,6 +6361,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "safe_engine_env": lambda *_args, **_kwargs: {},
                     "safe_temp_root": lambda _repo: Path(tempdir),
                     "run": fake_run,
+                    # Pin the managed-MCP state so the probe's expected flag set
+                    # is deterministic regardless of the host (a Code Space with
+                    # /etc/claude-code/managed-mcp.json would otherwise omit
+                    # --strict-mcp-config). No managed config => flag present.
+                    "claude_enterprise_mcp_config_present": lambda: False,
                 },
             ):
                 self.helper["ensure_claude_isolation_supported"](args, repo)

@@ -10076,6 +10076,26 @@ def codex_profile_tool_isolation_flags(profile: str | None) -> list[str]:
     ]
 
 
+def claude_enterprise_mcp_config_present() -> bool:
+    """Detect an endpoint-managed (enterprise) Claude Code MCP config.
+
+    Claude Code rejects `--strict-mcp-config` when a managed MCP config is
+    present ("You cannot use --strict-mcp-config when an enterprise MCP config
+    is present"), because that file is administrator-controlled and cannot be
+    narrowed by the flag. The managed file lives at a fixed platform path.
+    """
+    if os.name == "nt":
+        roots = [os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432")]
+        candidates = [
+            Path(root) / "ClaudeCode" / "managed-mcp.json" for root in roots if root
+        ]
+    elif sys.platform == "darwin":
+        candidates = [Path("/Library/Application Support/ClaudeCode/managed-mcp.json")]
+    else:
+        candidates = [Path("/etc/claude-code/managed-mcp.json")]
+    return any(candidate.is_file() for candidate in candidates)
+
+
 def claude_review_isolation_flags(
     args: argparse.Namespace | None = None,
 ) -> list[str]:
@@ -10086,14 +10106,21 @@ def claude_review_isolation_flags(
         "mantle",
     }:
         setting_sources = ""
-    return [
+    flags = [
         "--safe-mode",
         "--setting-sources",
         setting_sources,
-        "--strict-mcp-config",
         "--disallowedTools",
         "mcp__*",
     ]
+    # `--strict-mcp-config` is invalid when an endpoint-managed MCP config is
+    # present (Claude Code exits non-zero). Managed MCP is administrator-
+    # controlled and cannot be bypassed, so omitting the redundant flag keeps
+    # the same isolation guarantee; --safe-mode, --disallowedTools mcp__*, and
+    # the explicit tool inventory remain authoritative.
+    if not claude_enterprise_mcp_config_present():
+        flags.insert(3, "--strict-mcp-config")
+    return flags
 
 
 def pi_review_isolation_flags() -> list[str]:
