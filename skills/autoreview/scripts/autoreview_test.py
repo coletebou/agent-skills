@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import runpy
+import stat
 import subprocess
 import sys
 import tempfile
@@ -117,131 +120,1257 @@ class AutoreviewPriorityTests(unittest.TestCase):
         self.assertIn("below the requested P0", report["overall_explanation"])
 
 
-class AutoreviewSecretScannerTests(unittest.TestCase):
-    def test_typescript_type_annotations_are_not_credential_material(self) -> None:
-        source = "\n".join(
-            (
-                "export function modelRuntime(",
-                "  env: NodeJS.ProcessEnv = process.env,",
-                "): ModelRuntime {",
-                "  return env.MODEL_RUNTIME;",
-                "}",
+def reviewer_test_args(**overrides: object) -> argparse.Namespace:
+    defaults: dict[str, object] = {
+        "engine": "codex",
+        "reviewers": None,
+        "panel": False,
+        "engine_explicit": True,
+        "reviewer_selection_explicit": True,
+        "model": None,
+        "thinking": None,
+        "fallback_model": None,
+        "codex_config": None,
+        "codex_speed": None,
+        "codex_auth": "default",
+        "claude_auth": "default",
+        "claude_bedrock_region": None,
+        "tools": True,
+        "max_priority": "P0",
+        "stream_engine_output": False,
+        "web_search": False,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class AutoreviewPanelTests(unittest.TestCase):
+    def test_cli_env_selects_panel_but_explicit_engine_wins(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_REVIEWERS": "codex,claude"},
+            clear=False,
+        ), mock.patch.object(sys, "argv", ["autoreview"]):
+            args = AUTOREVIEW.parse_args()
+            self.assertEqual(
+                [reviewer.engine for reviewer in AUTOREVIEW.reviewer_args(args)],
+                ["codex", "claude"],
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_REVIEWERS": "codex,claude"},
+            clear=False,
+        ), mock.patch.object(
+            sys,
+            "argv",
+            ["autoreview", "--engine", "pi"],
+        ):
+            args = AUTOREVIEW.parse_args()
+            self.assertEqual(
+                [reviewer.engine for reviewer in AUTOREVIEW.reviewer_args(args)],
+                ["pi"],
+            )
+
+    def test_chatgpt_auth_does_not_select_fast_tier(self) -> None:
+        args = reviewer_test_args(codex_auth="chatgpt")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AUTOREVIEW_CODEX_SPEED": "",
+                "AUTOREVIEW_CODEX_CONFIG": "",
+            },
+            clear=False,
+        ):
+            reviewer = AUTOREVIEW.reviewer_args(args)[0]
+            self.assertIsNone(AUTOREVIEW.codex_speed_override(reviewer))
+
+    def test_chatgpt_auth_is_forced_without_a_source_config(self) -> None:
+        with mock.patch.object(AUTOREVIEW, "codex_source_home", return_value=None):
+            flags = AUTOREVIEW.codex_auth_config_flags(
+                Path.cwd(),
+                auth_mode="chatgpt",
+            )
+        self.assertIn('forced_login_method="chatgpt"', flags)
+
+    def test_chatgpt_auth_replaces_competing_forced_login_method(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-auth-test.") as tmpdir:
+            codex_home = Path(tmpdir)
+            (codex_home / "config.toml").write_text(
+                'forced_login_method = "api"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                AUTOREVIEW,
+                "codex_source_home",
+                return_value=codex_home,
+            ):
+                flags = AUTOREVIEW.codex_auth_config_flags(
+                    Path.cwd(),
+                    auth_mode="chatgpt",
+                )
+
+        overrides = [flags[index + 1] for index, value in enumerate(flags) if value == "-c"]
+        forced = [value for value in overrides if value.startswith("forced_login_method=")]
+        self.assertEqual(forced, ['forced_login_method="chatgpt"'])
+
+    def test_mantle_defaults_to_opus_5_low(self) -> None:
+        args = reviewer_test_args(engine="claude", claude_auth="mantle")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AUTOREVIEW_MODEL": "",
+                "AUTOREVIEW_THINKING": "",
+                "AUTOREVIEW_CLAUDE_MODEL": "",
+                "AUTOREVIEW_CLAUDE_THINKING": "",
+            },
+            clear=False,
+        ):
+            reviewer = AUTOREVIEW.reviewer_args(args)[0]
+        self.assertEqual(reviewer.model, "anthropic.claude-opus-5[1m]")
+        self.assertEqual(reviewer.thinking, "low")
+
+    def test_bedrock_defaults_round_trip_through_reviewer_validation(self) -> None:
+        args = reviewer_test_args(
+            engine="claude",
+            claude_auth="bedrock",
+            claude_bedrock_region="us-east-1",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AUTOREVIEW_MODEL": "",
+                "AUTOREVIEW_THINKING": "",
+                "AUTOREVIEW_CLAUDE_MODEL": "",
+                "AUTOREVIEW_CLAUDE_THINKING": "",
+            },
+            clear=False,
+        ):
+            reviewer = AUTOREVIEW.reviewer_args(args)[0]
+        self.assertEqual(
+            reviewer.model,
+            "global.anthropic.claude-opus-4-8[1m]",
+        )
+        self.assertEqual(reviewer.thinking, "xhigh")
+
+    def test_explicit_auth_routes_remove_competing_provider_env(self) -> None:
+        repo = Path("/tmp/autoreview-auth-test")
+        base_env = {
+            "OPENAI_API_KEY": "provider-key",
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_BEARER_TOKEN_BEDROCK": "bearer",
+        }
+        with mock.patch.object(
+            AUTOREVIEW,
+            "safe_engine_env",
+            side_effect=lambda *_args, **_kwargs: dict(base_env),
+        ) as safe_engine_env:
+            codex_env = AUTOREVIEW.codex_engine_env(
+                reviewer_test_args(codex_auth="chatgpt"),
+                repo,
+            )
+            mantle_env = AUTOREVIEW.claude_engine_env(
+                reviewer_test_args(
+                    engine="claude",
+                    claude_auth="mantle",
+                    claude_bedrock_region="us-east-1",
+                ),
+                repo,
+            )
+        self.assertNotIn("OPENAI_API_KEY", codex_env)
+        self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", mantle_env)
+        self.assertEqual(mantle_env["CLAUDE_CODE_USE_MANTLE"], "1")
+        self.assertEqual(mantle_env["AWS_BEARER_TOKEN_BEDROCK"], "bearer")
+        codex_call = safe_engine_env.call_args_list[0]
+        self.assertEqual(codex_call.kwargs["engine"], "codex")
+        self.assertIn("extra", codex_call.kwargs)
+
+    def test_panel_engine_replaces_first_slot(self) -> None:
+        args = reviewer_test_args(panel=True, engine="pi")
+        self.assertEqual(
+            [reviewer.engine for reviewer in AUTOREVIEW.reviewer_args(args)],
+            ["pi", "claude"],
+        )
+
+    def test_panel_engine_member_keeps_full_panel(self) -> None:
+        args = reviewer_test_args(panel=True, engine="claude")
+        self.assertEqual(
+            [reviewer.engine for reviewer in AUTOREVIEW.reviewer_args(args)],
+            ["codex", "claude"],
+        )
+
+    def test_panel_ignores_ambient_single_engine_default(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_ENGINE": "pi"},
+            clear=False,
+        ), mock.patch.object(sys, "argv", ["autoreview", "--panel"]):
+            args = AUTOREVIEW.parse_args()
+            self.assertEqual(
+                [reviewer.engine for reviewer in AUTOREVIEW.reviewer_args(args)],
+                ["codex", "claude"],
+            )
+
+    def test_reviewers_all_requires_explicit_list(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "list each intended reviewer"):
+            AUTOREVIEW.parse_reviewer_list("all", "--reviewers")
+
+    def test_mantle_region_is_validated_before_run_evidence(self) -> None:
+        args = reviewer_test_args(engine="claude", claude_auth="mantle")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AUTOREVIEW_CLAUDE_BEDROCK_REGION": "",
+                "AWS_REGION": "",
+                "AWS_DEFAULT_REGION": "",
+            },
+            clear=False,
+        ), self.assertRaisesRegex(SystemExit, "Claude Mantle auth requires"):
+            AUTOREVIEW.reviewer_args(args)
+
+    def test_explicit_claude_auth_requires_empty_setting_sources_version(self) -> None:
+        args = reviewer_test_args(
+            engine="claude",
+            claude_auth="mantle",
+            claude_bedrock_region="us-east-1",
+            claude_bin="claude",
+            fallback_model=None,
+            model="anthropic.claude-opus-5[1m]",
+        )
+        version_result = subprocess.CompletedProcess(
+            ["claude", "--version"],
+            0,
+            "2.1.236 (Claude Code)",
+            "",
+        )
+        with tempfile.TemporaryDirectory(prefix="autoreview-claude-version-test.") as tmpdir:
+            with mock.patch.object(
+                AUTOREVIEW,
+                "resolve_command",
+                return_value="/usr/bin/claude",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "claude_engine_env",
+                return_value={},
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "safe_temp_root",
+                return_value=Path(tmpdir),
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run",
+                return_value=version_result,
+            ), self.assertRaisesRegex(SystemExit, "2.1.237"):
+                AUTOREVIEW.ensure_claude_isolation_supported(args, Path(tmpdir))
+
+    def test_panel_merge_preserves_explanations_orders_and_marks_partial(self) -> None:
+        p3 = copy.deepcopy(DRAFT_REPORT["findings"][0])
+        p2 = copy.deepcopy(p3)
+        p2.update({"title": "Higher priority", "priority": "P2"})
+        first = copy.deepcopy(FINAL_REPORT)
+        first.update(
+            {
+                "findings": [p3],
+                "overall_correctness": "patch is incorrect",
+                "overall_explanation": "Omitted one finding below requested P3.",
+            }
+        )
+        second = copy.deepcopy(FINAL_REPORT)
+        second.update(
+            {
+                "findings": [p2],
+                "overall_correctness": "patch is incorrect",
+                "overall_explanation": "Second reviewer context.",
+            }
+        )
+
+        report = AUTOREVIEW.merge_panel_reports(
+            [("claude", first), ("codex", second)],
+            ["pi: timed out"],
+        )
+
+        self.assertEqual(
+            [finding["priority"] for finding in report["findings"]],
+            ["P2", "P3"],
+        )
+        self.assertIn("partially complete", report["overall_explanation"])
+        self.assertIn("pi: timed out", report["overall_explanation"])
+        self.assertIn("Omitted one finding", report["overall_explanation"])
+        self.assertIn("Second reviewer context", report["overall_explanation"])
+
+    def test_panel_merge_keeps_strongest_duplicate(self) -> None:
+        weaker = copy.deepcopy(DRAFT_REPORT["findings"][0])
+        weaker.update({"priority": "P3", "confidence": 0.9})
+        stronger = copy.deepcopy(weaker)
+        stronger.update({"priority": "P1", "confidence": 0.7, "body": "strong evidence"})
+        first = copy.deepcopy(DRAFT_REPORT)
+        first["findings"] = [weaker]
+        second = copy.deepcopy(DRAFT_REPORT)
+        second["findings"] = [stronger]
+
+        report = AUTOREVIEW.merge_panel_reports(
+            [("claude", first), ("codex", second)]
+        )
+
+        self.assertEqual(len(report["findings"]), 1)
+        self.assertEqual(report["findings"][0]["priority"], "P1")
+        self.assertIn("strong evidence", report["findings"][0]["body"])
+
+    def test_panel_confidence_comes_from_winning_verdict(self) -> None:
+        incorrect = copy.deepcopy(DRAFT_REPORT)
+        incorrect["overall_confidence"] = 0.6
+        clean = copy.deepcopy(FINAL_REPORT)
+        clean["overall_confidence"] = 0.99
+
+        report = AUTOREVIEW.merge_panel_reports(
+            [("codex", incorrect), ("claude", clean)]
+        )
+
+        self.assertEqual(report["overall_correctness"], "patch is incorrect")
+        self.assertEqual(report["overall_confidence"], 0.6)
+
+    def test_panel_merge_bounds_body_after_reviewer_prefix(self) -> None:
+        finding = copy.deepcopy(DRAFT_REPORT["findings"][0])
+        finding["body"] = "x" * 2000
+        reviewer_report = copy.deepcopy(DRAFT_REPORT)
+        reviewer_report["findings"] = [finding]
+
+        report = AUTOREVIEW.merge_panel_reports([("codex", reviewer_report)])
+
+        body = report["findings"][0]["body"]
+        self.assertEqual(len(body), 2000)
+        self.assertTrue(body.startswith("Reviewer: codex\n\n"))
+        self.assertTrue(body.endswith("[truncated]"))
+
+    def test_private_atomic_write_without_descriptor_chmod(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-write-test.") as tmpdir:
+            path = Path(tmpdir) / "report.json"
+            with mock.patch.object(AUTOREVIEW.os, "fchmod", None):
+                AUTOREVIEW.private_atomic_write(path, "{}\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "{}\n")
+
+    def test_invalid_bundle_logging_config_is_not_treated_as_storage_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-invalid-log-test.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            repo.mkdir()
+            args = reviewer_test_args(log_bundle=None, run_log_dir=None)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AUTOREVIEW_RUN_LOG_BUNDLE": "maybe",
+                    "AUTOREVIEW_RUN_LOG_DIR": str(root / "history"),
+                },
+                clear=False,
+            ), self.assertRaisesRegex(SystemExit, "invalid AUTOREVIEW_RUN_LOG_BUNDLE"):
+                AUTOREVIEW.create_run_evidence(args, repo, "local", None, [args])
+
+    @unittest.skipIf(os.name == "nt", "symlink behavior differs on Windows")
+    def test_default_symlinked_history_root_uses_private_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-symlink-log-test.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            target = root / "history-target"
+            link = root / "history-link"
+            repo.mkdir()
+            target.mkdir()
+            link.symlink_to(target, target_is_directory=True)
+            args = reviewer_test_args(log_bundle=False, run_log_dir=None)
+            with mock.patch.dict(
+                os.environ,
+                {"AUTOREVIEW_RUN_LOG_DIR": ""},
+                clear=False,
+            ), mock.patch.object(AUTOREVIEW, "default_run_log_root", return_value=link):
+                evidence = AUTOREVIEW.create_run_evidence(
+                    args,
+                    repo,
+                    "local",
+                    None,
+                    [args],
+                )
+
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertFalse(evidence.root.is_symlink())
+            self.assertTrue(evidence.root.name.startswith("autoreview-state-"))
+
+    def test_default_history_root_inside_repo_uses_private_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-overlap-log-test.") as tmpdir:
+            repo = Path(tmpdir)
+            args = reviewer_test_args(log_bundle=False, run_log_dir=None)
+            with mock.patch.dict(
+                os.environ,
+                {"AUTOREVIEW_RUN_LOG_DIR": ""},
+                clear=False,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "default_run_log_root",
+                return_value=repo / ".state" / "autoreview",
+            ):
+                evidence = AUTOREVIEW.create_run_evidence(
+                    args,
+                    repo,
+                    "local",
+                    None,
+                    [args],
+                )
+
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertFalse(AUTOREVIEW.path_overlaps_repo(evidence.root, repo))
+
+    def test_explicit_history_storage_error_is_clean_system_exit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-explicit-log-test.") as tmpdir:
+            repo = Path(tmpdir)
+            args = reviewer_test_args(
+                log_bundle=False,
+                run_log_dir=str(repo / ".state"),
+            )
+            with self.assertRaisesRegex(
+                SystemExit,
+                "run-log root must not overlap",
+            ):
+                AUTOREVIEW.create_run_evidence(
+                    args,
+                    repo,
+                    "local",
+                    None,
+                    [args],
+                )
+
+    def test_panel_buffers_streaming_reviewers(self) -> None:
+        reviewers = [
+            reviewer_test_args(engine="codex", stream_engine_output=True),
+            reviewer_test_args(engine="claude", stream_engine_output=True),
+        ]
+        args = reviewer_test_args(
+            allow_partial_panel=False,
+            require_finding=[],
+            stream_engine_output=True,
+        )
+        stream_flags: list[bool] = []
+
+        def fake_run_engine(reviewer: argparse.Namespace, _repo: Path, _prompt: str) -> str:
+            stream_flags.append(reviewer.stream_engine_output)
+            reviewer.stream_output_buffer.write(f"{reviewer.engine} activity\n")
+            AUTOREVIEW.reviewer_status(reviewer, f"{reviewer.engine} status")
+            return json.dumps(FINAL_REPORT)
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            AUTOREVIEW,
+            "run_engine",
+            side_effect=fake_run_engine,
+        ), contextlib.redirect_stderr(stderr):
+            report = AUTOREVIEW.run_panel(
+                args,
+                reviewers,
+                Path.cwd(),
+                "frozen prompt",
+                set(),
+                False,
+                [],
+                1,
+            )
+
+        self.assertEqual(stream_flags, [True, True])
+        self.assertIn("codex activity", stderr.getvalue())
+        self.assertIn("claude activity", stderr.getvalue())
+        self.assertIn("codex status", stderr.getvalue())
+        self.assertIn("claude status", stderr.getvalue())
+        self.assertEqual(report["overall_correctness"], "patch is correct")
+
+    def test_panel_fails_closed_and_partial_override_is_explicit(self) -> None:
+        reviewers = [
+            reviewer_test_args(engine="codex"),
+            reviewer_test_args(engine="claude"),
+        ]
+
+        def fake_run_engine(reviewer: argparse.Namespace, _repo: Path, _prompt: str) -> str:
+            if reviewer.engine == "claude":
+                raise SystemExit("provider unavailable")
+            return json.dumps(FINAL_REPORT)
+
+        strict_args = reviewer_test_args(
+            allow_partial_panel=False,
+            require_finding=[],
+        )
+        with mock.patch.object(
+            AUTOREVIEW,
+            "run_engine",
+            side_effect=fake_run_engine,
+        ), self.assertRaisesRegex(SystemExit, "claude.*provider unavailable"):
+            AUTOREVIEW.run_panel(
+                strict_args,
+                reviewers,
+                Path.cwd(),
+                "frozen prompt",
+                set(),
+                False,
+                [],
+                1,
+            )
+
+        partial_args = reviewer_test_args(
+            allow_partial_panel=True,
+            require_finding=[],
+        )
+        with mock.patch.object(
+            AUTOREVIEW,
+            "run_engine",
+            side_effect=fake_run_engine,
+        ):
+            report = AUTOREVIEW.run_panel(
+                partial_args,
+                reviewers,
+                Path.cwd(),
+                "frozen prompt",
+                set(),
+                False,
+                [],
+                1,
+            )
+        self.assertIn("partially complete", report["overall_explanation"])
+        self.assertIn("claude", report["overall_explanation"])
+
+    def test_panel_gives_each_reviewer_the_same_prompt(self) -> None:
+        reviewers = [
+            reviewer_test_args(engine="codex"),
+            reviewer_test_args(engine="claude"),
+        ]
+        args = reviewer_test_args(allow_partial_panel=False, require_finding=[])
+        prompts_seen: list[str] = []
+
+        def fake_run_engine(_reviewer: argparse.Namespace, _repo: Path, prompt: str) -> str:
+            prompts_seen.append(prompt)
+            return json.dumps(FINAL_REPORT)
+
+        with mock.patch.object(AUTOREVIEW, "run_engine", side_effect=fake_run_engine):
+            report = AUTOREVIEW.run_panel(
+                args,
+                reviewers,
+                Path.cwd(),
+                "frozen prompt",
+                set(),
+                False,
+                [],
+                1,
+            )
+
+        self.assertEqual(prompts_seen, ["frozen prompt", "frozen prompt"])
+        self.assertEqual(report["overall_correctness"], "patch is correct")
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
+    def test_run_evidence_is_private_and_records_standard_tier(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-evidence-test.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            history = root / "history"
+            repo.mkdir()
+            args = reviewer_test_args(log_bundle=False)
+            with mock.patch.dict(
+                os.environ,
+                {"AUTOREVIEW_CODEX_SPEED": ""},
+                clear=False,
+            ):
+                evidence = AUTOREVIEW.RunEvidence(
+                    args,
+                    repo,
+                    "local",
+                    None,
+                    [args],
+                    root=history,
+                )
+                reviewer_index = evidence.start_reviewer(args, 1)
+                evidence.finish_reviewer(
+                    reviewer_index,
+                    status="completed",
+                    findings=0,
+                )
+                evidence.record_bundle(
+                    "bundle",
+                    ["prompt"],
+                    {"source.py"},
+                    truncated=False,
+                )
+                evidence.record_result(FINAL_REPORT, "clean")
+                evidence.finish(0)
+            metadata = json.loads(evidence.metadata_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(stat.S_IMODE(evidence.run_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(evidence.metadata_path.stat().st_mode), 0o600)
+            self.assertEqual(metadata["reviewers"][0]["speed_requested"], "default")
+            self.assertIsInstance(metadata["started_at_unix_ns"], int)
+            self.assertEqual(metadata["target"], {"mode": "local", "ref": None})
+            self.assertEqual(metadata["attempts"][0]["status"], "completed")
+            self.assertEqual(metadata["attempts"][0]["reason"], "primary")
+            self.assertEqual(metadata["reviewer_runs"][0]["reviewer_run_id"], 1)
+            self.assertEqual(metadata["reviewer_runs"][0]["findings"], 0)
+
+
+def amp_test_stream(
+    cwd: Path,
+    *,
+    tools: list[object] | None = None,
+    mcp_servers: list[object] | None = None,
+    trigger: str = "Run the isolated autoreview adapter.",
+    tool_name: str = "autoreview_generate",
+    tool_input: object = None,
+    tool_result_id: str = "amp-tool-use",
+    tool_error: bool = False,
+    tool_result_content: str | None = None,
+) -> str:
+    if tool_input is None:
+        tool_input = {}
+    if tool_result_content is None:
+        tool_result_content = (
+            "Autoreview generation failed." if tool_error else "Adapter completed."
+        )
+    return "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "cwd": str(cwd),
+                    "session_id": "amp-test-session",
+                    "tools": ["autoreview_generate"] if tools is None else tools,
+                    "mcp_servers": [] if mcp_servers is None else mcp_servers,
+                    "agent_mode": "medium",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": trigger}],
+                    },
+                    "parent_tool_use_id": None,
+                    "session_id": "amp-test-session",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "amp-tool-use",
+                                "name": tool_name,
+                                "input": tool_input,
+                            }
+                        ],
+                    },
+                    "parent_tool_use_id": None,
+                    "session_id": "amp-test-session",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_result_id,
+                                "content": tool_result_content,
+                                "is_error": tool_error,
+                            }
+                        ],
+                    },
+                    "parent_tool_use_id": None,
+                    "session_id": "amp-test-session",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Completed."}],
+                    },
+                    "parent_tool_use_id": None,
+                    "session_id": "amp-test-session",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Completed.",
+                    "session_id": "amp-test-session",
+                }
+            ),
+        ]
+    ) + "\n"
+
+
+def amp_test_plugin_list(plugin_path: Path) -> str:
+    return "\n".join(
+        [
+            f"✓ {plugin_path} active",
+            "  tool: autoreview_generate",
+            "  agent: autoreview-adapter",
+            "  agent mode: autoreview",
+        ]
+    ) + "\n"
+
+
+def amp_test_mcp_denial_result(
+    command: list[str],
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    skills_root = Path(env["HOME"]) / ".config" / "agents" / "skills"
+    probe_roots = list(skills_root.glob("autoreview-mcp-deny-*"))
+    if len(probe_roots) != 1:
+        raise AssertionError(f"expected one MCP denial probe, found {probe_roots}")
+    mcp_config = json.loads((probe_roots[0] / "mcp.json").read_text(encoding="utf-8"))
+    probe_name = next(iter(mcp_config))
+    return subprocess.CompletedProcess(
+        command,
+        0,
+        "12 tools available\n",
+        f"error connecting to {probe_name}: MCP server is not allowed by MCP permissions\n",
+    )
+
+
+class AutoreviewAmpTests(unittest.TestCase):
+    def test_amp_bin_cli_option_and_defaults(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["autoreview", "--engine", "amp", "--amp-bin", "/tmp/trusted-amp"],
+        ):
+            args = AUTOREVIEW.parse_args()
+        reviewer = AUTOREVIEW.reviewer_args(args)[0]
+        self.assertEqual(reviewer.amp_bin, "/tmp/trusted-amp")
+        self.assertEqual(reviewer.model, "openai/gpt-5.6-sol")
+        self.assertEqual(reviewer.thinking, "high")
+        self.assertFalse(reviewer.tools)
+
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_isolation_probe_requires_api_key_and_flags(self) -> None:
+        args = argparse.Namespace(amp_bin="amp")
+        required_flags = " ".join(
+            [
+                "--execute",
+                "--stream-json",
+                "--stream-json-input",
+                "--plugin-ready-timeout",
+                "--settings-file",
+                "--no-ide",
+            ]
+        )
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-probe-test.") as tmpdir, mock.patch.dict(
+            os.environ,
+            {"AMP_API_KEY": "test-key"},
+            clear=False,
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "resolve_command",
+            return_value="/usr/bin/amp",
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "safe_engine_env",
+            return_value={},
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "safe_temp_root",
+            return_value=Path(tmpdir),
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "run",
+            return_value=subprocess.CompletedProcess(["amp", "--help"], 0, required_flags, ""),
+        ):
+            self.assertEqual(
+                AUTOREVIEW.ensure_amp_isolation_supported(args, Path(tmpdir)),
+                "/usr/bin/amp",
+            )
+
+        with mock.patch.dict(os.environ, {"AMP_API_KEY": ""}, clear=False), mock.patch.object(
+            AUTOREVIEW,
+            "resolve_command",
+            return_value="/usr/bin/amp",
+        ):
+            with self.assertRaisesRegex(SystemExit, "requires AMP_API_KEY"):
+                AUTOREVIEW.ensure_amp_isolation_supported(args, Path("/tmp/repo"))
+
+    def test_amp_isolation_probe_rejects_native_windows(self) -> None:
+        args = argparse.Namespace(amp_bin="amp")
+        repo = Path("/tmp/repo")
+        context = (
+            contextlib.nullcontext()
+            if os.name == "nt"
+            else mock.patch.object(AUTOREVIEW.os, "name", "nt")
+        )
+        with context:
+            with self.assertRaisesRegex(SystemExit, "native Windows"):
+                AUTOREVIEW.ensure_amp_isolation_supported(args, repo)
+
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_run_keeps_review_prompt_out_of_outer_agent(self) -> None:
+        args = argparse.Namespace(
+            amp_bin="amp",
+            max_output_chars=2_000_000,
+            model="openai/gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
+        )
+        secret_prompt = "review diff PRIVATE_REVIEW_MARKER_8f3c"
+        observed: dict[str, object] = {}
+
+        def fake_preflight(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            runtime_root = Path(str(env["XDG_CONFIG_HOME"])).parent
+            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
+            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
+            if command[-2:] == ["tools", "list"]:
+                observed["mcp_preflight_prompt_exists"] = (
+                    runtime_root / "review-prompt.txt"
+                ).exists()
+                return amp_test_mcp_denial_result(command, env)
+            observed["preflight_command"] = command
+            observed["preflight_prompt_exists"] = (
+                runtime_root / "review-prompt.txt"
+            ).exists()
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                amp_test_plugin_list(plugin_path),
                 "",
-                "export function modelRuntimeCredentials(",
-                "  env: NodeJS.ProcessEnv,",
-                "): NodeJS.ProcessEnv {",
-                "  const credentials: NodeJS.ProcessEnv = {};",
-                "  return credentials;",
-                "}",
             )
-        )
 
+        def fake_execute(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            observed["command"] = command
+            observed["cwd"] = cwd
+            observed["input"] = kwargs["input_text"]
+            observed["env"] = kwargs["env"]
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            runtime_root = Path(str(env["XDG_CONFIG_HOME"])).parent
+            prompt_path = runtime_root / "review-prompt.txt"
+            result_path = runtime_root / "review-result.json"
+            settings_path = runtime_root / "settings.json"
+            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
+            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
+            observed["prompt"] = prompt_path.read_text(encoding="utf-8")
+            observed["settings"] = json.loads(settings_path.read_text(encoding="utf-8"))
+            observed["plugin"] = plugin_path.read_text(encoding="utf-8")
+            observed["plugin_path"] = plugin_path
+            observed["workspace"] = list(cwd.iterdir())
+            result_path.write_text(json.dumps(FINAL_REPORT), encoding="utf-8")
+            result_path.chmod(0o600)
+            return subprocess.CompletedProcess(command, 0, amp_test_stream(cwd), "")
+
+        inherited = {
+            "AMP_API_KEY": "test-key",
+            "AMP_URL": "https://attacker.invalid",
+            "NODE_OPTIONS": "--require=/tmp/attack.js",
+            "PYTHONPATH": "/tmp/attack",
+            "PLUGINS": "inherited-plugins",
+        }
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-run-test.") as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            with mock.patch.dict(os.environ, inherited, clear=False), mock.patch.object(
+                AUTOREVIEW,
+                "ensure_amp_isolation_supported",
+                return_value="/usr/bin/amp",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run",
+                side_effect=fake_preflight,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_execute,
+            ):
+                output = AUTOREVIEW.run_amp(args, repo, secret_prompt)
+
+        self.assertEqual(json.loads(output), FINAL_REPORT)
+        self.assertFalse(observed["mcp_preflight_prompt_exists"])
+        self.assertFalse(observed["preflight_prompt_exists"])
+        preflight_command = observed["preflight_command"]
+        self.assertIsInstance(preflight_command, list)
+        assert isinstance(preflight_command, list)
+        self.assertEqual(preflight_command[-2:], ["plugins", "list"])
+        command = observed["command"]
+        self.assertIsInstance(command, list)
+        assert isinstance(command, list)
+        self.assertIn("--execute", command)
+        self.assertIn("--stream-json-input", command)
+        self.assertIn("--settings-file", command)
+        self.assertNotIn("--orb-execute", command)
+        self.assertEqual(command[command.index("--mode") + 1], "autoreview")
+        self.assertNotIn(secret_prompt, " ".join(command))
+        self.assertNotIn(secret_prompt, str(observed["input"]))
+        self.assertEqual(observed["prompt"], secret_prompt)
+        self.assertEqual(observed["workspace"], [])
+        settings = observed["settings"]
+        self.assertIsInstance(settings, dict)
+        assert isinstance(settings, dict)
+        self.assertNotIn("amp.tools.disable", settings)
+        self.assertNotIn("amp.tools.enable", settings)
+        self.assertEqual(settings["amp.updates.mode"], "disabled")
+        self.assertEqual(
+            settings["amp.mcpPermissions"],
+            [
+                {"matches": {"command": "*"}, "action": "reject"},
+                {"matches": {"url": "*"}, "action": "reject"},
+            ],
+        )
+        plugin = observed["plugin"]
+        self.assertIsInstance(plugin, str)
+        assert isinstance(plugin, str)
+        self.assertIn("amp.ai.generate", plugin)
+        self.assertIn("amp.registerTool", plugin)
+        self.assertIn("amp.createAgent", plugin)
+        self.assertIn('tools: ["autoreview_generate"]', plugin)
+        self.assertIn("readFileSync", plugin)
+        self.assertNotIn(secret_prompt, plugin)
+        env = observed["env"]
+        self.assertIsInstance(env, dict)
+        assert isinstance(env, dict)
+        self.assertEqual(env["AMP_API_KEY"], "test-key")
+        self.assertNotIn("AMP_URL", env)
+        self.assertNotIn("NODE_OPTIONS", env)
+        self.assertNotIn("PYTHONPATH", env)
+        self.assertEqual(env["PLUGINS"], "all")
+        plugin_path = observed["plugin_path"]
+        self.assertIsInstance(plugin_path, Path)
+        assert isinstance(plugin_path, Path)
+        self.assertRegex(plugin_path.stem, r"^autoreview-[0-9a-f]{32}$")
+        cwd = observed["cwd"]
+        self.assertIsInstance(cwd, Path)
+        assert isinstance(cwd, Path)
+        self.assertNotEqual(cwd.resolve(), repo.resolve())
+        self.assertEqual(Path(env["HOME"]).parent, cwd.parent)
+
+    def test_amp_stream_attestation_rejects_bad_events(self) -> None:
+        cwd = Path("/tmp/amp-review-empty")
+        misplaced_events = [
+            json.loads(line) for line in amp_test_stream(cwd).splitlines()
+        ]
+        tool_use = misplaced_events[2]["message"]["content"].pop()
+        misplaced_events[4]["message"]["content"].append(tool_use)
+        misplaced = "\n".join(json.dumps(event) for event in misplaced_events) + "\n"
+        extra_result_events = [
+            json.loads(line) for line in amp_test_stream(cwd).splitlines()
+        ]
+        extra_result_events[3]["message"]["content"].append(
+            {"type": "text", "text": "unexpected"}
+        )
+        extra_result = (
+            "\n".join(json.dumps(event) for event in extra_result_events) + "\n"
+        )
+        cases = {
+            "malformed": "not-json\n",
+            "tools": amp_test_stream(cwd, tools=["autoreview_generate", "shell_command"]),
+            "mcp": amp_test_stream(cwd, mcp_servers=[{"name": "server"}]),
+            "trigger": amp_test_stream(cwd, trigger="untrusted diff"),
+            "wrong tool": amp_test_stream(cwd, tool_name="shell_command"),
+            "tool input": amp_test_stream(cwd, tool_input={"command": "id"}),
+            "tool result": amp_test_stream(cwd, tool_result_id="wrong-id"),
+            "unsanitized error": amp_test_stream(
+                cwd,
+                tool_error=True,
+                tool_result_content="provider echoed PRIVATE_REVIEW_MARKER_8f3c",
+            ),
+            "multiple init": amp_test_stream(cwd).splitlines()[0] + "\n" + amp_test_stream(cwd),
+            "multiple result": amp_test_stream(cwd) + amp_test_stream(cwd).splitlines()[-1] + "\n",
+            "misplaced tool use": misplaced,
+            "extra tool result content": extra_result,
+        }
+        for label, stream in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                SystemExit,
+                "amp isolation attestation failed",
+            ):
+                AUTOREVIEW.attest_amp_stream(stream, cwd)
+
+        self.assertTrue(AUTOREVIEW.attest_amp_stream(amp_test_stream(cwd), cwd))
         self.assertFalse(
-            AUTOREVIEW.secret_text_risk(
-                source,
-                javascript_dialect="typescript",
+            AUTOREVIEW.attest_amp_stream(amp_test_stream(cwd, tool_error=True), cwd)
+        )
+
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_run_reports_timeout_before_stream_attestation(self) -> None:
+        args = argparse.Namespace(
+            amp_bin="amp",
+            engine_timeout_seconds=0.01,
+            max_output_chars=2_000_000,
+            model="openai/gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
+        )
+
+        def fake_preflight(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            if command[-2:] == ["tools", "list"]:
+                return amp_test_mcp_denial_result(command, env)
+            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
+            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                amp_test_plugin_list(plugin_path),
+                "",
             )
-        )
-        self.assertEqual(
-            AUTOREVIEW.review_secret_fragments(
-                source,
-                javascript_dialect="typescript",
-            ),
-            set(),
-        )
 
-    def test_typescript_typed_declaration_still_scans_initializer(self) -> None:
-        literal_value = "actual-production-" + "secret"
-        source = (
-            "const credentials: NodeJS.ProcessEnv = "
-            f'"{literal_value}";'
-        )
-
-        self.assertTrue(
-            AUTOREVIEW.secret_text_risk(
-                source,
-                javascript_dialect="typescript",
+        def fake_execute(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(kwargs["max_runtime_seconds"], 0.01)
+            return subprocess.CompletedProcess(
+                command,
+                124,
+                '{"type":"system","subtype":"init"}\n',
+                "amp engine timed out after 0.01s",
             )
-        )
-        self.assertEqual(
-            AUTOREVIEW.review_secret_fragments(
-                source,
-                javascript_dialect="typescript",
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                AUTOREVIEW,
+                "ensure_amp_isolation_supported",
+                return_value="/usr/bin/amp",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run",
+                side_effect=fake_preflight,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_execute,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "attest_amp_stream",
+                side_effect=AssertionError("timeout stream must not be attested"),
+            ) as attest:
+                with self.assertRaises(SystemExit) as exc_info:
+                    AUTOREVIEW.run_amp(args, repo, "review")
+
+        message = str(exc_info.exception)
+        self.assertIn("amp engine failed (124)", message)
+        self.assertIn("amp engine timed out after 0.01s", message)
+        attest.assert_not_called()
+
+    def test_amp_plugin_inventory_attestation_fails_closed(self) -> None:
+        cwd = Path("/tmp/amp-review-empty")
+        plugin_path = cwd.parent / "config" / "amp" / "plugins" / "autoreview-token.ts"
+        valid = amp_test_plugin_list(plugin_path)
+        AUTOREVIEW.attest_amp_plugin_inventory(valid, plugin_path, cwd)
+
+        cases = {
+            "missing": "",
+            "inactive": valid.replace("✓", "✗", 1).replace(" active", " error", 1),
+            "other plugin": valid
+            + amp_test_plugin_list(plugin_path.with_name("unexpected.ts")),
+            "event handler": valid + "  events: agent.start\n",
+            "other tool": valid.replace(
+                "  agent: autoreview-adapter",
+                "  tool: shell_command\n  agent: autoreview-adapter",
             ),
-            {literal_value},
+        }
+        for label, output in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                SystemExit,
+                "amp plugin isolation preflight failed",
+            ):
+                AUTOREVIEW.attest_amp_plugin_inventory(output, plugin_path, cwd)
+
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_run_surfaces_direct_generation_failure(self) -> None:
+        args = argparse.Namespace(
+            amp_bin="amp",
+            max_output_chars=2_000_000,
+            model="openai/gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
         )
 
-    def test_boolean_declarations_are_not_credential_material(self) -> None:
-        secret_field = "is" + "Secret"
-        client_secret_field = "hasClient" + "Secret"
-        cases = (
-            (f"val {secret_field}: Boolean? = null,", None),
-            (f"var {client_secret_field}: Boolean = false", None),
-            (f"abstract val {secret_field}: Boolean?", None),
-            (f"val {secret_field}: Boolean?", None),
-            (f"const {client_secret_field}: boolean = true;", "typescript"),
-            (f"declare const {client_secret_field}: boolean;", "typescript"),
-            (f"let {secret_field}: Bool? = nil", None),
-            (f"let {secret_field}: Bool?", None),
-        )
+        def fake_preflight(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            if command[-2:] == ["tools", "list"]:
+                return amp_test_mcp_denial_result(command, env)
+            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
+            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                amp_test_plugin_list(plugin_path),
+                "",
+            )
 
-        for content, javascript_dialect in cases:
-            with self.subTest(content=content):
-                self.assertFalse(
-                    AUTOREVIEW.secret_text_risk(
-                        content,
-                        javascript_dialect=javascript_dialect,
-                    )
-                )
+        def fake_execute(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            error_path = Path(str(env["XDG_CONFIG_HOME"])).parent / "review-error.txt"
+            error_path.write_text("provider rejected model", encoding="utf-8")
+            error_path.chmod(0o600)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                amp_test_stream(cwd, tool_error=True),
+                "",
+            )
 
-    def test_boolean_and_null_literal_values_are_not_credentials(self) -> None:
-        cases = (
-            ("is" + "Secret", "true"),
-            ("requires" + "Password", "false"),
-            ("access" + "Token", "null"),
-        )
-        for field_name, literal in cases:
-            content = f"{field_name} = {literal}"
-            with self.subTest(content=content):
-                self.assertFalse(AUTOREVIEW.secret_text_risk(content))
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-error-test.") as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                AUTOREVIEW,
+                "ensure_amp_isolation_supported",
+                return_value="/usr/bin/amp",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run",
+                side_effect=fake_preflight,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_execute,
+            ):
+                with self.assertRaisesRegex(SystemExit, "provider rejected model"):
+                    AUTOREVIEW.run_amp(args, repo, "review")
 
-    def test_boolean_annotation_does_not_hide_real_credential_literal(self) -> None:
-        literal_value = "actual-production-" + "secret"
-        secret_field = "is" + "Secret"
-        client_secret_field = "hasClient" + "Secret"
-        cases = (
-            (f'val {secret_field}: Boolean? = "{literal_value}",', None),
-            (f'var {client_secret_field}: Boolean = "{literal_value}"', None),
+
+class AutoreviewTruffleHogTests(unittest.TestCase):
+    def test_findings_map_to_prompt_dataset_untracked_and_diff_paths(self) -> None:
+        prompt = "\n".join(
             (
-                f'const {client_secret_field}: boolean = "{literal_value}";',
-                "typescript",
-            ),
-            (f'let {secret_field}: Bool? = "{literal_value}"', None),
+                "# Prompt file: review-notes.md",
+                "prompt body",
+                "# Dataset: evidence.json",
+                "dataset body",
+                "# Untracked File",
+                'path: "new/config.ts"',
+                "source-line 1: redacted example",
+                "diff --git a/old.ts b/new.ts",
+                "--- a/old.ts",
+                "+++ b/new.ts",
+                "@@ -1 +1 @@",
+                "+redacted example",
+            )
+        )
+        output = "\n".join(
+            json.dumps(
+                {
+                    "SourceMetadata": {
+                        "Data": {"Filesystem": {"line": line_number}}
+                    }
+                }
+            )
+            for line_number in (2, 4, 7, 12)
         )
 
-        for content, javascript_dialect in cases:
-            with self.subTest(content=content):
-                self.assertTrue(
-                    AUTOREVIEW.secret_text_risk(
-                        content,
-                        javascript_dialect=javascript_dialect,
-                    )
+        self.assertEqual(
+            AUTOREVIEW.trufflehog_review_pack_paths(prompt, output),
+            ["evidence.json", "new.ts", "new/config.ts", "review-notes.md"],
+        )
+
+    def test_deleted_diff_finding_maps_to_original_path(self) -> None:
+        prompt = "\n".join(
+            (
+                "# Change Bundle",
+                "diff --git a/config.ts b/config.ts",
+                "deleted file mode 100644",
+                "--- a/config.ts",
+                "+++ /dev/null",
+                "@@ -1 +0,0 @@",
+                "-redacted example",
+            )
+        )
+        output = json.dumps(
+            {
+                "SourceMetadata": {
+                    "Data": {"Filesystem": {"Line": 7}}
+                }
+            }
+        )
+
+        self.assertEqual(
+            AUTOREVIEW.trufflehog_review_pack_paths(prompt, output),
+            ["config.ts"],
+        )
+
+    def test_unusable_scanner_output_falls_back_without_echoing_it(self) -> None:
+        output = "not-json\n" + json.dumps(
+            {
+                "SourceMetadata": {
+                    "Data": {"Filesystem": {"line": "invalid"}}
+                },
+                "Raw": "must-not-be-returned",
+            }
+        )
+
+        self.assertEqual(
+            AUTOREVIEW.trufflehog_review_pack_paths("prompt", output),
+            ["review pack"],
+        )
+
+    def test_scanner_command_requests_verified_and_unknown_results(self) -> None:
+        prompt = "review pack with redacted examples only"
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+
+            def run_scanner(
+                command: list[str],
+                cwd: Path,
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(cwd, Path(command[2]).parent)
+                self.assertEqual(Path(command[2]).read_text(encoding="utf-8"), prompt)
+                self.assertEqual(
+                    command[3:],
+                    [
+                        "--json",
+                        "--no-color",
+                        "--results=verified,unknown",
+                        "--fail",
+                        "--fail-on-scan-errors",
+                    ],
                 )
+                self.assertEqual(kwargs["check"], False)
+                return subprocess.CompletedProcess(command, 0, "", "")
 
-    def test_boolean_prefix_values_remain_credentials(self) -> None:
-        field_name = "client" + "Secret"
-        for prefix in ("Boolean", "boolean", "Bool"):
-            literal_value = prefix + "-prod-credential"
-            content = f"{field_name}: {literal_value}"
-            with self.subTest(content=content):
-                self.assertTrue(AUTOREVIEW.secret_text_risk(content))
-
-    def test_boolean_type_tokens_in_config_remain_credentials(self) -> None:
-        field_name = "client" + "Secret"
-        for literal_value in ("Boolean?", "Boolean?=abc1234"):
-            content = f"{field_name}: {literal_value}"
-            with self.subTest(content=content):
-                self.assertTrue(AUTOREVIEW.secret_text_risk(content))
+            with mock.patch.object(
+                AUTOREVIEW,
+                "find_command",
+                return_value="/trusted/trufflehog",
+            ), mock.patch.object(AUTOREVIEW, "run", side_effect=run_scanner):
+                AUTOREVIEW.scan_outgoing_review_pack(repo, prompt)
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
@@ -267,927 +1396,147 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 os.environ[key] = value
         cls.home_dir.cleanup()
 
-    def test_harness_rejects_disabled_cursor_engine(self) -> None:
-        harness_path = SCRIPT_PATH.with_name("test-review-harness.py")
-        namespace = runpy.run_path(str(harness_path))
-        with self.assertRaises(SystemExit):
-            namespace["parse_args"](["--engine", "cursor"])
-
-    def test_cursor_agent_bin_cli_alias(self) -> None:
+    def test_kimi_bin_cli_option(self) -> None:
         with mock.patch.object(
             sys,
             "argv",
-            ["autoreview", "--cursor-agent-bin", "/tmp/legacy-cursor"],
+            ["autoreview", "--kimi-bin", "/tmp/trusted-kimi"],
         ):
             args = AUTOREVIEW.parse_args()
-        self.assertEqual(args.cursor_bin, "/tmp/legacy-cursor")
+        self.assertEqual(args.kimi_bin, "/tmp/trusted-kimi")
 
-    def test_cursor_agent_bin_env_alias(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"CURSOR_AGENT_BIN": "/tmp/legacy-cursor"},
-            clear=False,
-        ):
-            os.environ.pop("CURSOR_BIN", None)
-            with mock.patch.object(sys, "argv", ["autoreview"]):
-                args = AUTOREVIEW.parse_args()
-        self.assertEqual(args.cursor_bin, "/tmp/legacy-cursor")
-
-    def test_cursor_agent_reviewer_alias_normalizes_to_cursor(self) -> None:
-        self.assertEqual(
-            AUTOREVIEW.parse_reviewer_token("cursor-agent:auto"),
-            ("cursor", "auto", None),
-        )
-
-    def test_claude_auth_env_does_not_block_explicit_non_claude_engine(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"AUTOREVIEW_CLAUDE_AUTH": "subscription"},
-            clear=False,
-        ):
-            with mock.patch.object(sys, "argv", ["autoreview", "--engine", "cursor"]):
-                reviewers = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
-        self.assertEqual([reviewer.engine for reviewer in reviewers], ["cursor"])
-
-    def test_explicit_claude_auth_rejects_non_claude_engine(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            [
-                "autoreview",
-                "--engine",
-                "cursor",
-                "--claude-auth",
-                "subscription",
-            ],
-        ):
-            args = AUTOREVIEW.parse_args()
-        with self.assertRaisesRegex(SystemExit, "only supported for claude"):
-            AUTOREVIEW.reviewer_args(args)
-
-    def test_explicit_codex_auth_rejects_non_codex_engine(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            [
-                "autoreview",
-                "--engine",
-                "claude",
-                "--codex-auth",
-                "chatgpt",
-            ],
-        ):
-            args = AUTOREVIEW.parse_args()
-        with self.assertRaisesRegex(SystemExit, "only supported for codex"):
-            AUTOREVIEW.reviewer_args(args)
-
-    def test_mixed_chatgpt_and_bedrock_auth_is_preserved(self) -> None:
-        with mock.patch.object(
-            sys,
-            "argv",
-            [
-                "autoreview",
-                "--panel",
-                "--codex-auth",
-                "chatgpt",
-                "--claude-auth",
-                "bedrock",
-                "--claude-bedrock-region",
-                "us-east-1",
-            ],
-        ):
-            reviewers = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
-        self.assertEqual([reviewer.engine for reviewer in reviewers], ["codex", "claude"])
-        self.assertEqual(reviewers[0].codex_auth, "chatgpt")
-        self.assertEqual(reviewers[1].claude_auth, "bedrock")
-        self.assertEqual(reviewers[1].claude_bedrock_region, "us-east-1")
-        self.assertEqual(
-            reviewers[1].model,
-            "global.anthropic.claude-opus-4-8[1m]",
-        )
-        self.assertEqual(reviewers[1].thinking, "xhigh")
-
-    def test_chatgpt_codex_defaults_to_fast_without_overriding_explicit_tier(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            implicit = AUTOREVIEW.reviewer_test_args(codex_auth="chatgpt")
-            raw_tier = AUTOREVIEW.reviewer_test_args(
-                codex_auth="chatgpt",
-                codex_config=['service_tier="flex"'],
-            )
-            explicit = AUTOREVIEW.reviewer_test_args(
-                codex_auth="chatgpt",
-                codex_speed="default",
-            )
-            self.assertEqual(AUTOREVIEW.codex_speed_value(implicit), "fast")
-            self.assertIsNone(AUTOREVIEW.codex_speed_override(raw_tier))
-            self.assertEqual(AUTOREVIEW.codex_speed_value(raw_tier), "flex")
-            self.assertEqual(AUTOREVIEW.codex_speed_value(explicit), "default")
-
-    def test_codex_provider_profile_does_not_inherit_fast_default(self) -> None:
-        args = AUTOREVIEW.reviewer_test_args(
-            codex_auth="default",
-            codex_profile="bedrock",
-        )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(AUTOREVIEW.codex_speed_value(args))
-
-    def test_run_telemetry_persists_private_bundle_report_and_history(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-telemetry-test.") as tempdir:
-            root = Path(tempdir)
-            repo = root / "repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(
-                ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repo), "config", "user.name", "Test"],
-                check=True,
-            )
-            (repo / "example.txt").write_text("example\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(repo), "add", "example.txt"], check=True)
-            subprocess.run(
-                ["git", "-C", str(repo), "commit", "-q", "-m", "initial"],
-                check=True,
-            )
-            logs = root / "logs"
-            logs.mkdir(mode=0o755)
-            logs.chmod(0o755)
-            args = AUTOREVIEW.reviewer_test_args(
-                codex_auth="chatgpt",
-                model="gpt-5.6-sol",
-                thinking="high",
-                fallback_model="gpt-5.6-terra",
-                web_search=True,
-                stream_engine_output=False,
-                parallel_tests=None,
-                run_log_dir=str(logs),
-                log_bundle=True,
-            )
-            telemetry = AUTOREVIEW.RunTelemetry(
-                args,
-                repo,
-                "branch",
-                "origin/main",
-                [args],
-            )
-            self.assertEqual(logs.stat().st_mode & 0o777, 0o755)
-            self.assertEqual((logs / "runs").stat().st_mode & 0o777, 0o700)
-            args.run_telemetry = telemetry
-            telemetry.record_bundle(
-                "diff --git a/example.txt b/example.txt\n",
-                truncated=False,
-                changed_paths={"example.txt"},
-                prompts=["review prompt"],
-            )
-            reviewer_id = telemetry.start_reviewer(args)
-            attempt_id = telemetry.start_attempt(args)
-            telemetry.finish_attempt(attempt_id, status="completed", returncode=0)
-            telemetry.finish_reviewer(reviewer_id, status="completed", findings=0)
-            telemetry.record_result(FINAL_REPORT, tests_status=0, outcome="clean")
-            telemetry.finish(0)
-
-            metadata = json.loads(telemetry.metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(metadata["reviewers"][0]["speed_requested"], "fast")
-            self.assertEqual(metadata["bundle"]["changed_paths"], ["example.txt"])
-            self.assertEqual(metadata["attempts"][0]["status"], "completed")
-            self.assertEqual(
-                metadata["reviewer_runs"][0]["finding_disposition"],
-                {
-                    "confirmed": 0,
-                    "false_positive": 0,
-                    "not_actionable": 0,
-                    "pending": 0,
-                },
-            )
-            self.assertEqual(metadata["result"]["outcome"], "clean")
-            self.assertEqual((telemetry.run_dir / "bundle.txt").read_text(), "diff --git a/example.txt b/example.txt\n")
-            self.assertTrue((telemetry.run_dir / "report.json").is_file())
-            history = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT_PATH.with_name("autoreview-history")),
-                    "--log-dir",
-                    str(logs),
-                    "--json",
-                ],
-                check=True,
-                text=True,
-                stdout=subprocess.PIPE,
-            )
-            summary = json.loads(history.stdout)
-            self.assertEqual(summary["runs"], 1)
-            self.assertEqual(
-                summary["configurations"][0]["speed_requested"],
-                "fast",
-            )
-
-            args.log_bundle = False
-            metadata_only = AUTOREVIEW.RunTelemetry(
-                args,
-                repo,
-                "branch",
-                "origin/main",
-                [args],
-            )
-            metadata_only.record_result(
-                FINAL_REPORT,
-                tests_status=0,
-                outcome="clean",
-            )
-            metadata_only.finish(0)
-            self.assertFalse((metadata_only.run_dir / "report.json").exists())
-            self.assertEqual(
-                json.loads(metadata_only.metadata_path.read_text())["artifacts"],
-                {"metadata": "metadata.json"},
-            )
-
-    def test_run_log_root_rejects_paths_inside_reviewed_repo(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-log-root-test.") as tempdir:
-            repo = Path(tempdir).resolve()
-            args = argparse.Namespace(run_log_dir=str(repo / "review-history"))
-            with self.assertRaisesRegex(SystemExit, "must be outside"):
-                AUTOREVIEW.run_log_root(args, repo)
-
-    def test_implicit_history_root_falls_back_outside_home_repository(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-home-repo-test.") as tempdir:
-            root = Path(tempdir).resolve()
-            repo = root / "home-repo"
-            fallback_parent = root / "system-temp"
-            repo.mkdir()
-            (repo / ".git").mkdir()
-            fallback_parent.mkdir()
-            args = argparse.Namespace(run_log_dir=None)
-            with (
-                mock.patch.object(Path, "home", return_value=repo),
-                mock.patch.object(tempfile, "gettempdir", return_value=str(fallback_parent)),
-                mock.patch.dict(os.environ, {}, clear=True),
-            ):
-                history_root = AUTOREVIEW.run_log_root(args, repo)
-                (history_root / "runs").mkdir(parents=True)
-                history = runpy.run_path(
-                    str(SCRIPT_PATH.with_name("autoreview-history"))
-                )
-                reader_root = history["default_log_dir"]()
-            self.assertTrue(history_root.is_relative_to(fallback_parent))
-            self.assertFalse(history_root.is_relative_to(repo))
-            self.assertEqual(reader_root, history_root)
-
-    def test_history_runs_directory_must_not_overlap_repository(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-log-overlap-test.") as tempdir:
-            root = Path(tempdir).resolve()
-            repo = root / "runs"
-            repo.mkdir()
-            args = argparse.Namespace(run_log_dir=str(root))
-            with self.assertRaisesRegex(SystemExit, "must be outside"):
-                AUTOREVIEW.run_log_root(args, repo)
-
-    def test_existing_history_directory_must_not_be_shared_writable(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-mode-test.") as tempdir:
-            shared = Path(tempdir) / "shared"
-            shared.mkdir(mode=0o777)
-            shared.chmod(0o777)
-            with self.assertRaisesRegex(SystemExit, "group/world-writable"):
-                AUTOREVIEW.ensure_private_directory(shared)
-            self.assertEqual(shared.stat().st_mode & 0o777, 0o777)
-
-    def test_codex_setup_failure_finishes_telemetry_attempt(self) -> None:
-        args = AUTOREVIEW.reviewer_test_args(
-            codex_bin="codex",
-            codex_auth="chatgpt",
-            model="gpt-5.6-sol",
-            thinking="high",
+    def test_kimi_reviewer_disables_tools(self) -> None:
+        args = argparse.Namespace(
+            engine="kimi",
+            model=None,
+            thinking=["on"],
             fallback_model=None,
+            codex_config=None,
+            codex_speed=None,
+            tools=True,
         )
-        telemetry = mock.Mock(spec=AUTOREVIEW.RunTelemetry)
-        telemetry.start_attempt.return_value = 7
-        args.run_telemetry = telemetry
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-setup-test.") as tempdir, (
-            mock.patch.object(
-                AUTOREVIEW,
-                "prepare_codex_runtime_auth",
-                return_value=False,
-            )
+
+        reviewer = AUTOREVIEW.reviewer_args(args)[0]
+
+        self.assertEqual(reviewer.engine, "kimi")
+        self.assertEqual(reviewer.thinking, "on")
+        self.assertFalse(reviewer.tools)
+
+    def test_kimi_isolation_requires_current_cli_contract(self) -> None:
+        args = argparse.Namespace(kimi_bin="kimi")
+        required_flags = " ".join(
+            [
+                "--agent-file",
+                "--skills-dir",
+                "--prompt",
+                "--output-format",
+                "--model",
+            ]
+        )
+
+        def fake_run(command: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "--version" in command:
+                return subprocess.CompletedProcess(command, 0, "0.31.1", "")
+            return subprocess.CompletedProcess(command, 0, required_flags, "")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-kimi-probe-test.") as tmpdir, mock.patch.object(
+            AUTOREVIEW,
+            "resolve_command",
+            return_value="/usr/bin/kimi",
         ), mock.patch.object(
             AUTOREVIEW,
-            "prepare_codex_runtime_profile",
-            return_value=False,
-        ), mock.patch.object(
-            AUTOREVIEW,
-            "codex_source_home",
-            return_value=None,
-        ), mock.patch.object(
-            AUTOREVIEW,
-            "codex_command",
-            side_effect=OSError("setup failed"),
-        ):
-            with self.assertRaisesRegex(OSError, "setup failed"):
-                AUTOREVIEW.run_codex(args, Path(tempdir), "review")
-        telemetry.finish_attempt.assert_called_once_with(7, status="failed")
-
-    def test_bundle_history_is_opt_in(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(
-                AUTOREVIEW.run_log_bundle_enabled(
-                    argparse.Namespace(log_bundle=None)
-                )
-            )
-            os.environ["AUTOREVIEW_RUN_LOG_BUNDLE"] = "1"
-            self.assertTrue(
-                AUTOREVIEW.run_log_bundle_enabled(
-                    argparse.Namespace(log_bundle=None)
-                )
-            )
-            self.assertFalse(
-                AUTOREVIEW.run_log_bundle_enabled(
-                    argparse.Namespace(log_bundle=False)
-                )
-            )
-            os.environ["AUTOREVIEW_RUN_LOG_BUNDLE"] = "typo"
-            with self.assertRaisesRegex(SystemExit, "invalid AUTOREVIEW_RUN_LOG_BUNDLE"):
-                AUTOREVIEW.run_log_bundle_enabled(
-                    argparse.Namespace(log_bundle=None)
-                )
-
-    def test_default_history_setup_falls_back_without_failing_review(self) -> None:
-        args = AUTOREVIEW.reviewer_test_args(run_log_dir=None, log_bundle=False)
-        fallback = mock.Mock(strict=True)
-        with mock.patch.object(
-            AUTOREVIEW,
-            "RunTelemetry",
-            side_effect=[OSError("read only"), fallback],
-        ) as constructor:
-            result = AUTOREVIEW.create_run_telemetry(
-                args,
-                Path("/repo"),
-                "local",
-                None,
-                [args],
-            )
-        self.assertIs(result, fallback)
-        self.assertFalse(fallback.strict)
-        self.assertEqual(constructor.call_count, 2)
-
-    def test_default_history_fallback_does_not_follow_symlink(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-symlink-test.") as tempdir:
-            root = Path(tempdir)
-            state_home = root / "blocked-state-home"
-            state_home.write_text("not a directory", encoding="utf-8")
-            fallback_parent = root / "system-temp"
-            fallback_parent.mkdir()
-            target = root / "owned-target"
-            target.mkdir()
-            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
-            fallback.symlink_to(target, target_is_directory=True)
-            args = AUTOREVIEW.reviewer_test_args(
-                run_log_dir=None,
-                log_bundle=False,
-            )
-            with (
-                mock.patch.object(
-                    AUTOREVIEW.tempfile,
-                    "gettempdir",
-                    return_value=str(fallback_parent),
-                ),
-                mock.patch.dict(
-                    os.environ,
-                    {"XDG_STATE_HOME": str(state_home)},
-                    clear=True,
-                ),
-            ):
-                telemetry = AUTOREVIEW.create_run_telemetry(
-                    args,
-                    root / "repo",
-                    "local",
-                    None,
-                    [args],
-                )
-            self.assertIsNone(telemetry)
-            self.assertFalse((target / "runs").exists())
-
-    def test_explicit_history_setup_failure_remains_strict(self) -> None:
-        args = AUTOREVIEW.reviewer_test_args(
-            run_log_dir="/explicit/history",
-            log_bundle=False,
-        )
-        with mock.patch.object(
-            AUTOREVIEW,
-            "RunTelemetry",
-            side_effect=OSError("read only"),
-        ), self.assertRaisesRegex(OSError, "read only"):
-            AUTOREVIEW.create_run_telemetry(
-                args,
-                Path("/repo"),
-                "local",
-                None,
-                [args],
-            )
-
-    def test_default_history_write_failure_disables_logging_only(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-write-test.") as tempdir:
-            repo = Path(tempdir) / "repo"
-            repo.mkdir()
-            args = AUTOREVIEW.reviewer_test_args(
-                run_log_dir=str(Path(tempdir) / "history"),
-                log_bundle=False,
-            )
-            telemetry = AUTOREVIEW.RunTelemetry(
-                args,
-                repo,
-                "local",
-                None,
-                [args],
-                strict=False,
-            )
-            with mock.patch.object(
-                AUTOREVIEW,
-                "atomic_write_text",
-                side_effect=OSError("read only"),
-            ):
-                attempt_id = telemetry.start_attempt(args)
-            self.assertEqual(attempt_id, 1)
-            self.assertFalse(telemetry.logging_available)
-
-    def test_explicit_history_write_failure_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-write-test.") as tempdir:
-            repo = Path(tempdir) / "repo"
-            repo.mkdir()
-            args = AUTOREVIEW.reviewer_test_args(
-                run_log_dir=str(Path(tempdir) / "history"),
-                log_bundle=False,
-            )
-            telemetry = AUTOREVIEW.RunTelemetry(
-                args,
-                repo,
-                "local",
-                None,
-                [args],
-                strict=True,
-            )
-            with mock.patch.object(
-                AUTOREVIEW,
-                "atomic_write_text",
-                side_effect=OSError("read only"),
-            ), self.assertRaisesRegex(OSError, "read only"):
-                telemetry.start_attempt(args)
-
-    def test_telemetry_finalization_is_idempotent_after_strict_write_failure(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-finish-test.") as tempdir:
-            repo = Path(tempdir) / "repo"
-            repo.mkdir()
-            args = AUTOREVIEW.reviewer_test_args(
-                run_log_dir=str(Path(tempdir) / "history"),
-                log_bundle=False,
-            )
-            telemetry = AUTOREVIEW.RunTelemetry(
-                args,
-                repo,
-                "local",
-                None,
-                [args],
-                strict=True,
-            )
-            attempt_id = telemetry.start_attempt(args)
-            reviewer_id = telemetry.start_reviewer(args)
-            with mock.patch.object(
-                AUTOREVIEW,
-                "atomic_write_text",
-                side_effect=OSError("read only"),
-            ):
-                with self.assertRaisesRegex(OSError, "read only"):
-                    telemetry.finish_attempt(attempt_id, status="completed")
-                telemetry.finish_attempt(attempt_id, status="failed")
-                with self.assertRaisesRegex(OSError, "read only"):
-                    telemetry.finish_reviewer(reviewer_id, status="completed")
-                telemetry.finish_reviewer(reviewer_id, status="failed")
-
-    def test_pi_records_model_attempt_separately_from_review_validation(self) -> None:
-        args = AUTOREVIEW.reviewer_test_args(
-            engine="pi",
-            model="openai/gpt-4o",
-            thinking="high",
-        )
-        telemetry = mock.Mock(spec=AUTOREVIEW.RunTelemetry)
-        telemetry.start_attempt.return_value = 3
-        args.run_telemetry = telemetry
-        with tempfile.TemporaryDirectory(prefix="autoreview-pi-telemetry-test.") as tempdir, (
-            mock.patch.object(
-                AUTOREVIEW,
-                "ensure_pi_isolation_supported",
-                return_value="pi",
-            )
+            "safe_engine_env",
+            return_value={},
         ), mock.patch.object(
             AUTOREVIEW,
             "safe_temp_root",
-            return_value=tempdir,
+            return_value=Path(tmpdir),
         ), mock.patch.object(
             AUTOREVIEW,
-            "run_with_heartbeat",
-            return_value=subprocess.CompletedProcess(["pi"], 0, "{}", ""),
+            "run",
+            side_effect=fake_run,
         ):
-            self.assertEqual(AUTOREVIEW.run_pi(args, Path(tempdir), "review"), "{}")
-        telemetry.start_attempt.assert_called_once_with(args)
-        telemetry.finish_attempt.assert_called_once_with(
-            3,
-            status="completed",
-            returncode=0,
-        )
-
-    def test_history_uses_reviewer_runs_for_pi_and_preserves_inherited_speed(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        summary = history["summarize"](
-            [
-                {
-                    "status": "completed",
-                    "result": {"outcome": "clean"},
-                    "attempts": [
-                        {
-                            "engine": "codex",
-                            "model": "gpt-5.6-sol",
-                            "thinking": "high",
-                            "auth": "default",
-                            "profile": None,
-                            "speed_requested": None,
-                            "pass": 1,
-                            "status": "completed",
-                            "duration_seconds": 2.0,
-                            "reason": "primary",
-                            "refusal": False,
-                        }
-                    ],
-                    "reviewer_runs": [
-                        {
-                            "engine": "codex",
-                            "model": "gpt-5.6-sol",
-                            "thinking": "high",
-                            "auth": "default",
-                            "profile": None,
-                            "speed_requested": None,
-                            "pass": 1,
-                            "status": "failed",
-                            "duration_seconds": 2.1,
-                        },
-                        {
-                            "engine": "pi",
-                            "model": "openai/gpt-4o",
-                            "thinking": "high",
-                            "pass": 1,
-                            "status": "completed",
-                            "duration_seconds": 3.0,
-                        }
-                    ],
-                }
-            ],
-            None,
-        )
-        by_engine = {
-            row["engine"]: row for row in summary["configurations"]
-        }
-        self.assertEqual(
-            by_engine["codex"]["speed_requested"],
-            "inherited",
-        )
-        self.assertEqual(by_engine["codex"]["completed"], 1)
-        self.assertEqual(by_engine["codex"]["review_failures"], 1)
-        self.assertEqual(by_engine["pi"]["attempts"], 0)
-        self.assertEqual(by_engine["pi"]["review_completed"], 1)
-        self.assertEqual(by_engine["pi"]["speed_requested"], "n/a")
-
-    def test_history_summarizes_verified_finding_dispositions(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        reviewer = {
-            "engine": "claude",
-            "model": "global.anthropic.claude-opus-5[1m]",
-            "thinking": "medium",
-            "auth": "bedrock",
-            "profile": None,
-            "status": "completed",
-            "duration_seconds": 10.0,
-        }
-        summary = history["summarize"](
-            [
-                {
-                    "status": "completed",
-                    "result": {"outcome": "findings"},
-                    "attempts": [],
-                    "reviewer_runs": [
-                        {
-                            **reviewer,
-                            "findings": 3,
-                            "finding_disposition": {
-                                "confirmed": 1,
-                                "false_positive": 1,
-                                "not_actionable": 0,
-                                "pending": 1,
-                            },
-                        },
-                        {
-                            **reviewer,
-                            "findings": 2,
-                        },
-                    ],
-                }
-            ],
-            None,
-        )
-
-        row = summary["configurations"][0]
-        self.assertEqual(row["findings_reported"], 5)
-        self.assertEqual(row["findings_confirmed"], 1)
-        self.assertEqual(row["findings_false_positive"], 1)
-        self.assertEqual(row["findings_not_actionable"], 0)
-        self.assertEqual(row["findings_pending"], 3)
-        self.assertEqual(row["confirmation_rate"], 0.5)
-        self.assertEqual(row["false_positive_rate"], 0.5)
-
-    def test_history_records_finding_disposition_atomically(self) -> None:
-        history_path = SCRIPT_PATH.with_name("autoreview-history")
-        history = runpy.run_path(str(history_path))
-        with tempfile.TemporaryDirectory(prefix="autoreview-disposition-test.") as tempdir:
-            root = Path(tempdir) / "history"
-            run_dir = root / "runs" / "run-1"
-            run_dir.mkdir(parents=True)
-            root.chmod(0o700)
-            (root / "runs").chmod(0o700)
-            run_dir.chmod(0o700)
-            metadata_path = run_dir / "metadata.json"
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "run_id": "run-1",
-                        "status": "completed",
-                        "reviewer_runs": [
-                            {
-                                "reviewer_run_id": 7,
-                                "engine": "claude",
-                                "model": "claude-opus-5",
-                                "thinking": "medium",
-                                "findings": 3,
-                                "status": "completed",
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            metadata_path.chmod(0o600)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(history_path),
-                    "--log-dir",
-                    str(root),
-                    "--record-disposition",
-                    "run-1",
-                    "--reviewer-run-id",
-                    "7",
-                    "--confirmed",
-                    "1",
-                    "--false-positive",
-                    "1",
-                    "--json",
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["pending"], 1)
-            updated = history["record_finding_disposition"](
-                [root],
-                "run-1",
-                7,
-                confirmed=None,
-                false_positive=None,
-                not_actionable=1,
-            )
-            self.assertEqual(updated["confirmed"], 1)
-            self.assertEqual(updated["false_positive"], 1)
-            self.assertEqual(updated["not_actionable"], 1)
-            self.assertEqual(updated["pending"], 0)
-            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
-            disposition = saved["reviewer_runs"][0]["finding_disposition"]
-            self.assertEqual(disposition["confirmed"], 1)
-            self.assertEqual(disposition["false_positive"], 1)
-            self.assertEqual(disposition["not_actionable"], 1)
-            self.assertEqual(disposition["pending"], 0)
-            self.assertRegex(disposition["updated_at"], r"Z$")
-            self.assertEqual(metadata_path.stat().st_mode & 0o777, 0o600)
-
-    def test_history_rejects_dispositions_above_reported_findings(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-disposition-test.") as tempdir:
-            root = Path(tempdir) / "history"
-            run_dir = root / "runs" / "run-2"
-            run_dir.mkdir(parents=True)
-            root.chmod(0o700)
-            (root / "runs").chmod(0o700)
-            run_dir.chmod(0o700)
-            metadata_path = run_dir / "metadata.json"
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "run_id": "run-2",
-                        "status": "completed",
-                        "reviewer_runs": [
-                            {
-                                "reviewer_run_id": 1,
-                                "engine": "codex",
-                                "findings": 1,
-                                "status": "completed",
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            metadata_path.chmod(0o600)
-
-            with self.assertRaisesRegex(SystemExit, "exceeds"):
-                history["record_finding_disposition"](
-                    [root],
-                    "run-2",
-                    1,
-                    confirmed=1,
-                    false_positive=1,
-                    not_actionable=None,
-                )
-
-    def test_history_loads_runs_by_high_resolution_start_time(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-order-test.") as tempdir:
-            root = Path(tempdir)
-            for directory, run_id, started in (
-                ("z-random", "newer", 20),
-                ("a-random", "older", 10),
-            ):
-                run_dir = root / "runs" / directory
-                run_dir.mkdir(parents=True)
-                (run_dir / "metadata.json").write_text(
-                    json.dumps(
-                        {
-                            "run_id": run_id,
-                            "started_at_unix_ns": started,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-            runs = history["load_runs"](root)
-            self.assertEqual([run["run_id"] for run in runs], ["older", "newer"])
-
-    def test_history_reader_detects_repository_below_default_runs_root(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-fallback-test.") as tempdir:
-            root = Path(tempdir).resolve()
-            state_home = root / "state"
-            repo = state_home / "autoreview" / "runs" / "project"
-            fallback_parent = root / "system-temp"
-            (repo / ".git").mkdir(parents=True)
-            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
-            (fallback / "runs").mkdir(parents=True)
-            with (
-                mock.patch.object(Path, "cwd", return_value=repo),
-                mock.patch.object(
-                    tempfile,
-                    "gettempdir",
-                    return_value=str(fallback_parent),
-                ),
-                mock.patch.dict(
-                    os.environ,
-                    {"XDG_STATE_HOME": str(state_home)},
-                    clear=True,
-                ),
-            ):
-                resolved = history["default_log_dir"]()
-            self.assertTrue(resolved.is_relative_to(fallback_parent))
-
-    def test_history_reader_uses_populated_fallback_when_default_is_unavailable(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
-            root = Path(tempdir)
-            home = root / "home"
-            fallback_parent = root / "system-temp"
-            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
-            (fallback / "runs").mkdir(parents=True)
-            home.mkdir()
-            with (
-                mock.patch.object(Path, "home", return_value=home),
-                mock.patch.object(
-                    history["tempfile"],
-                    "gettempdir",
-                    return_value=str(fallback_parent),
-                ),
-                mock.patch.dict(os.environ, {}, clear=True),
-            ):
-                resolved = history["default_log_dir"]()
-            self.assertEqual(resolved, fallback.resolve())
-
-    def test_history_reader_rejects_insecure_default_before_preferring_it(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
-            root = Path(tempdir)
-            state_home = root / "state"
-            candidate = state_home / "autoreview"
-            fallback_parent = root / "system-temp"
-            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
-            (candidate / "runs").mkdir(parents=True)
-            candidate.chmod(0o775)
-            (fallback / "runs").mkdir(parents=True)
-            with (
-                mock.patch.object(
-                    history["tempfile"],
-                    "gettempdir",
-                    return_value=str(fallback_parent),
-                ),
-                mock.patch.dict(
-                    os.environ,
-                    {"XDG_STATE_HOME": str(state_home)},
-                    clear=True,
-                ),
-            ):
-                resolved = history["default_log_dir"]()
-            self.assertEqual(resolved, fallback.resolve())
-
-    def test_history_reader_ignores_untrusted_implicit_fallback(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
-            root = Path(tempdir)
-            home = root / "home"
-            fallback_parent = root / "system-temp"
-            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
-            home.mkdir()
-            (fallback / "runs").mkdir(parents=True)
-            fallback.chmod(0o777)
-            with (
-                mock.patch.object(Path, "home", return_value=home),
-                mock.patch.object(
-                    history["tempfile"],
-                    "gettempdir",
-                    return_value=str(fallback_parent),
-                ),
-                mock.patch.dict(os.environ, {}, clear=True),
-            ):
-                self.assertEqual(history["default_log_dirs"](), [])
-
-    def test_history_reader_does_not_follow_implicit_fallback_symlink(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
-            root = Path(tempdir)
-            home = root / "home"
-            fallback_parent = root / "system-temp"
-            target = root / "owned-target"
-            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
-            home.mkdir()
-            (target / "runs").mkdir(parents=True)
-            fallback_parent.mkdir()
-            fallback.symlink_to(target, target_is_directory=True)
-            with (
-                mock.patch.object(Path, "home", return_value=home),
-                mock.patch.object(
-                    history["tempfile"],
-                    "gettempdir",
-                    return_value=str(fallback_parent),
-                ),
-                mock.patch.dict(os.environ, {}, clear=True),
-            ):
-                self.assertEqual(history["default_log_dirs"](), [])
-
-    def test_history_reader_merges_default_and_fallback_runs(self) -> None:
-        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
-        with tempfile.TemporaryDirectory(prefix="autoreview-history-merge-test.") as tempdir:
-            root = Path(tempdir)
-            default = root / "default"
-            fallback = root / "fallback"
-            for history_root, run_id, started in (
-                (default, "default-run", 20),
-                (fallback, "fallback-run", 10),
-            ):
-                run_dir = history_root / "runs" / run_id
-                run_dir.mkdir(parents=True)
-                (run_dir / "metadata.json").write_text(
-                    json.dumps(
-                        {
-                            "run_id": run_id,
-                            "started_at_unix_ns": started,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-            runs = history["load_run_roots"]([default, fallback])
             self.assertEqual(
-                [run["run_id"] for run in runs],
-                ["fallback-run", "default-run"],
+                AUTOREVIEW.ensure_kimi_isolation_supported(args, Path(tmpdir)),
+                "/usr/bin/kimi",
             )
 
-
-    def test_cursor_agent_keyed_option_normalizes_to_cursor(self) -> None:
-        self.assertEqual(
-            AUTOREVIEW.parse_keyed_options(["cursor-agent=auto"], "model"),
-            (None, {"cursor": "auto"}),
+    def test_kimi_runs_with_empty_tools_skills_and_mcp(self) -> None:
+        args = argparse.Namespace(
+            kimi_bin="kimi",
+            model="kimi-model",
+            stream_engine_output=False,
+            thinking="on",
         )
+        observed: dict[str, object] = {}
+
+        def fake_run(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            observed["command"] = command
+            observed["cwd"] = cwd
+            observed["env"] = kwargs["env"]
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            home = Path(str(env["KIMI_CODE_HOME"]))
+            observed["agent"] = (home / "reviewer.md").read_text(encoding="utf-8")
+            observed["config"] = (home / "config.toml").read_text(encoding="utf-8")
+            observed["skills"] = list((home / "skills").iterdir())
+            observed["workspace"] = list(cwd.iterdir())
+            stream = (
+                json.dumps({"role": "meta", "type": "system.version", "version": "0.31.1"})
+                + "\n"
+                + json.dumps({"role": "assistant", "content": json.dumps(FINAL_REPORT)})
+                + "\n"
+            )
+            return subprocess.CompletedProcess(command, 0, stream, "")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-kimi-run-test.") as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                AUTOREVIEW,
+                "ensure_kimi_isolation_supported",
+                return_value="/usr/bin/kimi",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "load_kimi_review_config",
+                return_value=({"telemetry": False}, None),
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_run,
+            ):
+                output = AUTOREVIEW.run_kimi(args, repo, "review prompt")
+
+        self.assertEqual(json.loads(output), FINAL_REPORT)
+        command = observed["command"]
+        self.assertIsInstance(command, list)
+        assert isinstance(command, list)
+        self.assertEqual(command[command.index("--prompt") + 1], "review prompt")
+        self.assertEqual(command[command.index("--output-format") + 1], "stream-json")
+        self.assertEqual(command[command.index("--model") + 1], "kimi-model")
+        self.assertNotIn("--thinking", command)
+        agent = observed["agent"]
+        self.assertIsInstance(agent, str)
+        assert isinstance(agent, str)
+        self.assertIn("tools: []", agent)
+        self.assertIn("subagents: []", agent)
+        config = observed["config"]
+        self.assertIsInstance(config, str)
+        assert isinstance(config, str)
+        self.assertIn("[thinking]", config)
+        self.assertIn("enabled = true", config)
+        self.assertEqual(observed["skills"], [])
+        self.assertEqual(observed["workspace"], [])
+        env = observed["env"]
+        self.assertIsInstance(env, dict)
+        assert isinstance(env, dict)
+        self.assertEqual(env["KIMI_DISABLE_TELEMETRY"], "1")
+        self.assertEqual(env["KIMI_CODE_NO_AUTO_UPDATE"], "1")
+        self.assertNotEqual(Path(str(env["KIMI_CODE_HOME"])), repo)
 
     def test_codex_config_status_exposes_keys_only(self) -> None:
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
@@ -1270,7 +1619,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir:
             repo = Path(tmpdir)
-            (repo / ".env").write_text("OPENAI_API_KEY=ignored-secret\n")
+            (repo / ".env").write_text("ignored environment fixture\n")
             with mock.patch.dict(
                 os.environ,
                 {"CODEX_HOME": ""},
@@ -1467,164 +1816,6 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(SystemExit, "result was not structured JSON"):
             AUTOREVIEW.extract_json(json.dumps(payload))
-
-    def test_retry_filter_only_matches_parse_failures(self) -> None:
-        self.assertTrue(AUTOREVIEW.is_structured_output_failure("review engine returned non-JSON output: nope"))
-        self.assertTrue(AUTOREVIEW.is_structured_output_failure("review engine result was not structured JSON:\nnope"))
-        self.assertFalse(AUTOREVIEW.is_structured_output_failure("review JSON missing required key: findings"))
-        self.assertFalse(AUTOREVIEW.is_structured_output_failure("finding 0 has invalid priority"))
-
-    def test_cursor_workspace_instructions_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
-            repo = Path(tmpdir)
-            args = argparse.Namespace(
-                thinking=None,
-                tools=True,
-                web_search=True,
-                cursor_allow_workspace_instructions=False,
-                cursor_bin="cursor-agent",
-                model="auto",
-                stream_engine_output=False,
-            )
-            with self.assertRaises(SystemExit) as exc_info:
-                AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
-
-    def test_cursor_local_mcp_requires_explicit_approval(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
-            repo = Path(tmpdir)
-            (repo / ".cursor").mkdir()
-            (repo / ".cursor" / "mcp.json").write_text("{}\n")
-            args = argparse.Namespace(
-                thinking=None,
-                tools=True,
-                web_search=True,
-                cursor_allow_workspace_instructions=True,
-                cursor_bin="cursor-agent",
-                model="auto",
-                stream_engine_output=False,
-            )
-            with self.assertRaises(SystemExit) as exc_info:
-                AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
-
-    def test_cursor_local_hooks_are_always_refused(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
-            repo = Path(tmpdir)
-            (repo / ".cursor").mkdir()
-            (repo / ".cursor" / "hooks.json").write_text("{}\n")
-            args = argparse.Namespace(
-                thinking=None,
-                tools=True,
-                web_search=True,
-                cursor_allow_workspace_instructions=True,
-                cursor_bin="cursor-agent",
-                model="auto",
-                stream_engine_output=False,
-            )
-            with self.assertRaises(SystemExit) as exc_info:
-                AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
-
-    def test_cursor_local_permissions_are_always_refused(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
-            repo = Path(tmpdir)
-            (repo / ".cursor").mkdir()
-            (repo / ".cursor" / "cli.json").write_text("{}\n")
-            args = argparse.Namespace(
-                thinking=None,
-                tools=True,
-                web_search=True,
-                cursor_allow_workspace_instructions=True,
-                cursor_bin="cursor-agent",
-                model="auto",
-                stream_engine_output=False,
-            )
-            with self.assertRaises(SystemExit) as exc_info:
-                AUTOREVIEW.run_cursor(args, repo, "prompt")
-            self.assertIn("cursor engine is unavailable", str(exc_info.exception))
-
-    def test_cursor_is_disabled_without_repo_only_read_sandbox(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-cursor-test.") as tmpdir:
-            root = Path(tmpdir)
-            repo = root / "repo"
-            repo.mkdir()
-            cursor_bin = root / "cursor-agent"
-            AUTOREVIEW.write_executable(cursor_bin, AUTOREVIEW.fake_cursor_script())
-            args = argparse.Namespace(
-                thinking=None,
-                tools=True,
-                web_search=True,
-                cursor_allow_workspace_instructions=True,
-                cursor_bin=str(cursor_bin),
-                model=None,
-                stream_engine_output=False,
-            )
-            with mock.patch.object(AUTOREVIEW, "cursor_global_hook_paths", return_value=[]):
-                with self.assertRaisesRegex(SystemExit, "Cursor read permissions"):
-                    AUTOREVIEW.run_cursor(args, repo, "prompt")
-
-    def test_cursor_engine_fails_closed_end_to_end(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="autoreview-cursor-e2e.") as tmpdir:
-            root = Path(tmpdir)
-            repo = root / "repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.name", "AutoReview Test"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.email", "autoreview@example.invalid"], cwd=repo, check=True)
-            source = repo / "example.txt"
-            source.write_text("before\n")
-            subprocess.run(["git", "add", "example.txt"], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "--quiet", "-m", "test: seed fixture"], cwd=repo, check=True)
-            source.write_text("after\n")
-
-            cursor_bin = root / "cursor-agent"
-            trufflehog_bin = root / "trufflehog"
-            record_path = root / "record.json"
-            AUTOREVIEW.write_executable(cursor_bin, AUTOREVIEW.fake_cursor_script())
-            AUTOREVIEW.write_executable(
-                trufflehog_bin,
-                "#!/usr/bin/env python3\nraise SystemExit(0)\n",
-            )
-            env = os.environ.copy()
-            env.update(
-                {
-                    "AUTOREVIEW_FAKE_RECORD": str(record_path),
-                    "AUTOREVIEW_FAKE_CURSOR_INVOCATIONS": str(root / "cursor-invocations.jsonl"),
-                    "GIT_CONFIG_GLOBAL": str(root / "hostile-gitconfig"),
-                    "NODE_OPTIONS": "--require=hostile.js",
-                    "PYTHONPATH": str(root / "hostile-python"),
-                    "PATH": (
-                        f"{root}{os.pathsep}{repo}{os.pathsep}"
-                        f"{env.get('PATH', '')}"
-                    ),
-                    "HOME": str(root),
-                    "USERPROFILE": str(root),
-                }
-            )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT_PATH),
-                    "--mode",
-                    "local",
-                    "--engine",
-                    "cursor",
-                    "--cursor-bin",
-                    str(cursor_bin),
-                    "--cursor-allow-workspace-instructions",
-                ],
-                cwd=repo,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Cursor read permissions", result.stderr)
-            self.assertFalse(record_path.exists())
-
 
 if __name__ == "__main__":
     unittest.main()

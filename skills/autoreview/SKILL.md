@@ -1,23 +1,15 @@
 ---
 name: autoreview
-description: "Pre-commit/ship code review: Codex default; optional Claude or Pi."
+description: "Structured Codex, Claude, Amp, Pi, Kimi, or opt-in multi-model code review when explicitly requested."
 ---
 
 # Auto Review
 
-Run the bundled structured review helper as a closeout check. This is code review, not Guardian `auto_review` approval routing.
+Run the bundled structured review helper only when the user explicitly asks for autoreview, a second-model review, or one of its named review engines. This is code review, not Guardian `auto_review` approval routing.
 
-Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, selects the `fast` service tier when `--codex-auth chatgpt` or `AUTOREVIEW_CODEX_AUTH=chatgpt` is set, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Default/provider auth is never guessed, and provider profiles stay on their configured tier. Claude review is optional. Subscription/default auth uses `claude-fable-5` with `high` effort; Bedrock auth uses `global.anthropic.claude-opus-4-8[1m]` with `xhigh` effort.
+Codex review is the default when no engine or reviewer panel is set. It uses `gpt-5.6-sol` with `high` reasoning by default, uses the standard service tier unless `--codex-speed` or `AUTOREVIEW_CODEX_SPEED` explicitly selects another tier, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Claude review is optional and uses `claude-fable-5` by default; explicit Mantle auth defaults to `anthropic.claude-opus-5[1m]` with `low` effort. Amp review is optional and uses `openai/gpt-5.6-sol` with `high` reasoning by default. Pi and Kimi use the model configured by their respective CLIs unless `--model` overrides it.
 
-For user-visible behavior, pair autoreview with `behavior-validator`. Autoreview is source-aware and judges the change bundle; behavior validation is source-blind and judges the running product or tool against a behavior contract. A clean autoreview is not proof that a UI, CLI, API, or generated artifact works from the user's perspective.
-
-Use when:
-
-- user asks for Codex review / Claude review / Pi review / autoreview / second-model review
-- after non-trivial code edits, before final/commit/ship
-- reviewing a local branch or PR branch after fixes
-
-Do not require autoreview for a change whose entire diff is prose-only internal notes or `SKILL.md` documentation. Still inspect the diff directly and run the repository's lightweight documentation validation, if any. This exception does not cover user-facing documentation, executable examples, configuration, scripts, generated files, or behavior changes.
+Do not invoke Autoreview automatically before a commit, push, PR, merge, deploy, or final reply. Repository or workflow rules may call it only when they explicitly name it.
 
 ## Contract
 
@@ -28,69 +20,33 @@ Do not require autoreview for a change whose entire diff is prose-only internal 
 - Treat review output as advisory. Never blindly apply it.
 - Verify every finding by reading the real code path and adjacent files.
 - Read dependency docs/source/types when the finding depends on external behavior.
-- Reject unrealistic edge cases, speculative risks, broad rewrites, and fixes that over-complicate the codebase.
-- Prefer small fixes at the right ownership boundary; no refactor unless it clearly improves the bug class.
-- When an accepted finding shows a bug class or repeated pattern, inspect the current PR scope for sibling instances before fixing.
-- Fix the scoped bug class at once when practical; stop at touched surfaces, owner boundaries, and clear follow-up territory.
-- Keep going until structured review returns no accepted/actionable findings only while the work remains inside the original task scope.
-- If a review-triggered fix changes code, rerun focused tests and rerun the structured review helper.
+- Reject unrealistic edge cases, speculative risks, unrelated rewrites, and fixes that over-complicate the codebase.
+- Prefer root-cause fixes at the right ownership boundary. A coherent refactor is appropriate when it removes the bug class, duplicate policy, stale paths, or ownership confusion; do not default to a symptom patch.
+- When an accepted finding exposes a bug class or repeated pattern, inspect its owner and relevant sibling implementations before fixing.
+- Fix the same bug class across its owner-boundary neighborhood when practical; stop at unrelated invariants, different owners, and unapproved contract changes.
+- Run one bounded review pass. If an accepted finding changes code, run the smallest relevant test; rerun Autoreview only when the user explicitly requests another pass.
 - For security-audit suppression changes, verify accepted findings remain auditable: suppressed findings stay in structured output, active output keeps an unsuppressible suppression notice, and aggregate findings cannot hide unrelated active risk.
 - Never switch or override the requested review engine/model except for the documented Codex Sol-to-Terra account-access fallback. Capacity, rate-limit, and unrelated failures keep the same engine/model.
-- Claude's implicit refusal-based model switching is disabled for review. If Fable refuses the bundle, retry Fable once in a fresh session, then explicitly retry with `claude-opus-5` at `max` effort after the second refusal. Other selected Claude models fail on refusal.
 - Be patient with large bundles. Structured review can take up to 30 minutes while the model call is active, especially with Codex tools or web search.
 - Treat heartbeat lines like `review still running: ... elapsed=... pid=...` as healthy progress, not a hang. Let the helper continue while heartbeats are advancing. Pass `--stream-engine-output` when live engine text is useful; Codex and Claude filter tool/file chatter, other runnable engines pass raw output through.
 - Do not kill a review just because it has been quiet for 2-5 minutes, or because it is still running under the 30-minute window. Inspect the process only after missing multiple expected heartbeats, after 30 minutes, or after an obviously failed subprocess; prefer letting the same helper command finish.
 - Tools are useful in review mode. Codex receives the validated bundle in an empty workspace so ignored files and linked-worktree metadata remain unreadable; web search stays available for dependency contracts and upstream docs.
 - Security perspective is always included, but it should not cripple legitimate functionality. Report security findings only when the change creates a concrete, actionable risk or removes an important safety check.
 - Reviewer subprocesses preserve engine authentication and non-credentialed proxy variables needed by headless or restricted-network environments while stripping process-injection, Git override, and credentialed proxy values.
-- Before engine invocation, autoreview runs TruffleHog over temporary snapshots of the exact added, modified, or deleted content under review. It intentionally matches TruffleHog's low-false-positive pre-commit policy (`verified,unknown`); it does not classify arbitrary password-like strings or rescan unchanged history. After that scan passes, locally recognized secret-like values are redacted in place only when they occur exclusively on deleted lines of an entirely removed file; if one of those deleted values also occurs in added, context, or mixed staged/unstaged content, the review fails closed. Install TruffleHog using its official platform-neutral instructions; autoreview fails with that link when the binary is unavailable and never auto-installs it. Repositories should also run TruffleHog in pull-request CI as a backup outside autoreview; repository-local Git hooks are optional. Review bundles still omit security-sensitive paths or files, and explicit prompt and dataset inputs remain checked before engine invocation. Safe large diffs are sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
-- Review bundles fail closed before engine invocation when tracked or untracked paths look sensitive or patch text looks secret-like. Sensitive field names and file-backed configuration remain reviewable only when the scanner can classify them as references rather than embedded values; there is no scanner bypass. Safe large diffs are scanned in full, sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
+- Before any provider call, autoreview writes each exact outgoing review pack to an owner-only temporary file and scans it with TruffleHog using `verified,unknown`. A panel shares that same frozen, scanned prompt sequence across reviewers. The scan covers prompt and dataset inputs, untracked content, and every diff line, including deleted lines. A finding, scanner error, or missing TruffleHog binary refuses the send and names the implicated repository file when it can be resolved; credentials are never redacted and forwarded. Security-sensitive paths remain omitted. Safe large diffs are sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
 - For regression provenance, keep roles separate: blamed code author, blamed PR author, PR merger/committer, current PR author, and PR/date. If no blamed PR is traceable, use the blamed commit as the provenance: commit SHA, date, and author username. Do not guess a merger or frame missing PR metadata as a separate finding.
 - If the blamed PR was merged by `clawsweeper[bot]` or another automation, identify the human trigger when practical. Check timeline/comments first; if rate-limited, use gitcrawl/cache or public PR HTML. Look for maintainer commands such as `@clawsweeper automerge`, `/landpr`, or labels/status comments that armed automerge. Report `automerge triggered by @login`; if not found, say trigger unknown.
-- Do not invoke built-in `codex review`, nested reviewers, or reviewer panels from inside the review. The helper builds one validated bundle, calls the selected engine once for normal inputs or once per complete bounded chunk for oversized inputs, validates the structured results, and stops.
+- Do not invoke built-in `codex review`, nested reviewers, or another review panel from inside the review. The helper builds one validated bundle, calls each explicitly selected reviewer once for normal inputs or once per complete bounded chunk for oversized inputs, validates and merges the structured results, and stops.
 - Stop as soon as the helper exits 0 with no accepted/actionable findings. Do not run an extra review just to get a nicer "clean" line, a second opinion, or clearer closeout wording.
 - Treat the helper's successful exit plus absence of actionable findings as the clean review result, even if the underlying Codex CLI output is terse.
-- Multi-reviewer panels are opt-in only. Use them when explicitly requested or when risk justifies the extra spend; the main agent still verifies every accepted finding before fixing.
 - If rejecting a finding as intentional/not worth fixing, add a brief inline code comment only when it explains a real invariant or ownership decision that future reviewers should know.
 - If `gh`/Gitcrawl reports `database disk image is malformed`, run `gitcrawl doctor --json` once to let the portable cache repair before retrying review; do not bypass the shim unless repair fails and freshness requires live GitHub.
 - If Gitcrawl reports a portable manifest mismatch, source/runtime DB health error, or stale portable-store checkout, run `gitcrawl doctor --json` and inspect `source_db_health`, `runtime_db_health`, and `portable_store_status` before falling back to live GitHub.
 - Do not push just to review. Push only when the user requested push/ship/PR update.
 
-## Scope Governor
+## Scope
 
-Autoreview is a closeout gate, not permission to rewrite the task.
-
-Before the first review, freeze a scope baseline: original request or issue, target branch, intended behavior, owner boundary, changed files, and non-test LOC. For inherited or already-bloated branches, use the intended PR diff as the baseline rather than accepting all existing branch drift.
-
-Before patching a finding, classify it:
-
-- **In-scope blocker**: the finding is introduced by the current diff, affects the same owner boundary, and can be fixed without changing the task's contract.
-- **Follow-up**: the finding is real but belongs to an adjacent bug class, sibling surface, cleanup, or broader hardening track.
-- **Stop-and-escalate**: the finding requires a new protocol/config/storage/public API contract, a different owner boundary, a release-process change, or a design choice outside the original request.
-
-Stop patching and report the scope break instead of continuing when:
-
-- a narrow PR turns into an architecture change, protocol change, migration, or release-process change;
-- the diff grows past 2x the original files or non-test LOC without explicit approval to expand scope;
-- two review-triggered patch cycles have not converged; pause and reclassify every remaining finding before another edit;
-- the best fix is "define the canonical contract first" rather than another local inference layer;
-- fixing the accepted finding would make the PR no longer describe the same behavior, issue, or owner boundary.
-
-After the two-cycle pause, continue only when every remaining accepted finding is still an in-scope blocker. Otherwise preserve the useful analysis, identify the smallest safe landed subset if one exists, and open or request a follow-up for the larger fix. Do not keep committing speculative fixes just to satisfy the reviewer.
-
-Do not stack or push review-triggered fix commits while scope classification or focused proof is unresolved. Keep exploratory edits local until the cycle is proven in scope; if scope breaks, remove them from the landing lane instead of preserving them as branch history.
-
-Critical exceptions must be explicit: active data loss, crash, broken install/upgrade, release blocker, or concrete security exposure. If the exception is not one of those, it is not critical enough to blow up scope.
-
-## Release Branches And Release Process
-
-On release, beta, stable, hotfix, signing, notarization, appcast, package-publish, or release-check work, use freeze discipline even when the branch name is not release-like:
-
-- Fix only release blockers, failed release infrastructure, exact backports, install/upgrade breakage, data loss, crashes, or concrete security exposure.
-- Treat non-blocking autoreview findings as follow-ups for `main`, not reasons to broaden the release branch.
-- Do not introduce new product behavior, config surface, protocol shape, migration, plugin ownership, docs narrative, or process policy unless it directly unblocks the release.
-- Keep proof tied to the release target: exact branch/ref, failing check or shipped-risk reason, smallest command/proof, and whether the fix must also forward-port to `main`.
-- If review discovers a real but non-critical design problem during release closeout, stop with a follow-up issue/PR plan; do not use the release branch as the refactor lane.
+Autoreview does not expand the task. Fix only verified blockers in the requested path. Mention unrelated findings without opening a new workstream, and stop when the requested review pass is complete.
 
 ## Skill Path (set once)
 
@@ -220,77 +176,33 @@ Removing verified non-authoritative generated noise remains useful, but never
 drop lockfiles, generated clients, policies, manifests, schemas, or other
 independently semantic artifacts merely to shrink the review.
 
-## Parallel Closeout
+## Review panels
 
-Format first if formatting can change line locations. Then it is OK to run tests and review in parallel:
-
-```bash
-"$AUTOREVIEW" --parallel-tests "<focused test command>"
-```
-
-On Windows, the default `--parallel-tests` shell preserves the platform `cmd.exe`
-semantics used by Python `shell=True`. Use `--parallel-tests-shell powershell`
-or `--parallel-tests-shell pwsh` when the focused test command is PowerShell-specific.
-Parallel tests inherit only a small allowlist of ordinary OS, CI, and toolchain
-variables. Put additional non-secret project controls directly in the test command.
-Home and standard config directories point to a temporary isolated root that is
-removed after the command exits. Do not put secrets in the command because it is
-printed before execution. Set `OPENCLAW_TESTBOX=1` on the autoreview process, not
-inside the test command, because the environment snapshot and credential staging
-happen before the test shell starts:
+Panels are opt-in in the public skill. `--panel` selects Codex plus Claude;
+`--reviewers` accepts an explicit comma-separated set. Personal or fleet policy
+may set `AUTOREVIEW_REVIEWERS`, while an explicit `--engine` still selects one
+reviewer for that run.
 
 ```bash
-OPENCLAW_TESTBOX=1 "$AUTOREVIEW" --parallel-tests "pnpm check:changed"
-```
-
-On POSIX, the helper puts this isolated Testbox home under the short, sticky
-system `/tmp`; Blacksmith creates an SSH control socket below that home, and a
-long macOS `TMPDIR` can exceed the Unix-socket path limit. With an older helper,
-prefix the outer autoreview process with `TMPDIR=/tmp`. Setting `TMPDIR` inside
-the quoted test command is too late because the isolated home already exists.
-
-This is the narrow trusted-maintainer-code exception: it stages only the Blacksmith
-credential file into the temporary home so the command can delegate remotely. Never
-use this credential-hydrated path for untrusted contributor or fork code. Run other
-secret-bearing or credentialed tests separately in an appropriately isolated remote
-runner.
-
-Tradeoff: tests may force code changes that stale the review. If tests or review lead to code edits, rerun the affected tests and rerun review until no accepted/actionable findings remain. Once that rerun exits cleanly, stop; do not spend another long review cycle on redundant confirmation.
-
-## Review Panels
-
-Run multiple reviewers against one frozen bundle:
-
-```bash
-"$AUTOREVIEW" --reviewers codex,claude,pi
-```
-
-`--panel` is shorthand for Codex plus Claude unless `--engine` changes the first reviewer:
-
-```bash
+# Default two-reviewer panel
 "$AUTOREVIEW" --panel
+
+# Explicit reviewers and per-engine settings
+"$AUTOREVIEW" --reviewers codex,claude \
+  --model codex=gpt-5.6-sol --thinking codex=high \
+  --model 'claude=anthropic.claude-opus-5[1m]' --thinking claude=low
+
+# Fleet-style explicit provider routes; Codex remains standard tier
+"$AUTOREVIEW" --panel \
+  --codex-auth chatgpt \
+  --claude-auth mantle --claude-bedrock-region us-east-1
 ```
 
-Set reviewer models and thinking/effort explicitly:
-
-```bash
-"$AUTOREVIEW" --reviewers codex,claude --model codex=gpt-5.6-sol --thinking codex=high --model claude=claude-fable-5 --thinking claude=high
-```
-
-Inline syntax is also supported for simple model IDs:
-
-```bash
-"$AUTOREVIEW" --reviewers codex:gpt-5.6-sol:high,claude:claude-fable-5:high
-```
-
-For models with slashes or extra colons, prefer keyed form:
-
-```bash
-"$AUTOREVIEW" --engine pi --model anthropic/claude-sonnet-4 --thinking high
-"$AUTOREVIEW" --reviewers codex,pi --model codex=gpt-5.6-sol --model pi=anthropic/claude-sonnet-4
-```
-
-`--reviewers all` covers Codex, Claude, and Pi. Droid, Copilot, Cursor, and OpenCode selections fail closed because their current CLI contracts cannot confine project instructions, filesystem reads, or network fetches to the review boundary.
+Every reviewer receives the exact same scanner-approved prompt sequence. Panel
+reviewers run concurrently, failures fail the whole panel by default, and
+`--allow-partial-panel` is an explicit availability-over-consensus override.
+Panel runs buffer each engine's output even with `--stream-engine-output` so
+concurrent reviewer status lines cannot interleave or corrupt terminal output.
 
 ## Models and thinking
 
@@ -300,26 +212,21 @@ Recommended model defaults:
 
 | Engine              | Default model                                      | Source note                                           |
 | ------------------- | -------------------------------------------------- | ----------------------------------------------------- |
-| **codex** (default) | `gpt-5.6-sol` -> `gpt-5.6-terra` on access failure | High reasoning; ChatGPT auth uses fast tier          |
-| **claude**          | `claude-fable-5`; Bedrock: `global.anthropic.claude-opus-4-8[1m]` | Auth-aware defaults: Fable/high for subscription, Opus/xhigh for Bedrock |
+| **codex** (default) | `gpt-5.6-sol` -> `gpt-5.6-terra` on access failure | OpenClaw org review default                           |
+| **claude**          | `claude-fable-5`                                   | Anthropic's most capable widely released Claude model |
+| **amp**             | `openai/gpt-5.6-sol`                               | Amp structured-generation review default              |
 
-CLI flags and environment variables override these defaults. Pi does not get a built-in model default because its provider catalog may vary by installation. Droid, Copilot, Cursor, and OpenCode are currently refused.
+CLI flags and environment variables override these defaults. Amp model IDs must use `provider/model` form. Pi and Kimi do not get built-in model defaults because their configured model catalogs may vary by installation.
 
-| Engine              | Model flag                 | Example model IDs                                                            | Thinking flag                 | Accepted levels                                            |
-| ------------------- | -------------------------- | ---------------------------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------- |
-| **codex** (default) | `codex --model X exec ...` | `gpt-5.6-sol`, then `gpt-5.6-terra` on Sol access failure                    | `-c model_reasoning_effort=Y` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| **claude**          | `claude --model X`         | `claude-fable-5`, `claude-opus-5`, `claude-sonnet-4-6`, `claude-haiku-4-5` | `--effort Y`                  | `low`, `medium`, `high`, `xhigh`, `max`                    |
-| **droid**           | currently refused          | Factory model IDs                                                            | `-r, --reasoning-effort Y`    | `off`, `none`, `low`, `medium`, `high`, `xhigh`, `max`     |
-| **copilot**         | currently refused          | Copilot model aliases                                                        | not supported                 | n/a                                                        |
-| **pi**              | `pi --model X`             | `anthropic/claude-sonnet-4`, `openai/gpt-4o`                                 | `--thinking Y`                | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`         |
-| **cursor**          | currently refused          | Cursor model aliases                                                         | not supported                 | n/a                                                        |
-| **opencode**        | currently refused          | OpenCode provider/model IDs                                                  | not supported                 | n/a                                                        |
+| Engine              | Model flag                 | Example model IDs                                                            | Thinking flag                             | Accepted levels                                            |
+| ------------------- | -------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------- |
+| **codex** (default) | `codex --model X exec ...` | `gpt-5.6-sol`, then `gpt-5.6-terra` on Sol access failure                    | `-c model_reasoning_effort=Y`             | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| **claude**          | `claude --model X`         | `claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5` | `--effort Y`                              | `low`, `medium`, `high`, `xhigh`, `max`                    |
+| **amp**             | Amp `amp.ai.generate`      | `openai/gpt-5.6-sol`                                                         | `reasoningEffort`                         | `none`, `low`, `medium`, `high`, `xhigh`, `max`            |
+| **pi**              | `pi --model X`             | `anthropic/claude-sonnet-4`, `openai/gpt-4o`                                 | `--thinking Y`                            | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`         |
+| **kimi**            | `kimi --model X`           | A model alias from the user's Kimi config                                    | `[thinking] enabled` in the staged config | `on`, `off`                                                |
 
 Claude also supports `--fallback-model a,b` for availability-based fallback chains ([model-config](https://code.claude.com/docs/en/model-config)). Current Claude docs note that auth, billing, rate-limit, request-size, and transport errors do not trigger fallback, and the changelog documents interactive-session support in `v2.1.166`.
-
-Claude's CLI reference warns that `--help` does not list every supported flag. The helper capability-checks isolation through empty-print validation with the exact review flags, and verifies the same parser rejects an unknown control flag; it does not infer support from help text or early-exit version behavior.
-
-[Anthropic's Fable model-switching guidance](https://support.claude.com/en/articles/15363606-why-claude-switched-models-in-your-conversation-with-fable-5) explains that flagged Fable requests normally rerun on Opus. Autoreview disables the implicit switch so it can retry Fable once first; only a second refusal triggers the explicit `claude-opus-5`/`max` fallback, which is reported in the reviewer label.
 
 [OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model) identifies Sol as the GPT-5.6 frontier-capability route and documents `max` support. Autoreview keeps `high` as its default; use `max` only for the hardest quality-first reviews after comparing its latency and cost with `xhigh` on representative changes.
 
@@ -329,39 +236,27 @@ Examples matching current `main` behavior:
 # Codex with explicit model and reasoning
 "$AUTOREVIEW" --engine codex --model gpt-5.6-sol --thinking high
 
-# ChatGPT auth selects fast mode by default; explicitly restore standard service when desired
-"$AUTOREVIEW" --engine codex --codex-auth chatgpt
-"$AUTOREVIEW" --engine codex --codex-auth chatgpt --codex-speed default
+# Codex fast mode (priority service tier); needs a model whose catalog lists the tier, silently standard otherwise
+"$AUTOREVIEW" --engine codex --codex-speed fast
 
 # Safe Codex model/response tuning overrides (--codex-speed wins over a service_tier here)
 "$AUTOREVIEW" --engine codex --codex-config 'service_tier="fast"'
 
 # Claude Code aliases or full model names, with optional availability fallback
-"$AUTOREVIEW" --engine claude --model claude-fable-5 --thinking high
-"$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-5,claude-sonnet-4-6
+"$AUTOREVIEW" --engine claude --model claude-fable-5 --thinking max
+"$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-4-8,claude-sonnet-4-6
 
-# Mixed auth: Codex uses its stored ChatGPT login while Claude uses Amazon Bedrock.
-# Bedrock defaults to global.anthropic.claude-opus-4-8[1m] at xhigh effort;
-# explicit --model and --thinking values still win (including Fable when requested).
-"$AUTOREVIEW" --panel --codex-auth chatgpt --claude-auth bedrock --claude-bedrock-region us-east-1
-
-# Bedrock panel: the isolated Codex reviewer stages the named amazon-bedrock profile;
-# its model/effort defaults come from that profile, while Claude keeps its normal auth.
-"$AUTOREVIEW" --panel --codex-profile bedrock --claude-auth subscription
-
-# Mantle defaults to anthropic.claude-opus-4-8[1m] at xhigh effort. Mantle and Bedrock
-# Runtime are mutually exclusive providers, so each mode strips the other's enable
-# flag; a host configured for one cannot silently capture a review requesting the
-# other. Mantle needs the anthropic.* namespace, NOT Runtime's us./global.anthropic.*.
-"$AUTOREVIEW" --panel --codex-profile bedrock --claude-auth mantle --claude-bedrock-region us-east-1
+# Amp direct structured generation (requires AMP_API_KEY)
+"$AUTOREVIEW" --engine amp --model openai/gpt-5.6-sol --thinking high --amp-bin amp
 
 # Pi with explicit model and thinking level
 "$AUTOREVIEW" --engine pi --model anthropic/claude-sonnet-4 --thinking high --pi-bin pi
 
-```
+# Kimi with its configured default model, or a configured model alias
+"$AUTOREVIEW" --engine kimi --thinking on --kimi-bin kimi
+"$AUTOREVIEW" --engine kimi --model kimi-model-alias
 
-`--cursor-agent-bin` and `CURSOR_AGENT_BIN` remain compatibility aliases for
-`--cursor-bin` and `CURSOR_BIN`.
+```
 
 ### Environment defaults
 
@@ -373,71 +268,44 @@ loader such as an untracked `.envrc`; the helper does not write a config file.
 
 | Variable                            | Purpose                                                                                                                          |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `AUTOREVIEW_REVIEWERS`              | Default comma-separated reviewer panel, for example `codex,claude`                                                               |
 | `AUTOREVIEW_MODEL`                  | Override the built-in default `--model` for all engines                                                                          |
 | `AUTOREVIEW_THINKING`               | Default `--thinking` for all engines                                                                                             |
 | `AUTOREVIEW_FALLBACK_MODEL`         | Default Claude `--fallback-model` chain                                                                                          |
+| `AUTOREVIEW_REVIEWERS`              | Default comma-separated reviewer panel, for example `codex,claude`; explicit `--engine` overrides it                            |
+| `AUTOREVIEW_ENGINE_TIMEOUT_SECONDS` | Optional positive wall-clock limit for each reviewer process; disabled by default                                                |
 | `AUTOREVIEW_<ENGINE>_MODEL`         | Per-engine model override, for example `AUTOREVIEW_CODEX_MODEL=gpt-5.6-sol`                                                      |
 | `AUTOREVIEW_<ENGINE>_THINKING`      | Per-engine thinking override                                                                                                     |
 | `AUTOREVIEW_CODEX_CONFIG`           | Safe Codex model/response tuning overrides, semicolon-separated, e.g. `service_tier="fast"`; capability-bearing keys fail closed |
-| `AUTOREVIEW_CODEX_SPEED`            | Codex service tier override: `fast`, `flex`, or `default`; ChatGPT auth otherwise defaults to fast, provider profiles do not   |
-| `AUTOREVIEW_CODEX_PROFILE`          | Named Codex config profile staged into the isolated runtime; currently supports `amazon-bedrock` with env credentials            |
-| `AUTOREVIEW_CODEX_AUTH`             | `default` preserves API/provider env; `chatgpt` removes it and forces the stored ChatGPT login                                   |
-| `AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA` | Disable Codex CLI strict schema enforcement; automatically disabled for non-OpenAI profiles                                      |
-| `AUTOREVIEW_CLAUDE_AUTH`            | `default` preserves provider env; `subscription` forces Claude Code login; `bedrock` forces isolated AWS Bedrock Runtime routing; `mantle` forces isolated AWS Bedrock Mantle routing |
-| `AUTOREVIEW_CLAUDE_BEDROCK_REGION`  | Required AWS region for explicit Claude Bedrock auth unless `AWS_REGION` or `AWS_DEFAULT_REGION` is already set                  |
+| `AUTOREVIEW_CODEX_SPEED`            | Explicit Codex service tier: `fast` (priority), `flex`, or `default`; no value means standard/default                            |
+| `AUTOREVIEW_CODEX_AUTH`             | `default` preserves provider env; `chatgpt` removes competing provider routing and forces stored ChatGPT auth                    |
+| `AUTOREVIEW_CLAUDE_AUTH`            | `default`, `subscription`, `bedrock`, or `mantle`; explicit routes remove competing provider settings                           |
+| `AUTOREVIEW_CLAUDE_BEDROCK_REGION`  | AWS region for explicit Claude Bedrock or Mantle routing                                                                          |
 | `AUTOREVIEW_CLAUDE_FALLBACK_MODEL`  | Claude-only fallback chain                                                                                                       |
-| `AUTOREVIEW_PROVIDER_ENV_ALLOW`     | Comma-separated custom Pi/OpenCode credential variable names; names must end in a recognized credential suffix                   |
-| `AUTOREVIEW_RUN_LOG_DIR`            | Private history root; defaults to `$XDG_STATE_HOME/autoreview` or `~/.local/state/autoreview`                                   |
-| `AUTOREVIEW_RUN_LOG`                | Set to `0` to disable persistent run history                                                                                    |
-| `AUTOREVIEW_RUN_LOG_BUNDLE`         | Set to `1` to opt into persisting exact scanner-approved bundle and report artifacts; disabled by default                       |
+| `AUTOREVIEW_RUN_LOG`                | Private run metadata is enabled by default; set to `0` to disable                                                                 |
+| `AUTOREVIEW_RUN_LOG_DIR`            | Private history root outside the repository; defaults to the user state directory                                                |
+| `AUTOREVIEW_RUN_LOG_BUNDLE`         | Set to `1` to persist the exact scanner-approved bundle, prompts, and final report                                                |
+| `AUTOREVIEW_PROVIDER_ENV_ALLOW`     | Comma-separated custom Pi credential variable names; names must end in a recognized credential suffix                            |
+| `AMP_API_KEY`                       | Required Amp API credential; file/keychain auth is intentionally excluded from the isolated runtime                              |
 
-Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored. Use `--codex-auth chatgpt` to prevent ambient API keys or relays from overriding Codex's stored ChatGPT login. A Codex profile and a non-default Codex auth mode select competing provider routes, so autoreview never resolves that conflict silently: two explicit flags are rejected, an explicit `--codex-auth` is rejected against an ambient `AUTOREVIEW_CODEX_PROFILE` rather than being downgraded to the profile's route, and an environment-only pair still lets the profile win but reports the override and its remedy on stderr. A stale or inherited `AUTOREVIEW_CODEX_PROFILE` can otherwise reroute the reviewer's provider and credentials while the run appears to honor the requested auth mode. Use `--claude-auth subscription` for the Claude Code login, or `--claude-auth bedrock --claude-bedrock-region REGION` to route Claude through AWS credentials without loading user settings that can override the provider. Use `--claude-auth mantle --claude-bedrock-region REGION` for Bedrock Mantle; it authenticates with the same `AWS_BEARER_TOKEN_BEDROCK` but resolves the `anthropic.*` model namespace rather than Runtime's `us.`/`global.anthropic.*`, and each of the two modes strips the other's enable flag so a host configured for one cannot capture a review requesting the other.
+Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Amp maps thinking to `amp.ai.generate.reasoningEffort`. Pi maps thinking to `--thinking`. Kimi maps `on` and `off` to `[thinking] enabled` in the staged review config. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored.
 
-## Run History
-
-Every non-dry review writes owner-only metadata to a unique run directory outside the reviewed repository. Opt-in artifact logging additionally writes the exact scanner-approved `bundle.txt` and final `report.json`. Metadata includes target/ref, bundle hash and size, changed paths, prompt-pass sizes, reviewer model/reasoning/auth/profile/requested speed, per-reviewer duration and usable-review outcome, individual model attempts, refusal retries/fallbacks, finding counts, test status, total duration, and exit status. Requested speed records what autoreview passed to Codex; a provider may silently use standard service when that model does not support the requested tier. The history summary separates model-call success from validated-review success. Credentials, environment values, full finding bodies, prompts beyond explicitly logged artifacts, and raw engine output are never in default metadata history. `autoreview-history` reads the independent atomic metadata files directly, so concurrent runs do not share a writable index.
-
-After verifying a review finding against the real code, record aggregate dispositions on that reviewer run:
-
-```bash
-"$(dirname "$AUTOREVIEW")/autoreview-history" \
-  --record-disposition RUN_ID \
-  --reviewer-run-id 2 \
-  --confirmed 1 \
-  --false-positive 0 \
-  --not-actionable 0
-```
-
-`confirmed` means the finding is technically valid, whether or not code changes follow; independently reported duplicates are confirmed for each reviewer. `false-positive` means its technical claim is invalid. `not-actionable` means the finding was deliberately left technically unrated because it is outside the review's scope or ownership boundary. Findings not yet categorized remain `pending`. Omitted category flags preserve their previous counts, and the helper rejects totals above the reviewer-reported finding count. The history summary reports these counts per reviewer configuration plus confirmation and false-positive rates over technically rated findings only; `not-actionable` and `pending` findings are excluded from that denominator. Dispositions are explicit coordinator judgments, never inferred from whether code changed.
-
-Inspect longitudinal model and speed results with:
-
-```bash
-"$(dirname "$AUTOREVIEW")/autoreview-history"
-"$(dirname "$AUTOREVIEW")/autoreview-history" --last 50 --engine codex
-"$(dirname "$AUTOREVIEW")/autoreview-history" --json
-```
-
-Use `--run-log-dir PATH` to choose another external history root, `--log-bundle` to persist the validated bundle and report artifacts, or `--no-run-log` to disable history for one run. `--no-log-bundle` overrides an environment opt-in. Explicit paths and their writes fail closed; paths inside the reviewed repository are rejected so generated review artifacts cannot be committed accidentally. The implicit default is best-effort: if its XDG/home location is unavailable or overlaps the repository (for example, a home-root dotfiles checkout), autoreview tries a private per-user system-temp root, then continues the review with a warning if history is still unavailable.
+Amp receives only `AMP_API_KEY` from the caller. Autoreview intentionally ignores `AMP_URL`, user settings, stored authentication, inherited MCP configuration, and other runtime variables. The API key's authenticated account and workspace must have no personal or workspace plugins: current normal Amp execution loads every authenticated plugin, so the preflight requests the complete inventory and fails before creating the review prompt unless the generated adapter is the only plugin. A dedicated Amp API key/account without plugins is the safest setup. Amp can still discover personal and workspace skill metadata, but the isolated settings deny every local and remote MCP server before use, and the outer adapter has no skill tool. Custom Amp endpoints are not supported because forwarding an arbitrary endpoint could disclose the API key and review bundle. Native Windows is refused because its `chmod` behavior cannot establish or attest the POSIX private-file permissions used here; use Linux, macOS, or WSL.
 
 ## Review engine isolation
 
 When autoreview runs inside the repository under review, external reviewer CLIs must not load project-local trust or configuration that the branch controls.
 
-| Engine       | Isolation flags                                                                                                                                                                                                                                   | Reference                                                                   |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **codex**    | Auth-only config overrides, isolated workspace, `exec --ignore-user-config --ignore-rules --skip-git-repo-check`, plus read-only sandbox; ChatGPT auth strips API/provider env; profiled runs load only the sanitized runtime profile and disable process tools | Codex CLI `exec --help`                                                    |
-| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*`; explicit subscription or Bedrock auth uses an empty settings source; auto-memory and filesystem/shell tools disabled; empty external workspace; WebSearch by default (`v2.1.169+`) | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference) |
-| **droid**    | Fails closed: current CLI cannot disable both project instructions and all tools                                                                                                                                                                  | Droid CLI `exec --help` and `--list-tools`                                  |
-| **copilot**  | Fails closed: repository read tools also expose ignored files outside the reviewed bundle                                                                                                                                                         | GitHub Copilot CLI command reference                                        |
-| **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                                                                                                           | Pi CLI `--help`; requires Pi `v0.79.0+`                                     |
-| **opencode** | Fails closed: project/global config isolation and private-network fetch denial are not both proven                                                                                                                                                | OpenCode CLI contract                                                       |
-| **cursor**   | Fails closed: documented read permissions can target absolute host paths and no proven repository-only filesystem sandbox is exposed                                                                                                              | Cursor CLI [permissions](https://cursor.com/docs/cli/reference/permissions) |
+| Engine       | Isolation flags                                                                                                                                                                                                                                                                                               | Reference                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| **codex**    | Auth-only config overrides, isolated workspace, `exec --ignore-user-config --ignore-rules --skip-git-repo-check`, plus read-only sandbox                                                                                                                                                                      | Codex CLI `exec --help`                                                        |
+| **claude**   | `--safe-mode --strict-mcp-config --disallowedTools mcp__*`; user settings only for default auth, no setting sources for explicit subscription/Bedrock/Mantle routes; auto-memory and filesystem/shell tools disabled; empty external workspace; WebSearch by default (`v2.1.169+`; explicit auth requires `v2.1.237+`) | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference)     |
+| **amp**      | Empty external workspace and isolated HOME/XDG roots; complete authenticated plugin inventory must contain only the generated adapter; catch-all MCP denial with a process-spawn probe; fixed outer trigger and one input-free adapter tool; private prompt only reaches schema-constrained `amp.ai.generate` | Amp [plugin API](https://ampcode.com/manual/plugin-api) and local CLI `--help` |
+| **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                                                                                                                                                                       | Pi CLI `--help`; requires Pi `v0.79.0+`                                        |
+| **kimi**     | Empty external workspace; staged `KIMI_CODE_HOME` with sanitized config; Markdown custom agent with no tools/subagents; explicit empty `--skills-dir`; isolated runtime state                                                                                                                                 | Kimi Code CLI `--help`; requires Kimi `v0.30.0+`                               |
 
-Codex `--ignore-user-config` skips normal user config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication usable without forwarding unrelated user configuration. ChatGPT auth also removes ambient API-key and relay variables before forcing `forced_login_method="chatgpt"`. When `--codex-profile` is selected, autoreview stages only model, reasoning, service-tier, and built-in Amazon Bedrock region fields into the isolated Codex home; hooks, MCP servers, commands, paths, and unrelated settings are dropped. Profile runs omit `--ignore-user-config` so Codex can load that isolated profile, and force shell, code-mode, and multi-agent execution tools off so Bedrock credentials remain unavailable to model-controlled processes. Bedrock reviews accept `AWS_BEARER_TOKEN_BEDROCK` or static AWS credential environment variables. File-backed AWS named profiles are rejected because the isolated reviewer home intentionally cannot expose `~/.aws`, SSO caches, or credential processes. Codex runs in an empty temporary workspace: the validated bundle is its sole repository input, ignored files and linked-worktree metadata remain unreadable, and the zero project-doc budget keeps workspace instructions out of the prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; subscription and explicit Bedrock reviews also disable user settings so a settings `env` block cannot restore or replace the requested provider route. Bedrock mode removes subscription and competing cloud-provider variables, forces `CLAUDE_CODE_USE_BEDROCK=1`, and supplies the selected AWS region while preserving AWS credentials. Autoreview supplies WebSearch by default, permits only explicitly domain-constrained WebFetch rules, and exposes no filesystem or shell tools. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. Droid, Copilot, Cursor, and OpenCode fail closed because their current CLI contracts cannot isolate untrusted review input from host, project, or private-network trust surfaces.
+Codex `--ignore-user-config` skips config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication usable without forwarding unrelated user configuration. `--codex-auth chatgpt` also removes API/provider routing variables before forcing ChatGPT auth. Codex runs in an empty temporary workspace: the validated bundle is its sole repository input, ignored files and linked-worktree metadata remain unreadable, and the zero project-doc budget keeps workspace instructions out of the prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; explicit subscription, Bedrock, and Mantle routes also disable user settings and remove competing provider routes before enabling the selected one. Claude runs also set `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` so an explicit reviewer refusal is recorded instead of being silently replaced inside the CLI. Autoreview supplies WebSearch by default, permits only explicitly domain-constrained WebFetch rules, and exposes no filesystem or shell tools. Amp runs its local CLI with isolated HOME/XDG roots and one generated adapter plugin whose name includes a fresh 128-bit random suffix. Current normal Amp execution loads all authenticated plugins, so the preflight deliberately requests that same complete inventory and fails before writing the private prompt unless the generated adapter is the only active plugin, with exactly its expected tool, agent, and mode. Users with personal or workspace plugins must use a dedicated plugin-free Amp API key/account. Isolated `amp.mcpPermissions` reject every local command and remote URL. Before writing the private prompt, autoreview creates a temporary skill whose MCP command would write a marker, runs `amp tools list`, and requires Amp to report the policy rejection without creating the marker; it removes that skill before continuing. A custom outer mode then receives only a fixed harmless trigger and exposes exactly one trusted, input-free `autoreview_generate` tool. That tool reads the private prompt file and calls `amp.ai.generate` directly with an explicit system prompt and report schema, so the untrusted patch never enters the outer agent context. Autoreview requires the stream's leading init event to attest the empty working directory, the exact singleton adapter-tool inventory, and `mcp_servers: []`; it then requires exactly one correctly ordered empty-input tool call/result and one terminal result before consuming the permission-checked private structured-result file. Native Windows is refused; Linux, macOS, and WSL use permission-checked private files. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. Kimi (`-p`, `stream-json`) runs from an empty external workspace with a staged `KIMI_CODE_HOME`: sanitized model/provider config only (no services, hooks, or extra skill/agent dirs), its OAuth credential directory linked in and device identity copied so native token refreshes remain durable without exposing the rest of the user's Kimi state. A Markdown `--agent-file` with `tools: []` and `subagents: []` plus an empty `--skills-dir` keep project instructions, tools, and MCP servers out of the review; the prompt travels as the `--prompt` argument, so per-pass prompts are capped at a platform-safe argv budget (120 KiB POSIX, 30 KiB Windows) and larger bundles partition into bounded passes.
 
-Codex `0.134.0+` profiles use a separate `$CODEX_HOME/<name>.config.toml` file selected by `--profile <name>`; legacy `[profiles.<name>]` tables are no longer read. See [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles).
+Amp cloud/orb agent execution is deliberately unsupported. In current Amp CLI behavior, `--orb-execute` does not preserve the local tool isolation and can expose shell, patch, thread, and reviewer tools. Autoreview therefore never passes `--orb-execute`: the local isolated adapter may call Amp's cloud inference service through `amp.ai.generate`, but it does not launch a cloud Amp agent over an untrusted diff.
 
 Codex uses a named permission profile that grants read access only to an empty temporary workspace. This is narrower than repository-root access, which would expose ignored credentials, and narrower than the legacy `read-only` sandbox, which permits reads across the host filesystem.
 
@@ -478,33 +346,25 @@ The helper:
 - otherwise uses current PR base if `gh pr view` works
 - otherwise uses `origin/main` for non-main branches
 - does not fetch automatically during branch review; the selected base ref must already resolve locally
-- recognizes `--engine droid`, `copilot`, `cursor`, and `opencode` only to fail closed with isolation errors; runnable engines are `codex`, `claude`, and `pi`; default is `AUTOREVIEW_ENGINE` or `codex`
+- supports `codex`, `claude`, `amp`, `pi`, and `kimi`; default is `AUTOREVIEW_ENGINE` or `codex`
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit `--*-bin` paths are interpreted from the reviewed repository root when relative and accepted only when both the supplied path and resolved target stay outside the reviewed repository
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
 - scans safe Git patches in full, recognizes synthetic fixture values tied to their credential field, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
-- writes owner-only run history outside the repository by default; `--no-run-log` disables it, while `--output`, `--json-output`, and live streamed engine stderr remain explicit
-- supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, run-history controls, and commit refs
+- writes review output only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set; private owner-only run metadata is enabled separately by default and `--no-run-log` disables it
+- supports `--dry-run` (validates bundle construction and reviewer CLI binary resolution without contacting any engine; exits nonzero if either check fails), an opt-in per-reviewer wall-clock bound via `--engine-timeout-seconds`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
-- supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
-- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-4-8[1m]`/`xhigh` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
-- supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles, automatically drops Codex CLI schema enforcement for those non-OpenAI runs, and disables model-controlled process tools so provider credentials remain outside the model-visible tool boundary
-- supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock|mantle` to force Claude Code login, AWS Bedrock Runtime, or AWS Bedrock Mantle routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-5`/`max` fallback after the second refusal
-- gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools
-- runs Claude with `--safe-mode` (`v2.1.169+`), user-only settings for default auth or no settings for explicit subscription/Bedrock auth, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
-- refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
+- supports opt-in panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
+- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, `claude=claude-fable-5`, and `amp=openai/gpt-5.6-sol` with `high` reasoning; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
+- gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch; Amp sends the bundle only through direct schema-constrained generation; Pi and Kimi receive the bundle with no tools
+- runs Claude with `--safe-mode` (`v2.1.169+`; explicit auth routes require `v2.1.237+`), isolated setting sources for explicit auth routes, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
+- runs Amp locally from an empty temporary workspace with isolated runtime roots, complete plugin inventory attestation that fails if any authenticated personal/workspace plugin exists, catch-all MCP denial verified by a no-spawn marker probe, a fixed outer trigger, one input-free adapter tool, and direct `amp.ai.generate`; requires `AMP_API_KEY`, refuses native Windows, and refuses cloud/orb agent execution
 - runs Pi `v0.79.0+` from neutral temporary directories with `--no-approve`, `--no-session`, disabled Pi context/resource loading, and `--no-tools` because its built-in read tools are not repository-confined
+- runs Kimi Code CLI `v0.30.0+` from an empty temporary workspace with a staged `KIMI_CODE_HOME`, sanitized config, an empty `--skills-dir`, and a no-tools/no-subagents Markdown `--agent-file`
 - prints `review still running: <engine> elapsed=<seconds>s pid=<pid>` to stderr at long-running intervals while waiting for the selected review engine, unless streamed output or compact Codex activity has been visible recently
 - prints `autoreview clean: no accepted/actionable findings reported` when the selected review command exits 0
 - exits nonzero when accepted/actionable findings are present
 
 ## Final Report
 
-Include:
-
-- review command used
-- tests/proof run
-- findings accepted/rejected, briefly why
-- the clean review result from the final helper/review run, or why a remaining finding was consciously rejected
-
-Do not run another review solely to improve the final report wording. If the final helper run exited 0 and produced no accepted/actionable findings, report that exact run as clean.
+Report material findings and the resulting status in chat. If there are none, say so plainly. Do not add command logs, test ledgers, proof blocks, or review receipts unless the user asks for them.
