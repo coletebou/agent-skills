@@ -215,7 +215,11 @@ class AutoreviewPanelTests(unittest.TestCase):
         self.assertEqual(forced, ['forced_login_method="chatgpt"'])
 
     def test_mantle_defaults_to_opus_5_low(self) -> None:
-        args = reviewer_test_args(engine="claude", claude_auth="mantle")
+        args = reviewer_test_args(
+            engine="claude",
+            claude_auth="mantle",
+            claude_bedrock_region="us-east-1",
+        )
         with mock.patch.dict(
             os.environ,
             {
