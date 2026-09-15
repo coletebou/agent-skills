@@ -16,6 +16,11 @@
       "title": "Sessions",
       "description": "Skills for inspecting and sharing local agent sessions.",
       "skills": ["session-viewer", "beam"]
+    },
+    {
+      "title": "Documentation",
+      "description": "Skills for writing and reviewing project documentation.",
+      "skills": ["readme-standard"]
     }
   ]
 }

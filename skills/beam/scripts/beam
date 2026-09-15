@@ -12,6 +12,7 @@ import {
 
 const MAX_UPLOAD_BYTES = 52 * 1024;
 const MAX_UPLOAD_ITEMS = 200;
+const MAX_UPLOAD_ITEM_CHARS = 6_000;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 function usage() {
@@ -120,7 +121,7 @@ function resolveSession(options, hook) {
 
 function normalizeItems(rendered, hook, options) {
   const items = rendered.items.map((item) => ({ ...item }));
-  const entryMaxChars = positiveInteger(options["entry-max-chars"], 6_000, "--entry-max-chars");
+  const entryMaxChars = parseEntryMaxChars(options);
   const lastAssistant =
     typeof hook.last_assistant_message === "string" && hook.last_assistant_message.trim()
       ? sanitizeVisibleText(hook.last_assistant_message, { maxChars: entryMaxChars })
@@ -139,6 +140,18 @@ function positiveInteger(value, fallback, label, minimum = 1) {
     throw new Error(`${label} must be an integer of at least ${minimum}`);
   }
   return Math.floor(parsed);
+}
+
+function parseEntryMaxChars(options) {
+  const value = positiveInteger(
+    options["entry-max-chars"],
+    MAX_UPLOAD_ITEM_CHARS,
+    "--entry-max-chars",
+  );
+  if (value > MAX_UPLOAD_ITEM_CHARS) {
+    throw new Error(`--entry-max-chars must be at most ${MAX_UPLOAD_ITEM_CHARS}`);
+  }
+  return value;
 }
 
 function titleFromItems(items) {
@@ -210,7 +223,7 @@ function buildPayload(options, hook) {
   const session = resolveSession(options, hook);
   const rendered = renderSession(session.file, {
     source: session.source,
-    maxChars: positiveInteger(options["entry-max-chars"], 6_000, "--entry-max-chars"),
+    maxChars: parseEntryMaxChars(options),
   });
   const items = normalizeItems(rendered, hook, options);
   if (!items.length) throw new Error("the sanitized session contains no shareable messages");
@@ -247,12 +260,54 @@ function isLoopbackUrl(url) {
   return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 }
 
-function expectedChatPath(endpoint) {
+function expectedControlUiBasePath(endpoint) {
   const suffix = "/api/v1/beam/sessions";
-  const basePath = endpoint.pathname.endsWith(suffix)
+  return endpoint.pathname.endsWith(suffix)
     ? endpoint.pathname.slice(0, -suffix.length)
     : "";
-  return `${basePath}/chat`;
+}
+
+function isSafeReceiverUrl(resultUrl, endpoint) {
+  return (
+    ["http:", "https:"].includes(resultUrl.protocol) &&
+    resultUrl.origin === endpoint.origin &&
+    !resultUrl.hash &&
+    !resultUrl.username &&
+    !resultUrl.password
+  );
+}
+
+function isPrettyBeamUrl(resultUrl, endpoint, beamId) {
+  const pathPrefix = `${expectedControlUiBasePath(endpoint)}/beam/`;
+  const returnedPath = resultUrl.pathname.startsWith(pathPrefix)
+    ? resultUrl.pathname.slice(pathPrefix.length)
+    : "";
+  const match = /^(?:([a-z0-9]+(?:-[a-z0-9]+)*)-)?([0-9a-f]{12,32})$/u.exec(returnedPath);
+  return (
+    /^[0-9a-f]{32}$/u.test(beamId) &&
+    match !== null &&
+    (match[1]?.length ?? 0) <= 48 &&
+    beamId.startsWith(match[2]) &&
+    resultUrl.searchParams.size === 0
+  );
+}
+
+function isCanonicalCatalogUrl(resultUrl, endpoint, beamId) {
+  const pathPrefix = `${expectedControlUiBasePath(endpoint)}/chat/`;
+  const agentId = resultUrl.pathname.startsWith(pathPrefix)
+    ? resultUrl.pathname.slice(pathPrefix.length)
+    : "";
+  const entries = [...resultUrl.searchParams.entries()];
+  return (
+    /^[a-z0-9_][a-z0-9_-]{0,63}$/u.test(agentId) &&
+    entries.length === 3 &&
+    resultUrl.searchParams.getAll("catalog").length === 1 &&
+    resultUrl.searchParams.get("catalog") === "beam" &&
+    resultUrl.searchParams.getAll("host").length === 1 &&
+    resultUrl.searchParams.get("host") === "gateway" &&
+    resultUrl.searchParams.getAll("thread").length === 1 &&
+    resultUrl.searchParams.get("thread") === beamId
+  );
 }
 
 function endpointUrl(options) {
@@ -350,18 +405,10 @@ async function publish(payload, options) {
       throw new Error("Beam receiver returned an unsafe session URL");
     }
     const resultUrl = new URL(printableUrl, url);
-    const expectedSession = `catalog:beam:gateway:${payload.beamId}`;
-    const entries = [...resultUrl.searchParams.entries()];
     if (
-      !["http:", "https:"].includes(resultUrl.protocol) ||
-      resultUrl.origin !== url.origin ||
-      resultUrl.pathname !== expectedChatPath(url) ||
-      resultUrl.hash ||
-      resultUrl.username ||
-      resultUrl.password ||
-      entries.length !== 1 ||
-      entries[0]?.[0] !== "session" ||
-      resultUrl.searchParams.get("session") !== expectedSession
+      !isSafeReceiverUrl(resultUrl, url) ||
+      (!isPrettyBeamUrl(resultUrl, url, payload.beamId) &&
+        !isCanonicalCatalogUrl(resultUrl, url, payload.beamId))
     ) {
       throw new Error("Beam receiver returned an unsafe session URL");
     }

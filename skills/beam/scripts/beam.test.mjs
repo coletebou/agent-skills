@@ -3,8 +3,8 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
-import test from "node:test";
+import { execFileSync, spawn } from "node:child_process";
+import test, { after } from "node:test";
 import {
   renderSession,
   resolveClaudeSession,
@@ -13,9 +13,16 @@ import {
 } from "./beam-session.js";
 
 const script = path.resolve("skills/beam/scripts/beam");
+const tempDirs = [];
+
+after(() => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "beam-test-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "beam-test-"));
+  tempDirs.push(dir);
+  return dir;
 }
 
 function writeJsonl(file, rows) {
@@ -41,6 +48,28 @@ function run(args, options = {}) {
     else child.stdin.end();
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+async function beamReceiverEndpoint(t, urlForPayload, basePath = "") {
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const payload = JSON.parse(body);
+      response.writeHead(200, {
+        "content-type": "application/json",
+        connection: "close",
+      });
+      response.end(JSON.stringify({ ok: true, url: urlForPayload(payload, request) }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+  return `http://127.0.0.1:${address.port}${basePath}/api/v1/beam/sessions`;
 }
 
 function claudeSession() {
@@ -155,6 +184,23 @@ test("standalone sanitizer keeps ordinary AGENTS.md tasks", () => {
   );
 });
 
+test("standalone sanitizer keeps its truncation marker inside the receiver item limit", () => {
+  const input = "visible ".repeat(900).trim();
+  const value = sanitizeVisibleText(input, { maxChars: 6_000 });
+
+  assert.equal(value.length, 6_000);
+  assert.match(value, /\n\.\.\.\[truncated \d+ chars\]$/);
+});
+
+test("standalone sanitizer preserves astral characters at the truncation boundary", () => {
+  const value = sanitizeVisibleText("🦞".repeat(3_487), { maxChars: 6_000 });
+
+  assert.ok(value.length <= 6_000);
+  assert.match(value, /\n\.\.\.\[truncated \d+ chars\]$/);
+  assert.equal(Buffer.from(value, "utf8").toString("utf8"), value);
+  assert.equal(value.includes("\ufffd"), false);
+});
+
 test("standalone Claude discovery requires one exact session-id filename", () => {
   const configDir = tempDir();
   const projectDir = path.join(configDir, "projects", "demo");
@@ -184,6 +230,89 @@ test("standalone discovery fails closed when the file scan is incomplete", () =>
     () => resolveClaudeSession(id, { CLAUDE_CONFIG_DIR: configDir }, { maxFiles: 1 }),
     /discovery exceeded its file limit/,
   );
+});
+
+test("Claude discovery accepts the exact cap with trailing non-session entries", () => {
+  const configDir = tempDir();
+  const projectDir = path.join(configDir, "projects", "demo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const id = "exact-cap-session";
+  const session = path.join(projectDir, `${id}.jsonl`);
+  writeJsonl(session, [{ type: "user", sessionId: id, message: { content: "Exact cap" } }]);
+  fs.writeFileSync(path.join(projectDir, "z-notes.txt"), "not a session");
+  fs.mkdirSync(path.join(projectDir, "zz-empty"));
+  assert.equal(
+    resolveClaudeSession(id, { CLAUDE_CONFIG_DIR: configDir }, { maxFiles: 1 }).file,
+    fs.realpathSync(session),
+  );
+});
+
+test("Codex discovery shares an exact cap across active and empty archive roots", () => {
+  const codexHome = tempDir();
+  const active = path.join(codexHome, "sessions");
+  const archived = path.join(codexHome, "archived_sessions");
+  fs.mkdirSync(active);
+  fs.mkdirSync(archived);
+  const id = "exact-cap-session";
+  const session = path.join(active, `rollout-${id}.jsonl`);
+  writeJsonl(session, [{ type: "session_meta", payload: { id } }]);
+  assert.equal(
+    resolveCodexSession(id, { CODEX_HOME: codexHome }, { maxFiles: 1 }).file,
+    fs.realpathSync(session),
+  );
+  writeJsonl(path.join(archived, "other.jsonl"), []);
+  assert.throws(
+    () => resolveCodexSession(id, { CODEX_HOME: codexHome }, { maxFiles: 1 }),
+    /discovery exceeded its file limit/,
+  );
+});
+
+test("session rendering and metadata discovery retry short reads", (t) => {
+  const codexHome = tempDir();
+  fs.mkdirSync(path.join(codexHome, "sessions"));
+  const id = "short-read-session";
+  const session = path.join(codexHome, "sessions", `rollout-${id}.jsonl`);
+  writeJsonl(session, [
+    { type: "session_meta", payload: { id } },
+    { type: "event_msg", payload: { type: "user_message", message: "Complete message" } },
+  ]);
+  const read = fs.readSync;
+  t.mock.method(fs, "readSync", (fd, buffer, offset, length, position) =>
+    read(fd, buffer, offset, Math.min(length, 13), position));
+  assert.equal(resolveCodexSession(id, { CODEX_HOME: codexHome }).file, fs.realpathSync(session));
+  assert.deepEqual(renderSession(session, { source: "codex" }).items, [
+    { type: "userMessage", text: "Complete message" },
+  ]);
+});
+
+test("bounded session reads retain head and tail messages after short reads", (t) => {
+  const session = path.join(tempDir(), "session.jsonl");
+  const row = (message) => JSON.stringify({ type: "event_msg", payload: { type: "user_message", message } });
+  fs.writeFileSync(session, `${row("Head message")}\n${"x".repeat(8 * 1024 * 1024)}\n${row("Tail message")}\n`);
+  const read = fs.readSync;
+  t.mock.method(fs, "readSync", (fd, buffer, offset, length, position) =>
+    read(fd, buffer, offset, Math.min(length, 4096), position));
+  const rendered = renderSession(session, { source: "codex" });
+  assert.equal(rendered.truncated, true);
+  assert.deepEqual(rendered.items, [
+    { type: "userMessage", text: "Head message" },
+    { type: "userMessage", text: "Tail message" },
+  ]);
+});
+
+test("rendering and metadata discovery reject unexpected EOF", (t) => {
+  const codexHome = tempDir();
+  fs.mkdirSync(path.join(codexHome, "sessions"));
+  const id = "early-eof-session";
+  const session = path.join(codexHome, "sessions", `rollout-${id}.jsonl`);
+  writeJsonl(session, [{ type: "session_meta", payload: { id } }]);
+  const read = fs.readSync;
+  let calls = 0;
+  t.mock.method(fs, "readSync", (fd, buffer, offset, length, position) =>
+    calls++ === 0 ? read(fd, buffer, offset, Math.min(length, 13), position) : 0);
+  assert.throws(() => renderSession(session, { source: "codex" }), /ended before the expected read/);
+  calls = 0;
+  assert.throws(() => resolveCodexSession(id, { CODEX_HOME: codexHome }), /ended before the expected read/);
 });
 
 test("standalone Codex discovery verifies metadata across active and archived rollouts", () => {
@@ -362,6 +491,30 @@ test("standalone parser handles modern Codex items without reasoning or raw outp
   );
 });
 
+test("standalone parser ignores persisted Codex inter-agent messages", () => {
+  const session = path.join(tempDir(), "rollout.jsonl");
+  writeJsonl(session, [
+    { type: "session_meta", payload: { id: "33333333-4444-4555-8666-777777777777" } },
+    { type: "response_item", payload: { type: "function_call", name: "read_file" } },
+    {
+      type: "response_item",
+      payload: {
+        type: "agent_message",
+        author: "agent-a",
+        recipient: "agent-b",
+        content: [{ type: "input_text", text: "private inter-agent coordination" }],
+      },
+    },
+    { type: "response_item", payload: { type: "function_call", name: "exec_command" } },
+  ]);
+
+  const rendered = renderSession(session, { source: "codex" });
+  assert.deepEqual(rendered.items, [
+    { type: "other", text: "1 read, 1 execute; raw tool outputs dropped: 0" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(rendered), /private inter-agent coordination/);
+});
+
 test("publish dry-run emits a sanitized versioned payload", async () => {
   const session = claudeSession();
   const result = await run([
@@ -438,7 +591,7 @@ test("publish honors the total max-chars disclosure limit", async () => {
   assert.doesNotMatch(payload.title, /^alpha/);
 });
 
-test("publish preserves a visible message when byte trimming drops tool summaries", async () => {
+test("publish keeps multibyte transcript items within receiver limits", async () => {
   const session = path.join(tempDir(), "multibyte.jsonl");
   writeJsonl(session, [
     { type: "user", message: { role: "user", content: "🦞".repeat(20_000) } },
@@ -452,8 +605,6 @@ test("publish preserves a visible message when byte trimming drops tool summarie
     session,
     "--max-chars",
     "48000",
-    "--entry-max-chars",
-    "48000",
     "--dry-run",
     "--quiet",
   ]);
@@ -461,8 +612,27 @@ test("publish preserves a visible message when byte trimming drops tool summarie
   assert.equal(result.code, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.items.some((item) => item.type === "userMessage"), true);
-  assert.equal(payload.items.every((item) => item.type !== "other"), true);
-  assert.equal(payload.truncated, true);
+  assert.equal(payload.items.some((item) => item.type === "other"), true);
+  assert.equal(payload.items.every((item) => item.text.length <= 6_000), true);
+  assert.ok(Buffer.byteLength(JSON.stringify(payload)) <= 52 * 1024);
+});
+
+test("publish rejects an entry limit above the receiver maximum", async () => {
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--session",
+    claudeSession(),
+    "--entry-max-chars",
+    "6001",
+    "--dry-run",
+    "--quiet",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /--entry-max-chars must be at most 6000/);
+  assert.equal(result.stdout, "");
 });
 
 test("publish accepts IPv6 loopback development endpoints", async () => {
@@ -900,9 +1070,13 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
     });
     request.on("end", () => {
       const received = JSON.parse(requestBody);
-      const sessionKey = encodeURIComponent(`catalog:beam:gateway:${received.beamId}`);
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, url: `/chat?session=${sessionKey}` }));
+      response.end(
+        JSON.stringify({
+          ok: true,
+          url: `/beam/${received.beamId.slice(0, 12)}`,
+        }),
+      );
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -916,7 +1090,10 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
   );
 
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, new RegExp(`http://127\\.0\\.0\\.1:${address.port}/chat\\?session=`));
+  assert.match(
+    result.stdout,
+    new RegExp(`http://127\\.0\\.0\\.1:${address.port}/beam/[a-f0-9]{12}`),
+  );
   assert.equal(accessToken, "test-access-token");
   const payload = JSON.parse(requestBody);
   assert.equal(payload.version, 1);
@@ -1013,68 +1190,175 @@ test("publish rejects receiver URLs containing reflected credentials", async (t)
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /test-access-token/);
 });
 
-test("publish accepts the endpoint-derived Control UI base path", async (t) => {
+test("publish accepts bare and named Beam URLs below the endpoint-derived base path", async (t) => {
   const session = claudeSession();
-  let body = "";
-  const server = http.createServer((request, response) => {
-    request.setEncoding("utf8");
-    request.on("data", (chunk) => {
-      body += chunk;
-    });
-    request.on("end", () => {
-      const payload = JSON.parse(body);
-      const key = encodeURIComponent(`catalog:beam:gateway:${payload.beamId}`);
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, url: `/openclaw/chat?session=${key}` }));
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => server.close());
-  const address = server.address();
+  let makePath;
+  let returnedPath;
+  const endpoint = await beamReceiverEndpoint(
+    t,
+    ({ beamId }) => (returnedPath = `/openclaw/beam/${makePath(beamId)}`),
+    "/openclaw",
+  );
+  const cases = [
+    ["bare prefix", (beamId) => beamId.slice(0, 12)],
+    ["bare full id", (beamId) => beamId],
+    ["current title", (beamId) => `current-session-title-${beamId.slice(0, 12)}`],
+    ["stale title", (beamId) => `previous-title-${beamId.slice(0, 12)}`],
+    ["named full id", (beamId) => `collision-fallback-${beamId}`],
+    ["maximum title length", (beamId) => `${"a".repeat(48)}-${beamId.slice(0, 12)}`],
+  ];
+
+  for (const [label, pathFactory] of cases) {
+    makePath = pathFactory;
+    const result = await run([
+      "publish",
+      "--endpoint",
+      endpoint,
+      "--session",
+      session,
+      "--title",
+      "Current session title",
+    ]);
+
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.ok(result.stdout.includes(returnedPath), label);
+  }
+});
+
+test("publish accepts the current canonical catalog URL during rollout", async (t) => {
+  const session = claudeSession();
+  const endpoint = await beamReceiverEndpoint(
+    t,
+    (payload) =>
+      `/chat/roboclaw?catalog=beam&host=gateway&thread=${payload.beamId}`,
+  );
   const result = await run([
     "publish",
     "--endpoint",
-    `http://127.0.0.1:${address.port}/openclaw/api/v1/beam/sessions`,
+    endpoint,
     "--session",
     session,
   ]);
 
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /\/openclaw\/chat\?session=/);
+  assert.match(
+    result.stdout,
+    /\/chat\/roboclaw\?catalog=beam&host=gateway&thread=[a-f0-9]{32}/,
+  );
 });
 
-test("publish rejects duplicate session parameters and receiver-controlled chat prefixes", async (t) => {
+test("publish rejects malformed pretty Beam URLs", async (t) => {
   const session = claudeSession();
-  for (const mode of ["duplicate", "prefix"]) {
-    let body = "";
-    const server = http.createServer((request, response) => {
-      request.setEncoding("utf8");
-      request.on("data", (chunk) => {
-        body += chunk;
-      });
-      request.on("end", () => {
-        const payload = JSON.parse(body);
-        const key = encodeURIComponent(`catalog:beam:gateway:${payload.beamId}`);
-        const url =
-          mode === "duplicate"
-            ? `/chat?session=${key}&session=extra`
-            : `/secret-prefix/chat?session=${key}`;
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, url }));
-      });
-    });
-    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-    t.after(() => server.close());
-    const address = server.address();
+  let makeUrl;
+  const endpoint = await beamReceiverEndpoint(t, (payload, request) =>
+    makeUrl(payload, request),
+  );
+  const cases = [
+    ["short id", ({ beamId }) => `/beam/${beamId.slice(0, 11)}`],
+    ["uppercase id", ({ beamId }) => `/beam/${beamId.slice(0, 12).toUpperCase()}`],
+    ["nonhex id", ({ beamId }) => `/beam/${beamId.slice(0, 11)}g`],
+    ["long id", ({ beamId }) => `/beam/${beamId}0`],
+    ["uppercase title", ({ beamId }) => `/beam/Current-title-${beamId.slice(0, 12)}`],
+    ["long title", ({ beamId }) => `/beam/${"a".repeat(49)}-${beamId.slice(0, 12)}`],
+    ["empty title", ({ beamId }) => `/beam/-${beamId.slice(0, 12)}`],
+    ["title with empty word", ({ beamId }) => `/beam/current--title-${beamId.slice(0, 12)}`],
+    ["title with trailing hyphen", ({ beamId }) => `/beam/current-title--${beamId.slice(0, 12)}`],
+    ["title with punctuation", ({ beamId }) => `/beam/current_title-${beamId.slice(0, 12)}`],
+    ["encoded title", ({ beamId }) => `/beam/current%2ftitle-${beamId.slice(0, 12)}`],
+    ["named short id", ({ beamId }) => `/beam/current-title-${beamId.slice(0, 11)}`],
+    ["named uppercase id", ({ beamId }) => `/beam/current-title-${beamId.slice(0, 12).toUpperCase()}`],
+    ["named nonhex id", ({ beamId }) => `/beam/current-title-${beamId.slice(0, 11)}g`],
+    ["named long id", ({ beamId }) => `/beam/current-title-${beamId}0`],
+    [
+      "wrong prefix",
+      ({ beamId }) => `/beam/${beamId[0] === "0" ? "1" : "0"}${beamId.slice(1, 12)}`,
+    ],
+    [
+      "named wrong prefix",
+      ({ beamId }) => `/beam/current-title-${beamId[0] === "0" ? "1" : "0"}${beamId.slice(1, 12)}`,
+    ],
+    ["extra segment", ({ beamId }) => `/beam/${beamId.slice(0, 12)}/extra`],
+    ["query", ({ beamId }) => `/beam/${beamId.slice(0, 12)}?view=debug`],
+    [
+      "duplicate query",
+      ({ beamId }) => `/beam/${beamId.slice(0, 12)}?thread=${beamId}&thread=${beamId}`,
+    ],
+    ["wrong base path", ({ beamId }) => `/secret-prefix/beam/${beamId.slice(0, 12)}`],
+    ["foreign origin", ({ beamId }) => `https://example.test/beam/${beamId.slice(0, 12)}`],
+    [
+      "credentials",
+      ({ beamId }, request) =>
+        `http://user@${request.headers.host}/beam/${beamId.slice(0, 12)}`,
+    ],
+    ["hash", ({ beamId }) => `/beam/${beamId.slice(0, 12)}#fragment`],
+    ["control", ({ beamId }) => `/beam/${beamId.slice(0, 12)}\n`],
+    ["non-http", ({ beamId }) => `ftp://example.test/beam/${beamId.slice(0, 12)}`],
+  ];
+
+  for (const [label, urlFactory] of cases) {
+    makeUrl = urlFactory;
     const result = await run([
       "publish",
       "--endpoint",
-      `http://127.0.0.1:${address.port}/api/v1/beam/sessions`,
+      endpoint,
       "--session",
       session,
     ]);
-    assert.equal(result.code, 1);
-    assert.match(result.stderr, /unsafe session URL/);
+    assert.equal(result.code, 1, label);
+    assert.match(result.stderr, /unsafe session URL/, label);
+  }
+});
+
+test("publish rejects malformed rollout catalog URLs", async (t) => {
+  const session = claudeSession();
+  let makeUrl;
+  const endpoint = await beamReceiverEndpoint(t, (payload) => makeUrl(payload));
+  const canonical = (beamId) =>
+    `/chat/roboclaw?catalog=beam&host=gateway&thread=${beamId}`;
+  const cases = [
+    ["duplicate thread", ({ beamId }) => `${canonical(beamId)}&thread=extra`],
+    ["extra query", ({ beamId }) => `${canonical(beamId)}&view=debug`],
+    ["wrong base path", ({ beamId }) => `/secret-prefix${canonical(beamId)}`],
+    [
+      "missing agent",
+      ({ beamId }) => `/chat?catalog=beam&host=gateway&thread=${beamId}`,
+    ],
+    [
+      "extra segment",
+      ({ beamId }) =>
+        `/chat/roboclaw/extra?catalog=beam&host=gateway&thread=${beamId}`,
+    ],
+    [
+      "legacy beta session",
+      ({ beamId }) =>
+        `/chat?session=${encodeURIComponent(`catalog:beam:gateway:${beamId}`)}`,
+    ],
+    [
+      "wrong catalog",
+      ({ beamId }) => `/chat/roboclaw?catalog=other&host=gateway&thread=${beamId}`,
+    ],
+    [
+      "wrong host",
+      ({ beamId }) => `/chat/roboclaw?catalog=beam&host=other&thread=${beamId}`,
+    ],
+    ["wrong thread", () => "/chat/roboclaw?catalog=beam&host=gateway&thread=other"],
+    [
+      "invalid agent",
+      ({ beamId }) => `/chat/Bad.Agent?catalog=beam&host=gateway&thread=${beamId}`,
+    ],
+  ];
+
+  for (const [label, urlFactory] of cases) {
+    makeUrl = urlFactory;
+    const result = await run([
+      "publish",
+      "--endpoint",
+      endpoint,
+      "--session",
+      session,
+    ]);
+    assert.equal(result.code, 1, label);
+    assert.match(result.stderr, /unsafe session URL/, label);
   }
 });
 
@@ -1104,4 +1388,25 @@ test("publish never prints access tokens on receiver errors", async (t) => {
   assert.equal(result.stderr.includes(String.fromCharCode(27)), false);
   assert.doesNotMatch(result.stderr, /\nforged/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /super-secret-access-token/);
+});
+
+test("CLI loads its native module format without loader warnings", async () => {
+  const result = await run(["--help"], {
+    env: { NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Usage:/);
+  assert.equal(result.stderr, "");
+});
+
+test("copied Beam runs inside a CommonJS project without dependencies", () => {
+  const root = tempDir();
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "commonjs" }));
+  const installed = path.join(root, "installed-beam");
+  fs.cpSync(path.dirname(path.dirname(script)), installed, { recursive: true });
+  const output = execFileSync(process.execPath, [path.join(installed, "scripts", "beam"), "--help"], {
+    cwd: root, encoding: "utf8", stdio: "pipe",
+    env: { ...process.env, NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.match(output, /Usage:/);
 });

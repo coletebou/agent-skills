@@ -29,7 +29,10 @@ The `beam` helper is self-contained. It does not require `agent-transcript`,
 
 Beam refuses fuzzy discovery. If an exact session cannot be resolved or multiple
 exact candidates exist, publication stops without choosing the newest nearby
-session.
+session. Discovery permits up to 20,000 JSONL files across the native roots;
+non-session files and empty directories do not consume that budget. Reads retry
+short filesystem results and stop publication on unexpected EOF, so an incomplete
+read cannot be uploaded as a complete snapshot.
 
 ## Install
 
@@ -70,12 +73,29 @@ node "$BEAM_SKILL_DIR/scripts/beam" publish \
   --thread-id "$CODEX_THREAD_ID"
 ```
 
+On success, Beam prints the endpoint-derived Control UI URL in its short share
+form, for example:
+
+```text
+Beamed session: https://gateway.example.com/beam/fix-upload-flow-0123456789ab
+```
+
+A Gateway mounted below a base path returns that same base path, such as
+`https://gateway.example.com/openclaw/beam/fix-upload-flow-0123456789ab`.
+
+The Gateway builds the optional title slug from the redacted `--title` value or
+the first shared user message. It contains up to 48 lowercase alphanumeric
+characters and hyphens. The final 12–32 lowercase hex characters identify the
+session independently of its title, so earlier named links still work after a
+rename. Bare `/beam/<id-prefix>` links remain accepted.
+
 Explicit transcript:
 
 ```sh
 node "$BEAM_SKILL_DIR/scripts/beam" publish \
   --endpoint "$BEAM_ENDPOINT" \
-  --session /path/to/session.jsonl
+  --session /path/to/session.jsonl \
+  --title "Fix upload flow"
 ```
 
 Inspect the exact sanitized payload without networking:
@@ -137,7 +157,16 @@ Gateway HTTP authentication. Uploads require `operator.write` or
 `operator.admin`. Every `operator.read` client on that Gateway can view the
 catalog, so a separate Gateway remains the isolation boundary between teams.
 
+The receiver rejects transcript item text longer than 6,000 characters.
+Accordingly, explicit `--entry-max-chars` values above 6,000 fail locally
+before upload.
+
 The catalog has no continue, archive, terminal, tool, or node capability.
+
+For rollout compatibility, the helper also accepts the current server's exact
+`/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` URL. This is a
+narrow transition path: the obsolete `?session=catalog:...` beta URL remains
+rejected.
 
 OpenClaw plugin documentation:
 https://docs.openclaw.ai/plugins/beam

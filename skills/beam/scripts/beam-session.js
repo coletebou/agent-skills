@@ -36,11 +36,7 @@ function uniqueRealFiles(files) {
 }
 
 function walkJsonl(root, match, state, out) {
-  if (!root || !fs.existsSync(root)) return;
-  if (state.files >= state.maxFiles) {
-    state.exhausted = true;
-    return;
-  }
+  if (state.exhausted || !root || !fs.existsSync(root)) return;
   let entries;
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
@@ -48,10 +44,7 @@ function walkJsonl(root, match, state, out) {
     return;
   }
   for (const entry of entries) {
-    if (state.files >= state.maxFiles) {
-      state.exhausted = true;
-      break;
-    }
+    if (state.exhausted) break;
     if (entry.name === ".git" || entry.name === "node_modules") continue;
     const candidate = path.join(root, entry.name);
     if (entry.isDirectory()) {
@@ -59,6 +52,10 @@ function walkJsonl(root, match, state, out) {
       continue;
     }
     if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    if (state.files >= state.maxFiles) {
+      state.exhausted = true;
+      break;
+    }
     state.files++;
     if (match(entry.name, candidate)) out.push(candidate);
   }
@@ -79,9 +76,7 @@ function readPrefix(file, maxBytes = TRANSCRIPT_HEAD_BYTES) {
   try {
     const stat = fs.fstatSync(fd);
     const size = Math.min(stat.size, maxBytes);
-    const buffer = Buffer.alloc(size);
-    fs.readSync(fd, buffer, 0, size, 0);
-    return buffer.toString("utf8");
+    return readRegion(fd, 0, size);
   } finally {
     fs.closeSync(fd);
   }
@@ -145,8 +140,15 @@ export function resolveCodexSession(threadId, env = process.env, options = {}) {
 
 function readRegion(fd, start, length) {
   const buffer = Buffer.alloc(length);
-  const read = fs.readSync(fd, buffer, 0, length, start);
-  return buffer.subarray(0, read).toString("utf8");
+  let offset = 0;
+  while (offset < length) {
+    const read = fs.readSync(fd, buffer, offset, length - offset, start + offset);
+    if (read === 0) {
+      throw new Error("session file ended before the expected read completed; retry publication");
+    }
+    offset += read;
+  }
+  return buffer.toString("utf8");
 }
 
 function completeHead(text) {
@@ -576,9 +578,27 @@ export function sanitizeVisibleText(input, options = {}) {
   text = redact(text, stats).replace(/\n{3,}/g, "\n\n").trim();
   if (unsafePatterns(text).length) throw new Error("unsafe transcript text remains after redaction");
   const maxChars = Number(options.maxChars || DEFAULT_ENTRY_MAX_CHARS);
-  return text.length > maxChars
-    ? `${text.slice(0, maxChars).trimEnd()}\n...[truncated ${text.length - maxChars} chars]`
-    : text;
+  if (text.length <= maxChars) return text;
+  let omitted = text.length - maxChars;
+  while (true) {
+    const marker = `\n...[truncated ${omitted} chars]`;
+    if (marker.length >= maxChars) return marker.slice(0, maxChars);
+    let cutoff = maxChars - marker.length;
+    const lastCodeUnit = text.charCodeAt(cutoff - 1);
+    const nextCodeUnit = text.charCodeAt(cutoff);
+    if (
+      lastCodeUnit >= 0xd800 &&
+      lastCodeUnit <= 0xdbff &&
+      nextCodeUnit >= 0xdc00 &&
+      nextCodeUnit <= 0xdfff
+    ) {
+      cutoff--;
+    }
+    const visible = text.slice(0, cutoff).trimEnd();
+    const nextOmitted = text.length - visible.length;
+    if (nextOmitted === omitted) return `${visible}${marker}`;
+    omitted = nextOmitted;
+  }
 }
 
 function toolFamily(name) {
@@ -600,7 +620,7 @@ function addTool(stats, name) {
   stats.toolCalls++;
 }
 
-function pushMessage(items, _seen, type, input, stats, maxChars) {
+function pushMessage(items, type, input, stats, maxChars) {
   const text = sanitizeVisibleText(input, { stats, maxChars });
   if (text) items.push({ type, text });
 }
@@ -659,7 +679,6 @@ function activeClaudeRows(rows) {
 
 function parseClaude(rows, options) {
   const items = [];
-  const seen = new Set();
   const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
   let identity = null;
   for (const row of activeClaudeRows(rows)) {
@@ -681,8 +700,8 @@ function parseClaude(rows, options) {
     }
     if (row.type === "tool_use") addTool(stats, row.name || "tool_use");
     if (row.type === "tool_result") stats.toolOutputsDropped++;
-    if (role === "user") pushMessage(items, seen, "userMessage", visibleText(content ?? message), stats, options.maxChars);
-    if (role === "assistant") pushMessage(items, seen, "agentMessage", visibleText(content ?? message), stats, options.maxChars);
+    if (role === "user") pushMessage(items, "userMessage", visibleText(content ?? message), stats, options.maxChars);
+    if (role === "assistant") pushMessage(items, "agentMessage", visibleText(content ?? message), stats, options.maxChars);
   }
   return { source: "claude", identity, items, stats };
 }
@@ -691,15 +710,15 @@ function normalizedType(value) {
   return String(value || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
-function parseCodexItem(item, items, seen, stats, options) {
+function parseCodexItem(item, items, stats, options) {
   if (!isRecord(item)) return;
   const type = normalizedType(item.type);
   if (type === "usermessage") {
-    pushMessage(items, seen, "userMessage", visibleText(item.content ?? item.text ?? item.message), stats, options.maxChars);
+    pushMessage(items, "userMessage", visibleText(item.content ?? item.text ?? item.message), stats, options.maxChars);
     return;
   }
   if (type === "agentmessage") {
-    pushMessage(items, seen, "agentMessage", visibleText(item.content ?? item.text ?? item.message), stats, options.maxChars);
+    pushMessage(items, "agentMessage", visibleText(item.content ?? item.text ?? item.message), stats, options.maxChars);
     return;
   }
   if (["reasoning", "plan", "contextcompaction", "compaction"].includes(type)) return;
@@ -719,7 +738,6 @@ function parseCodexItem(item, items, seen, stats, options) {
 
 function parseCodex(rows, options) {
   const items = [];
-  const seen = new Set();
   const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
   let identity = null;
   const hasEventDialogue = rows.some((row) => {
@@ -741,18 +759,18 @@ function parseCodex(rows, options) {
     }
     if (row.type === "event_msg") {
       const type = normalizedType(payload.type);
-      if (type === "usermessage") pushMessage(items, seen, "userMessage", visibleText(payload.message ?? payload.content), stats, options.maxChars);
-      else if (type === "agentmessage") pushMessage(items, seen, "agentMessage", visibleText(payload.message ?? payload.content), stats, options.maxChars);
-      else if (type === "itemcompleted") parseCodexItem(payload.item, items, seen, stats, options);
+      if (type === "usermessage") pushMessage(items, "userMessage", visibleText(payload.message ?? payload.content), stats, options.maxChars);
+      else if (type === "agentmessage") pushMessage(items, "agentMessage", visibleText(payload.message ?? payload.content), stats, options.maxChars);
+      else if (type === "itemcompleted") parseCodexItem(payload.item, items, stats, options);
       continue;
     }
     if (row.type !== "response_item") continue;
     const type = normalizedType(payload.type);
+    if (type === "agentmessage") continue;
     if (payload.role === "user" || payload.role === "assistant") {
       if (hasEventDialogue) continue;
       pushMessage(
         items,
-        seen,
         payload.role === "user" ? "userMessage" : "agentMessage",
         visibleText(payload.content),
         stats,

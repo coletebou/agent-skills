@@ -3,12 +3,49 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
+import { pathToFileURL } from "node:url";
 
 const script = path.resolve("skills/agent-transcript/scripts/agent-transcript");
+const tempDirs = [];
+
+after(() => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "agent-transcript-test-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-transcript-test-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function runWithLimitedReads(args, session, chunkSize, earlyEof = false) {
+  const preload = path.join(tempDir(), "limited-reads.mjs");
+  fs.writeFileSync(preload, `
+import fs from "node:fs";
+import path from "node:path";
+const open = fs.openSync, read = fs.readSync, close = fs.closeSync;
+const owned = new Set();
+let calls = 0;
+fs.openSync = (file, ...args) => {
+  const fd = open(file, ...args);
+  if (typeof file === "string" && path.resolve(file) === path.resolve(process.env.TEST_SESSION)) owned.add(fd);
+  return fd;
+};
+fs.closeSync = (fd) => { owned.delete(fd); return close(fd); };
+fs.readSync = (fd, buffer, offset, length, position) => {
+  if (owned.has(fd)) {
+    if (process.env.TEST_EOF === "1" && calls++ > 0) return 0;
+    length = Math.min(length, Number(process.env.TEST_CHUNK));
+  }
+  return read(fd, buffer, offset, length, position);
+};
+`);
+  return execFileSync(process.execPath, ["--import", pathToFileURL(preload).href, script, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, TEST_SESSION: session, TEST_CHUNK: String(chunkSize), TEST_EOF: earlyEof ? "1" : "0" },
+  });
 }
 
 function writeJsonl(file, rows) {
@@ -141,4 +178,268 @@ test("find labels explicit roots under trailing-slash CLAUDE_CONFIG_DIR as Claud
   assert.equal(matches.length, 1);
   assert.equal(matches[0].file, session);
   assert.equal(matches[0].agent, "claude");
+});
+
+function oversizedSession(dir) {
+  const session = path.join(dir, "session.jsonl");
+  const pad = JSON.stringify({
+    type: "user",
+    message: { role: "user", content: `pad-${"x".repeat(80)}` },
+  });
+  const lines = [
+    JSON.stringify({ type: "user", message: { role: "user", content: "HEAD_READ_BOUND_MARKER" } }),
+    ...Array.from({ length: 40 }, () => pad),
+    JSON.stringify({ type: "user", message: { role: "user", content: "MIDDLE_READ_BOUND_MARKER" } }),
+    ...Array.from({ length: 40 }, () => pad),
+    JSON.stringify({ type: "user", message: { role: "user", content: "TAIL_READ_BOUND_MARKER" } }),
+  ];
+  fs.writeFileSync(session, `${lines.join("\n")}\n`);
+  return session;
+}
+
+test("render bounds oversized JSONL reads before parse", () => {
+  const dir = tempDir();
+  const session = oversizedSession(dir);
+
+  const output = run(["render", "--session", session, "--max-read-bytes", "400"]);
+  assert.match(output, /HEAD_READ_BOUND_MARKER/);
+  assert.match(output, /TAIL_READ_BOUND_MARKER/);
+  assert.doesNotMatch(output, /MIDDLE_READ_BOUND_MARKER/);
+  assert.match(output, /source truncated:/);
+  assert.match(output, /"sourceTruncated":true/);
+});
+
+test("html bounds oversized JSONL reads before parse", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  oversizedSession(dir);
+  const prs = path.join(dir, "prs.json");
+  fs.writeFileSync(prs, JSON.stringify([{ title: "HEAD_READ_BOUND_MARKER", url: "https://example.com/pr/1" }]));
+
+  const output = run(
+    ["html", "--prs", prs, "--root", dir, "--since-days", "1", "--min-score", "1", "--max-read-bytes", "400"],
+    { env: { ...process.env, HOME: home } },
+  );
+  assert.match(output, /HEAD_READ_BOUND_MARKER/);
+  assert.match(output, /TAIL_READ_BOUND_MARKER/);
+  assert.doesNotMatch(output, /MIDDLE_READ_BOUND_MARKER/);
+  assert.match(output, /source truncated:/);
+  assert.match(output, /&quot;sourceTruncated&quot;:true/);
+});
+
+test("preview and append-body retain source truncation notices even when output is shortened", () => {
+  const dir = tempDir();
+  const session = oversizedSession(dir);
+  const body = path.join(dir, "body.md");
+  fs.writeFileSync(body, "# Synthetic PR\n");
+  for (const command of [["render"], ["preview"], ["append-body", "--body", body]]) {
+    const output = run([...command, "--session", session, "--max-read-bytes", "400", "--max-chars", "1"]);
+    assert.match(output, /source truncated:/);
+    assert.match(output, /this transcript is partial/);
+  }
+});
+
+test("default read cap discloses omitted content in a file larger than eight MiB", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "large.jsonl");
+  const row = (content) => ({ type: "user", message: { role: "user", content } });
+  writeJsonl(session, [row("HEAD_DEFAULT_MARKER"), row("x".repeat(5 * 1024 * 1024)), row("MIDDLE_DEFAULT_MARKER"), row("y".repeat(5 * 1024 * 1024)), row("TAIL_DEFAULT_MARKER")]);
+  const output = run(["render", "--session", session]);
+  assert.match(output, /HEAD_DEFAULT_MARKER/);
+  assert.match(output, /TAIL_DEFAULT_MARKER/);
+  assert.doesNotMatch(output, /MIDDLE_DEFAULT_MARKER/);
+  assert.match(output, /source truncated:/);
+});
+
+test("exact byte limit and small sessions remain complete", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "small.jsonl");
+  writeJsonl(session, [{ type: "user", message: { role: "user", content: "complete-session-marker" } }]);
+  for (const options of [[], ["--max-read-bytes", String(fs.statSync(session).size)]]) {
+    const output = run(["render", "--session", session, ...options]);
+    assert.match(output, /complete-session-marker/);
+    assert.match(output, /"sourceTruncated":false/);
+    assert.doesNotMatch(output, /source truncated:/);
+  }
+});
+
+test("line-limited sessions disclose omitted source content", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "many-lines.jsonl");
+  const row = { type: "user", message: { role: "user", content: "line-cap-marker" } };
+  writeJsonl(session, Array.from({ length: 12001 }, () => row));
+  const output = run(["render", "--session", session]);
+  assert.match(output, /source truncated:/);
+  assert.match(output, /"sourceTruncated":true/);
+});
+
+test("render rejects invalid and missing byte limits", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "small.jsonl");
+  writeJsonl(session, []);
+  for (const value of ["1.5", "0", "-1", "NaN", "Infinity", "9007199254740992", null]) {
+    assert.throws(
+      () => run(["render", "--session", session, "--max-read-bytes", ...(value === null ? [] : [value])]),
+      (error) => /--max-read-bytes must be a positive integer/.test(String(error.stderr)),
+    );
+  }
+});
+
+test("find fails closed when session discovery exceeds the walk cap", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  writeJsonl(path.join(dir, "a.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-find-marker" } },
+  ]);
+  writeJsonl(path.join(dir, "b.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-find-marker" } },
+  ]);
+
+  assert.throws(
+    () =>
+      run(
+        [
+          "find",
+          "--query",
+          "walk-cap-find-marker",
+          "--root",
+          dir,
+          "--since-days",
+          "1",
+          "--max-files",
+          "20",
+          "--max-discovery-files",
+          "1",
+        ],
+        { env: { ...process.env, HOME: home } },
+      ),
+    (error) => {
+      assert.match(String(error.stderr || ""), /session discovery exceeded its file limit/);
+      return true;
+    },
+  );
+});
+
+test("html fails closed when session discovery exceeds the walk cap", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  writeJsonl(path.join(dir, "a.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-html-marker" } },
+  ]);
+  writeJsonl(path.join(dir, "b.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-html-marker" } },
+  ]);
+  const prs = path.join(dir, "prs.json");
+  fs.writeFileSync(prs, JSON.stringify([{ title: "walk-cap-html-marker", url: "https://example.com/pr/1" }]));
+
+  assert.throws(
+    () =>
+      run(["html", "--prs", prs, "--root", dir, "--since-days", "1", "--max-discovery-files", "1"], {
+        env: { ...process.env, HOME: home },
+      }),
+    (error) => {
+      assert.match(String(error.stderr || ""), /session discovery exceeded its file limit/);
+      return true;
+    },
+  );
+});
+
+test("discovery accepts exactly the cap across roots and ignores trailing non-session entries", () => {
+  const dir = tempDir();
+  const empty = tempDir();
+  writeJsonl(path.join(dir, "a.jsonl"), [
+    { type: "user", message: { role: "user", content: "exact-cap-marker" } },
+  ]);
+  fs.mkdirSync(path.join(dir, "z-empty"));
+  fs.writeFileSync(path.join(dir, "z-not-session.txt"), "ignored");
+  const prs = path.join(empty, "prs.json");
+  fs.writeFileSync(prs, JSON.stringify([{ title: "exact-cap-marker", url: "https://example.com/pr/1" }]));
+  for (const root of [dir, path.join(dir, "a.jsonl")]) {
+    const options = ["--root", root, "--root", empty, "--max-discovery-files", "1"];
+    const matches = JSON.parse(run(["find", "--query", "exact-cap-marker", ...options]));
+    assert.equal(matches.length, 1);
+    assert.match(run(["html", "--prs", prs, "--min-score", "1", ...options]), /exact-cap-marker/);
+  }
+});
+
+test("discovery shares its cap across roots and counts old JSONL files", () => {
+  const dir = tempDir();
+  const roots = ["a.jsonl", "b.jsonl"].map((name) => path.join(dir, name));
+  for (const file of roots) {
+    writeJsonl(file, [{ type: "user", message: { role: "user", content: "old-marker" } }]);
+    fs.utimesSync(file, new Date(0), new Date(0));
+  }
+  assert.throws(
+    () => run(["find", "--query", "old-marker", "--root", roots[0], "--root", roots[1], "--since-days", "1", "--max-discovery-files", "1"]),
+    (error) => /session discovery exceeded its file limit/.test(String(error.stderr)),
+  );
+});
+
+test("discovery rejects invalid and missing file limits", () => {
+  const dir = tempDir();
+  const prs = path.join(dir, "prs.json");
+  fs.writeFileSync(prs, "[]");
+  for (const value of ["1.5", "0", "-1", "NaN", "Infinity", "9007199254740992", null]) {
+    for (const command of [["find", "--query", "marker"], ["html", "--prs", prs]]) {
+      assert.throws(
+        () => run([...command, "--root", dir, "--max-discovery-files", ...(value === null ? [] : [value])]),
+        (error) => /--max-discovery-files must be a positive integer/.test(String(error.stderr)),
+      );
+    }
+  }
+});
+
+test("render retries short reads without losing complete source messages", () => {
+  const session = path.join(tempDir(), "session.jsonl");
+  writeJsonl(session, [
+    { type: "user", message: { role: "user", content: "First complete message" } },
+    { type: "assistant", message: { role: "assistant", content: "Second complete message" } },
+  ]);
+  const output = runWithLimitedReads(["render", "--session", session], session, 13);
+  assert.match(output, /First complete message/);
+  assert.match(output, /Second complete message/);
+  assert.match(output, /"sourceTruncated":false/);
+});
+
+test("bounded rendering retries both head and tail reads", () => {
+  const session = path.join(tempDir(), "session.jsonl");
+  const row = (content) => JSON.stringify({ type: "user", message: { role: "user", content } });
+  fs.writeFileSync(session, `${row("First complete message")}\n${"x".repeat(2048)}\n${row("Last complete message")}\n`);
+  const output = runWithLimitedReads(["render", "--session", session, "--max-read-bytes", "256"], session, 13);
+  assert.match(output, /First complete message/);
+  assert.match(output, /Last complete message/);
+  assert.match(output, /"sourceTruncated":true/);
+});
+
+test("find retries short reads before scoring a session", () => {
+  const root = tempDir();
+  const session = path.join(root, "session.jsonl");
+  writeJsonl(session, [{ type: "user", message: { role: "user", content: "tail-search-marker" } }]);
+  const output = runWithLimitedReads(["find", "--root", root, "--query", "tail-search-marker"], session, 13);
+  assert.equal(JSON.parse(output)[0]?.file, session);
+});
+
+test("render and discovery fail instead of treating unexpected EOF as complete input", () => {
+  const root = tempDir();
+  const session = path.join(root, "session.jsonl");
+  const first = JSON.stringify({ type: "user", message: { role: "user", content: "First complete message" } }) + "\n";
+  fs.writeFileSync(session, first + JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Last complete message" } }) + "\n");
+  for (const args of [["render", "--session", session], ["find", "--root", root, "--query", "First complete message"]]) {
+    assert.throws(
+      () => runWithLimitedReads(args, session, Buffer.byteLength(first), true),
+      (error) => error.status === 1 && error.stdout === "" && /ended before the expected read/.test(error.stderr),
+    );
+  }
+});
+
+test("copied agent-transcript runs inside a CommonJS project without dependencies", () => {
+  const root = tempDir();
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "commonjs" }));
+  const installed = path.join(root, "installed-transcript");
+  fs.cpSync(path.dirname(path.dirname(script)), installed, { recursive: true });
+  const output = execFileSync(process.execPath, [path.join(installed, "scripts", "agent-transcript"), "--help"], {
+    cwd: root, encoding: "utf8", stdio: "pipe",
+    env: { ...process.env, NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.match(output, /Usage:/);
 });
