@@ -57,6 +57,8 @@ class AutoreviewCursorTests(unittest.TestCase):
         for raw in ("[" * 2000 + "]" * 2000, '{"findings":[],"number":' + "9" * 10000 + "}"):
             with self.subTest(length=len(raw)), mock.patch.object(
                 AUTOREVIEW, "run_engine", return_value=raw,
+            ), mock.patch.object(
+                AUTOREVIEW, "scan_outgoing_review_pack",
             ):
                 with self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
                     AUTOREVIEW.run_reviewer(args, Path.cwd(), "synthetic", set(), [])
@@ -79,6 +81,8 @@ class AutoreviewCursorTests(unittest.TestCase):
                 owner[field] = value
                 with self.subTest(field=field, value=value), mock.patch.object(
                     AUTOREVIEW, "run_engine", return_value=json.dumps(report),
+                ), mock.patch.object(
+                    AUTOREVIEW, "scan_outgoing_review_pack",
                 ):
                     with self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
                         AUTOREVIEW.run_reviewer(args, Path.cwd(), "synthetic", {"draft.js"}, [])
@@ -387,7 +391,9 @@ class AutoreviewTargetResultTests(unittest.TestCase):
                     "overall_correctness": "patch is incorrect", "overall_confidence": 0.43}
         for engine in AUTOREVIEW.ENGINES:
             with self.subTest(engine=engine), mock.patch.object(AUTOREVIEW, "run_engine", return_value=json.dumps(provider)), \
-                    mock.patch.object(AUTOREVIEW, "verify_mixed_sources"), contextlib.redirect_stderr(io.StringIO()):
+                    mock.patch.object(AUTOREVIEW, "verify_mixed_sources"), \
+                    mock.patch.object(AUTOREVIEW, "scan_outgoing_review_pack"), \
+                    contextlib.redirect_stderr(io.StringIO()):
                 report = AUTOREVIEW.run_reviewer(argparse.Namespace(engine=engine, max_priority="P0"),
                                                  Path.cwd(), prompt, captured, [])
             self.assertEqual(report["provider_report"], provider)
@@ -1811,6 +1817,8 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     AUTOREVIEW, "load_kimi_review_config", return_value=({"telemetry": False}, None),
                 ), mock.patch.object(
                     AUTOREVIEW, "run_with_heartbeat", return_value=subprocess.CompletedProcess([], 0, stream, ""),
+                ), mock.patch.object(
+                    AUTOREVIEW, "scan_outgoing_review_pack",
                 ):
                     with self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
                         AUTOREVIEW.run_reviewer(args, repo, "synthetic pack", set(), [])

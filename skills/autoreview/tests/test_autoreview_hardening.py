@@ -179,6 +179,41 @@ print(json.dumps(report))
 '''
 
 
+def fake_trufflehog_script() -> str:
+    return r'''#!/usr/bin/env python3
+import sys
+
+expected = {
+    "--json",
+    "--no-color",
+    "--results=verified,unknown",
+    "--fail",
+    "--fail-on-scan-errors",
+}
+args = sys.argv[1:]
+if len(args) < 2 or args[0] != "filesystem" or not expected.issubset(args[2:]):
+    print("unexpected fake TruffleHog invocation", file=sys.stderr)
+    raise SystemExit(2)
+raise SystemExit(0)
+'''
+
+
+def install_fake_trufflehog(testcase: unittest.TestCase) -> None:
+    scanner_tempdir = tempfile.TemporaryDirectory(
+        prefix="autoreview-fake-scanner."
+    )
+    testcase.addCleanup(scanner_tempdir.cleanup)
+    scanner_bin = Path(scanner_tempdir.name) / "bin"
+    scanner_bin.mkdir()
+    write_executable(scanner_bin / "trufflehog", fake_trufflehog_script())
+    path_patch = mock.patch.dict(
+        os.environ,
+        {"PATH": f"{scanner_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+    )
+    path_patch.start()
+    testcase.addCleanup(path_patch.stop)
+
+
 def load_helper() -> dict[str, object]:
     return runpy.run_path(str(SCRIPT), run_name="autoreview_under_test")
 
@@ -271,6 +306,7 @@ def installed_java() -> str | None:
 
 class AutoreviewMixedTargetTests(unittest.TestCase):
     def setUp(self):
+        install_fake_trufflehog(self)
         self.helper = load_helper()
 
     @contextlib.contextmanager
@@ -934,6 +970,11 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
 class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
+        # Subprocess integration tests provide every external dependency in
+        # their fixture. This keeps a passing test independent of whether the
+        # host has TruffleHog installed while still exercising the production
+        # discovery and subprocess boundary.
+        install_fake_trufflehog(self)
         # Helper-level tests mock provider subprocesses and are not scanner
         # integration tests. Keep the restored send-boundary scan isolated
         # unless a test explicitly replaces this binding. Subprocess tests
@@ -6633,6 +6674,7 @@ PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_pro
 
 class AuthenticatedProxyTests(unittest.TestCase):
     def setUp(self):
+        install_fake_trufflehog(self)
         self.helper = load_helper()
 
     def test_authenticated_proxy_urls_are_transport_not_openclaw_provenance(self):
