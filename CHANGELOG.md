@@ -4,6 +4,7 @@
 
 **Highlights:** Authenticated proxy support for isolated reviews, explicit reviewer availability, and controlled session sharing.
 
+- Preflight Autoreview Git within 10 seconds, honor a trusted `AUTOREVIEW_GIT` override and macOS `DEVELOPER_DIR`, and accept absolute in-repository prompt files with existing evidence safeguards.
 - Reject unsupported GPT-6 Astra reasoning efforts before Autoreview preparation, document explicit invocation, and keep source instructions subordinate to the noninteractive review contract. Thanks @coygeek.
 - Support launcher-provided authenticated HTTP/SOCKS proxies in Autoreview, preserve external transport trust settings, and redact proxy credentials from diagnostics and reports without changing reviewer isolation. Thanks @fuller-stack-dev.
 - Fix Claude reviewer startup when the CLI truncates piped help output, while retaining mandatory isolation checks. Thanks @phyrexia.
