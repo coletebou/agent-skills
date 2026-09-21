@@ -53,6 +53,21 @@ merge_base=$(git merge-base HEAD "origin/$pr_base")
 "$AUTOREVIEW" --mode local --base "$merge_base"
 ```
 
+The helper refuses any target whose diff includes binary changes (images,
+fonts, archives) because their contents cannot be reviewed, and there is no
+path filter. To review the text half of such a branch, build a throwaway
+branch from the base that carries only the text files, and review that with
+`--mode branch`; say in `--prompt` that the binaries were reviewed separately:
+
+```bash
+git switch -c review/<branch>-text origin/master
+git diff --name-only origin/master <branch> | grep -v -E '\.(png|jpe?g|webp|ttf|otf|zip)$' \
+  | xargs git restore --source=<branch> --staged --worktree --
+git commit -m "review: text-only view of <branch>"
+"$AUTOREVIEW" --mode branch --base origin/master ...
+git switch <branch> && git branch -D review/<branch>-text
+```
+
 When a file has both staged and unstaged changes, both states are reviewed.
 A defect in the index remains actionable even if the working tree fixes it;
 the report labels it `INDEX-only`.
