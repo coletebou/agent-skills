@@ -484,7 +484,7 @@ class AutoreviewSingleEngineRoutingTests(unittest.TestCase):
     def test_explicit_aws_routes_keep_verified_model_defaults(self) -> None:
         for auth, model, effort in (
             ("bedrock", "global.anthropic.claude-fable-5-1[1m]", "high"),
-            ("mantle", "anthropic.claude-opus-5[1m]", "low"),
+            ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
         ):
             with self.subTest(auth=auth), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
                 sys, "argv", ["autoreview", "--engine", "claude", "--claude-auth", auth,
@@ -693,10 +693,10 @@ class AutoreviewSingleEngineRoutingTests(unittest.TestCase):
             [
                 ("global.anthropic.claude-fable-5-1[1m]", "high", "bedrock"),
                 ("global.anthropic.claude-fable-5-1[1m]", "high", "bedrock"),
-                ("anthropic.claude-opus-5[1m]", "max", "mantle"),
+                ("anthropic.claude-opus-5-5[1m]", "max", "mantle"),
             ],
         )
-        self.assertEqual(args.actual_model, "anthropic.claude-opus-5[1m]")
+        self.assertEqual(args.actual_model, "anthropic.claude-opus-5-5[1m]")
         self.assertEqual(args.actual_thinking, "max")
         self.assertEqual(args.actual_claude_auth, "mantle")
 
@@ -990,6 +990,573 @@ class AutoreviewRunHistoryTests(unittest.TestCase):
             clear=False,
         ), self.assertRaisesRegex(SystemExit, "invalid AUTOREVIEW_RUN_LOG_BUNDLE"):
             AUTOREVIEW.run_log_bundle_enabled(args)
+
+
+COMPLETE_REPORT = json.dumps({**FINAL_REPORT, "review_completion": "complete"})
+
+
+def route_reviewer(argv: list[str], env: dict[str, str] | None = None) -> argparse.Namespace:
+    with mock.patch.dict(os.environ, env or {}, clear=True), mock.patch.object(
+        sys, "argv", ["autoreview", *argv],
+    ):
+        return AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+
+
+def reviewer_failure(message: str, *, reason: str = "engine_failed", returncode: int = 1,
+                     timed_out: bool = False) -> AUTOREVIEW.ReviewerUnavailable:
+    result_type = AUTOREVIEW.TimedOutEngineProcess if timed_out else subprocess.CompletedProcess
+    return AUTOREVIEW.ReviewerUnavailable(
+        message, reason=reason, result=result_type(["engine"], returncode, "", ""),
+    )
+
+
+MANTLE_ENV = {
+    "AUTOREVIEW_CLAUDE_AUTH": "mantle",
+    "AUTOREVIEW_CLAUDE_BEDROCK_REGION": "us-east-1",
+    "AUTOREVIEW_CLAUDE_FALLBACK_AUTH": "subscription",
+}
+CLAUDE_MANTLE_ARGV = ["--engine", "claude", "--mode", "local"]
+CODEX_PROFILE_ARGV = [
+    "--engine", "codex", "--codex-profile", "autoreview-bedrock",
+    "--model", "openai.gpt-6-sol", "--thinking", "max",
+]
+
+
+class AutoreviewRouteFallbackTests(unittest.TestCase):
+    def route_engine(self, *outcomes: object) -> tuple[mock.Mock, list[tuple[object, ...]]]:
+        observed: list[tuple[object, ...]] = []
+        pending = list(outcomes)
+
+        def fake_run_engine(reviewer: argparse.Namespace, _repo: Path, _prompt: str) -> str:
+            observed.append((
+                AUTOREVIEW.reviewer_route(reviewer),
+                reviewer.model,
+                reviewer.thinking,
+            ))
+            outcome = pending.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return str(outcome)
+
+        return mock.Mock(side_effect=fake_run_engine), observed
+
+    def test_default_mantle_route_is_opus_5_5_xhigh(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        self.assertEqual(
+            (reviewer.claude_auth, reviewer.model, reviewer.thinking),
+            ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
+        )
+        bare = route_reviewer(
+            [*CLAUDE_MANTLE_ARGV, "--model", "claude-opus-5-5"], MANTLE_ENV,
+        )
+        self.assertEqual(bare.model, "anthropic.claude-opus-5-5")
+
+    def test_claude_mantle_failure_retries_subscription_with_derived_model(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        engine, observed = self.route_engine(
+            reviewer_failure("claude engine failed (1)\nsynthetic-provider-log token=abc"),
+            COMPLETE_REPORT,
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+            AUTOREVIEW, "scan_outgoing_review_pack",
+        ), contextlib.redirect_stderr(stderr):
+            result = AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+
+        self.assertTrue(result.complete)
+        self.assertEqual(observed, [
+            ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
+            ("subscription", "claude-opus-5-5", "xhigh"),
+        ])
+        self.assertIn(
+            "claude route mantle failed (engine_failed: claude engine failed (1)); "
+            "retrying on subscription with claude-opus-5-5",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("synthetic-provider-log", stderr.getvalue())
+        fallback = reviewer.route_fallback
+        self.assertIsNone(fallback.fallback_model)
+        self.assertIsNone(fallback.route_fallback)
+        self.assertEqual(reviewer.claude_auth, "mantle")
+
+    def test_claude_route_model_derivation(self) -> None:
+        cases = (
+            ("anthropic.claude-opus-5-5[1m]", "subscription", "claude-opus-5-5"),
+            ("global.anthropic.claude-fable-5-1[1m]", "subscription", "claude-fable-5-1"),
+            ("us.anthropic.claude-opus-5", "default", "claude-opus-5"),
+            ("us-gov.anthropic.claude-opus-5-5", "subscription", "claude-opus-5-5"),
+            ("claude-opus-5-5", "mantle", "anthropic.claude-opus-5-5"),
+            ("global.anthropic.claude-opus-5-5[1m]", "mantle", "anthropic.claude-opus-5-5[1m]"),
+            ("anthropic.claude-fable-5-1[1m]", "bedrock", "global.anthropic.claude-fable-5-1[1m]"),
+            ("custom-model", "mantle", "custom-model"),
+        )
+        for model, auth, expected in cases:
+            with self.subTest(model=model, auth=auth):
+                self.assertEqual(AUTOREVIEW.claude_route_model(model, auth), expected)
+
+    def test_codex_profile_fallback_drops_profile_and_provider_route(self) -> None:
+        reviewer = route_reviewer(
+            [*CODEX_PROFILE_ARGV, "--codex-fallback-auth", "chatgpt"],
+            {"AUTOREVIEW_CODEX_CONFIG": "model_verbosity=\"low\""},
+        )
+        fallback = reviewer.route_fallback
+        self.assertEqual(
+            (fallback.codex_auth, fallback.codex_profile, fallback.model, fallback.thinking),
+            ("chatgpt", None, "gpt-6-sol", "max"),
+        )
+        self.assertIsNone(fallback.fallback_model)
+        route = AUTOREVIEW.RunEvidence.reviewer_metadata(fallback)
+        self.assertEqual((route["auth"], route["profile"], route["output_schema"]),
+                         ("chatgpt", None, True))
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_CODEX_CONFIG": 'model_provider="review_api"'},
+            clear=True,
+        ):
+            self.assertEqual(AUTOREVIEW.codex_config_overrides(fallback), ['model_verbosity="low"'])
+
+        provider_primary = route_reviewer(
+            ["--engine", "codex", "--codex-config", 'model_provider="review_api"',
+             "--codex-config", 'model_verbosity="low"', "--codex-fallback-auth", "chatgpt"],
+        )
+        provider_fallback = provider_primary.route_fallback
+        self.assertEqual(provider_fallback.model, "gpt-5.6-sol")
+        self.assertEqual(provider_fallback.fallback_model, "gpt-5.6-terra")
+        self.assertNotIn("model_provider", AUTOREVIEW.codex_config_keys(provider_fallback))
+
+        env = {"OPENAI_API_KEY": "synthetic", "AWS_BEARER_TOKEN_BEDROCK": "synthetic"}
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-fallback.") as tmpdir, \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                mock.patch.object(AUTOREVIEW, "safe_engine_env",
+                                  side_effect=lambda *_a, **_k: dict(env)):
+            root = Path(tmpdir)
+            command = AUTOREVIEW.codex_command(
+                fallback, root, root, root, root / "schema.json", root / "out.json",
+                fallback.model, auth_config=[],
+            )
+            engine_env = AUTOREVIEW.codex_engine_env(fallback, root)
+        self.assertNotIn("--profile", command)
+        self.assertIn("--output-schema", command)
+        self.assertEqual(command[command.index("--model") + 1], "gpt-6-sol")
+        self.assertFalse(any(part.startswith("model_provider=") for part in command))
+        self.assertNotIn("OPENAI_API_KEY", engine_env)
+
+    @unittest.skipIf(os.name == "nt", "POSIX profile staging")
+    def test_codex_profile_failure_runs_chatgpt_route_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-codex.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            codex_home = root / "codex-home"
+            repo.mkdir()
+            codex_home.mkdir()
+            (codex_home / "autoreview-bedrock.config.toml").write_text(
+                'model = "openai.gpt-6-sol"\nmodel_provider = "amazon-bedrock"\n',
+                encoding="utf-8",
+            )
+            reviewer = route_reviewer(
+                CODEX_PROFILE_ARGV, {"AUTOREVIEW_CODEX_FALLBACK_AUTH": "chatgpt"},
+            )
+            reviewer.stream_engine_output = False
+            events: list[tuple[bool, str, bool]] = []
+
+            def fake_run(command, _cwd, **kwargs):
+                profile = "--profile" in command
+                events.append((
+                    profile,
+                    command[command.index("--model") + 1],
+                    "AWS_BEARER_TOKEN_BEDROCK" in kwargs["env"],
+                ))
+                if profile:
+                    return subprocess.CompletedProcess(
+                        command, 1, "", "HTTP 403 Forbidden synthetic-provider-log",
+                    )
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text(COMPLETE_REPORT, encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {
+                "AWS_BEARER_TOKEN_BEDROCK": "synthetic-bearer",
+                "CODEX_HOME": str(codex_home),
+                "HOME": str(root),
+                "PATH": os.environ.get("PATH", ""),
+            }, clear=True), mock.patch.object(
+                AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex",
+            ), mock.patch.object(
+                AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex",
+            ), mock.patch.object(
+                AUTOREVIEW, "codex_auth_config_flags", return_value=[],
+            ), mock.patch.object(
+                AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None,
+            ), mock.patch.object(
+                AUTOREVIEW, "safe_temp_root", return_value=root,
+            ), mock.patch.object(
+                AUTOREVIEW, "scan_outgoing_review_pack",
+            ), mock.patch.object(
+                AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run,
+            ), contextlib.redirect_stderr(stderr):
+                result = AUTOREVIEW.run_reviewer(reviewer, repo, "frozen", set(), [])
+
+        self.assertTrue(result.complete)
+        self.assertEqual(events, [
+            (True, "openai.gpt-6-sol", True),
+            (False, "gpt-6-sol", False),
+        ])
+        self.assertIn(
+            "codex route profile=autoreview-bedrock failed (engine_failed: codex engine failed: "
+            "provider-access; provider diagnostics suppressed); retrying on chatgpt with gpt-6-sol",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("synthetic-provider-log", stderr.getvalue())
+
+    def test_route_fallback_runs_after_same_route_refusal_policy(self) -> None:
+        refusal = subprocess.CompletedProcess(
+            ["claude"], 0, json.dumps({"terminal_reason": "model_refusal"}), "",
+        )
+        failure = subprocess.CompletedProcess(["claude"], 1, "", "synthetic-provider-log")
+        success = subprocess.CompletedProcess(["claude"], 0, COMPLETE_REPORT, "")
+        for primary_model, outcomes, expected in (
+            (
+                "anthropic.claude-fable-5-1[1m]",
+                [refusal, refusal, failure, success],
+                [
+                    ("mantle", "anthropic.claude-fable-5-1[1m]", "xhigh"),
+                    ("mantle", "anthropic.claude-fable-5-1[1m]", "xhigh"),
+                    ("mantle", "anthropic.claude-opus-5-5[1m]", "max"),
+                    ("subscription", "claude-fable-5-1", "xhigh"),
+                ],
+            ),
+            (
+                "anthropic.claude-opus-5-5[1m]",
+                [refusal, success],
+                [
+                    ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
+                    ("subscription", "claude-opus-5-5", "xhigh"),
+                ],
+            ),
+        ):
+            with self.subTest(model=primary_model):
+                reviewer = route_reviewer(
+                    [*CLAUDE_MANTLE_ARGV, "--model", primary_model], MANTLE_ENV,
+                )
+                observed: list[tuple[str, str, str]] = []
+                pending = list(outcomes)
+
+                def run_once(selected, _repo, _prompt):
+                    observed.append((selected.claude_auth, selected.model, selected.thinking))
+                    return pending.pop(0)
+
+                with mock.patch.object(
+                    AUTOREVIEW, "ensure_claude_isolation_supported",
+                ), mock.patch.object(
+                    AUTOREVIEW, "run_claude_once", side_effect=run_once,
+                ), mock.patch.object(
+                    AUTOREVIEW, "scan_outgoing_review_pack",
+                ), contextlib.redirect_stderr(io.StringIO()):
+                    result = AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+                self.assertTrue(result.complete)
+                self.assertEqual(observed, expected)
+
+    def test_no_route_fallback_when_unset_or_same_route(self) -> None:
+        for argv, env in (
+            (CLAUDE_MANTLE_ARGV, {**MANTLE_ENV, "AUTOREVIEW_CLAUDE_FALLBACK_AUTH": ""}),
+            ([*CLAUDE_MANTLE_ARGV, "--claude-auth", "subscription"], MANTLE_ENV),
+            (CODEX_PROFILE_ARGV, {}),
+            (["--engine", "codex", "--codex-auth", "chatgpt"],
+             {"AUTOREVIEW_CODEX_FALLBACK_AUTH": "chatgpt"}),
+            (["--engine", "pi"], {"AUTOREVIEW_CLAUDE_FALLBACK_AUTH": "subscription",
+                                  "AUTOREVIEW_CODEX_FALLBACK_AUTH": "chatgpt"}),
+        ):
+            with self.subTest(argv=argv):
+                reviewer = route_reviewer(argv, env)
+                self.assertIsNone(reviewer.route_fallback)
+                engine, observed = self.route_engine(reviewer_failure("engine failed (1)"))
+                with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+                    AUTOREVIEW, "scan_outgoing_review_pack",
+                ), self.assertRaises(AUTOREVIEW.ReviewerUnavailable):
+                    AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+                self.assertEqual(len(observed), 1)
+
+    def test_no_route_fallback_for_interrupt_scan_mutation_setup_or_verdict(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        self.assertIsNotNone(reviewer.route_fallback)
+        incomplete = json.dumps({**FINAL_REPORT, "review_completion": "incomplete"})
+        for label, outcome, expected in (
+            ("interrupt", AUTOREVIEW.EngineInterrupted(130), AUTOREVIEW.EngineInterrupted),
+            ("isolation", SystemExit("claude isolation probe failed"), SystemExit),
+        ):
+            with self.subTest(label=label):
+                engine, observed = self.route_engine(outcome)
+                with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+                    AUTOREVIEW, "scan_outgoing_review_pack",
+                ), self.assertRaises(expected) as caught:
+                    AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+                self.assertNotIsInstance(caught.exception, AUTOREVIEW.ReviewerUnavailable)
+                self.assertEqual(len(observed), 1)
+
+        engine, observed = self.route_engine(incomplete)
+        with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+            AUTOREVIEW, "scan_outgoing_review_pack",
+        ):
+            result = AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+        self.assertFalse(result.complete)
+        self.assertEqual(len(observed), 1)
+
+        engine, observed = self.route_engine(COMPLETE_REPORT)
+        with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+            AUTOREVIEW, "scan_outgoing_review_pack",
+            side_effect=SystemExit("refusing to send review pack: config.ts"),
+        ), self.assertRaisesRegex(SystemExit, "config.ts"):
+            AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+        self.assertEqual(observed, [])
+
+        engine, observed = self.route_engine(
+            reviewer_failure("claude engine failed (1)"), COMPLETE_REPORT,
+        )
+        with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+            AUTOREVIEW, "scan_outgoing_review_pack",
+        ), mock.patch.object(
+            AUTOREVIEW, "verify_evidence",
+            side_effect=[None, SystemExit("evidence changed after capture: notes.md")],
+        ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+        self.assertNotIsInstance(caught.exception, AUTOREVIEW.ReviewerUnavailable)
+        self.assertIn("evidence changed", str(caught.exception))
+        self.assertEqual(len(observed), 1)
+
+    def test_invalid_primary_report_and_timeout_trigger_route_fallback(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        for label, primary in (
+            ("empty", ""),
+            ("timeout", reviewer_failure("claude engine failed (124)", returncode=124, timed_out=True)),
+        ):
+            with self.subTest(label=label):
+                engine, observed = self.route_engine(primary, COMPLETE_REPORT)
+                stderr = io.StringIO()
+                with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+                    AUTOREVIEW, "scan_outgoing_review_pack",
+                ), contextlib.redirect_stderr(stderr):
+                    result = AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+                self.assertTrue(result.complete)
+                self.assertEqual(len(observed), 2)
+                expected = (
+                    "invalid_report: review engine returned empty output"
+                    if label == "empty"
+                    else "engine_failed: claude engine failed (124) (timed out)"
+                )
+                self.assertIn(f"claude route mantle failed ({expected})", stderr.getvalue())
+
+    def test_fallback_failure_surfaces_both_summaries_in_stable_envelope(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        engine, _observed = self.route_engine(
+            reviewer_failure("claude engine failed (1)\nsynthetic-primary-log"),
+            reviewer_failure(
+                "claude engine refused the requested model 'claude-opus-5-5'",
+                reason="model_refusal", returncode=0, timed_out=True,
+            ),
+        )
+        with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+            AUTOREVIEW, "scan_outgoing_review_pack",
+        ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(
+            AUTOREVIEW.ReviewerUnavailable,
+        ) as caught:
+            AUTOREVIEW.run_reviewer(reviewer, Path.cwd(), "frozen", set(), [])
+
+        failure = caught.exception
+        message = str(failure)
+        self.assertIn("refused the requested model 'claude-opus-5-5'", message)
+        self.assertIn(
+            "claude primary route mantle failed first: engine_failed: claude engine failed (1)",
+            message,
+        )
+        self.assertNotIn("synthetic-primary-log", message)
+        self.assertEqual((failure.reason, failure.returncode, failure.timed_out),
+                         ("model_refusal", 0, True))
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-status.") as tmpdir:
+            status_path = Path(tmpdir) / "status.json"
+            status_args = argparse.Namespace(status_output=str(status_path), engine="claude")
+            AUTOREVIEW.write_review_status(status_args, "reviewer_unavailable", 1, failure)
+            envelope = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(envelope, {
+            "schema_version": 1,
+            "status": "reviewer_unavailable",
+            "exit_code": 1,
+            "engine": "claude",
+            "report_produced": False,
+            "reason": "model_refusal",
+            "reviewer_exit_code": 0,
+            "timed_out": True,
+        })
+
+    def test_run_evidence_records_route_fallback_attempt(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        engine, _observed = self.route_engine(
+            reviewer_failure("claude engine failed (7)", returncode=7), COMPLETE_REPORT,
+        )
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-history.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            repo.mkdir()
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                AUTOREVIEW, "current_branch", return_value="main",
+            ), mock.patch.object(AUTOREVIEW, "git", return_value="abc123"):
+                evidence = AUTOREVIEW.RunEvidence(
+                    reviewer, repo, "local", None, [reviewer], root=root / "history",
+                )
+            reviewer.run_evidence = evidence
+            with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+                AUTOREVIEW, "scan_outgoing_review_pack",
+            ), contextlib.redirect_stderr(io.StringIO()):
+                AUTOREVIEW.run_reviewer(reviewer, repo, "frozen", set(), [])
+            metadata = json.loads(evidence.metadata_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(metadata["reviewers"][0]["route_fallback"], {
+            "auth": "subscription", "profile": None,
+            "model": "claude-opus-5-5", "thinking": "xhigh",
+        })
+        attempts = [
+            (attempt["reason"], attempt["status"], attempt["auth"], attempt["model"],
+             attempt["thinking"], attempt["returncode"])
+            for attempt in metadata["attempts"]
+        ]
+        self.assertEqual(attempts, [
+            ("primary", "failed", "mantle", "anthropic.claude-opus-5-5[1m]", "xhigh", 7),
+            ("route_fallback", "completed", "subscription", "claude-opus-5-5", "xhigh", 0),
+        ])
+        self.assertNotIn("region", metadata["attempts"][1])
+        self.assertFalse(metadata["attempts"][0]["refusal"])
+        run = metadata["reviewer_runs"][0]
+        self.assertEqual(
+            (run["status"], run["auth"], run["model"], run["thinking"]),
+            ("completed", "subscription", "claude-opus-5-5", "xhigh"),
+        )
+        self.assertNotIn("region", run)
+        self.assertEqual(run["route_fallback_from"], {
+            "route": "mantle", "model": "anthropic.claude-opus-5-5[1m]", "thinking": "xhigh",
+        })
+
+    def test_run_evidence_marks_primary_refusal_before_route_fallback(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        engine, _observed = self.route_engine(
+            reviewer_failure("claude engine refused the requested model", reason="model_refusal",
+                             returncode=0),
+            COMPLETE_REPORT,
+        )
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-refusal.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            repo.mkdir()
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                AUTOREVIEW, "current_branch", return_value="main",
+            ), mock.patch.object(AUTOREVIEW, "git", return_value="abc123"):
+                evidence = AUTOREVIEW.RunEvidence(
+                    reviewer, repo, "local", None, [reviewer], root=root / "history",
+                )
+            reviewer.run_evidence = evidence
+            with mock.patch.object(AUTOREVIEW, "run_engine", engine), mock.patch.object(
+                AUTOREVIEW, "scan_outgoing_review_pack",
+            ), contextlib.redirect_stderr(io.StringIO()):
+                AUTOREVIEW.run_reviewer(reviewer, repo, "frozen", set(), [])
+            metadata = json.loads(evidence.metadata_path.read_text(encoding="utf-8"))
+        first = metadata["attempts"][0]
+        self.assertEqual((first["status"], first["refusal"], first["returncode"]),
+                         ("refused", True, 0))
+        self.assertEqual(metadata["attempts"][1]["reason"], "route_fallback")
+
+    def test_later_passes_stay_on_exhausted_fallback_route(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+        engine, observed = self.route_engine(
+            reviewer_failure("claude engine failed (1)"), COMPLETE_REPORT, COMPLETE_REPORT,
+        )
+        with mock.patch.object(AUTOREVIEW, "run_engine", engine), contextlib.redirect_stderr(
+            io.StringIO(),
+        ), contextlib.redirect_stdout(io.StringIO()):
+            results = AUTOREVIEW.run_review_passes(
+                reviewer, [reviewer], Path.cwd(), ["pass one", "pass two"], set(),
+            )
+        self.assertEqual(len(results), 2)
+        self.assertEqual([route for route, _model, _thinking in observed],
+                         ["mantle", "subscription", "subscription"])
+
+    def test_env_and_explicit_fallback_models_override_derivation(self) -> None:
+        env_claude = route_reviewer(CLAUDE_MANTLE_ARGV, {
+            **MANTLE_ENV, "AUTOREVIEW_CLAUDE_FALLBACK_AUTH_MODEL": "claude-fable-5-1",
+        })
+        self.assertEqual(env_claude.route_fallback.model, "claude-fable-5-1")
+        flag_claude = route_reviewer(
+            [*CLAUDE_MANTLE_ARGV, "--claude-fallback-auth", "bedrock",
+             "--claude-fallback-auth-model", "global.anthropic.claude-opus-5-5"],  # gitleaks:allow (model id)
+            MANTLE_ENV,
+        )
+        self.assertEqual(
+            (flag_claude.route_fallback.claude_auth, flag_claude.route_fallback.model),
+            ("bedrock", "global.anthropic.claude-opus-5-5"),
+        )
+        env_codex = route_reviewer(CODEX_PROFILE_ARGV, {
+            "AUTOREVIEW_CODEX_FALLBACK_AUTH": "chatgpt",
+            "AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL": "gpt-6-astra",
+        })
+        self.assertEqual(
+            (env_codex.route_fallback.model, env_codex.route_fallback.thinking),
+            ("gpt-6-astra", "max"),
+        )
+        flag_codex = route_reviewer(
+            [*CODEX_PROFILE_ARGV, "--codex-fallback-auth=chatgpt",
+             "--codex-fallback-auth-model=gpt-5.6-sol"],
+        )
+        self.assertEqual(flag_codex.route_fallback.model, "gpt-5.6-sol")
+        self.assertEqual(flag_codex.route_fallback.fallback_model, "gpt-5.6-terra")
+
+    def test_route_fallback_configuration_errors_fail_before_review(self) -> None:
+        for argv, env, message in (
+            (["--engine", "codex", "--claude-fallback-auth", "subscription"], {},
+             "--claude-fallback-auth is only supported for claude"),
+            ([*CLAUDE_MANTLE_ARGV, "--codex-fallback-auth", "chatgpt"], MANTLE_ENV,
+             "--codex-fallback-auth is only supported for codex"),
+            ([*CLAUDE_MANTLE_ARGV, "--claude-fallback-auth-model", "claude-opus-5-5"],
+             {**MANTLE_ENV, "AUTOREVIEW_CLAUDE_FALLBACK_AUTH": ""},
+             "requires --claude-fallback-auth"),
+            (["--engine", "claude", "--claude-fallback-auth", "mantle"], {},
+             "Claude Mantle auth requires"),
+            (["--engine", "codex", "--codex-profile", "autoreview-bedrock",
+              "--codex-fallback-auth", "chatgpt"], {},
+             "needs a model when the Codex profile selects it"),
+            ([*CODEX_PROFILE_ARGV[:-2], "--thinking", "minimal",
+              "--codex-fallback-auth-model", "gpt-6-astra"],
+             {"AUTOREVIEW_CODEX_FALLBACK_AUTH": "chatgpt"},
+             "invalid thinking level for codex model gpt-6-astra"),
+            (["--engine", "claude"], {"AUTOREVIEW_CLAUDE_FALLBACK_AUTH": "api"},
+             "invalid Claude fallback auth mode"),
+        ):
+            with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, message):
+                route_reviewer(argv, env)
+
+    def test_dry_run_checks_route_fallback_startup(self) -> None:
+        reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
+
+        def resolve(selected, _repo):
+            if selected.claude_auth == "subscription":
+                return False, "claude subscription login missing"
+            return True, None
+
+        stdout = io.StringIO()
+        with mock.patch.object(
+            AUTOREVIEW, "capture_evidence_inputs", side_effect=SystemExit("synthetic"),
+        ), mock.patch.object(
+            AUTOREVIEW, "build_bundle", side_effect=SystemExit("synthetic"),
+        ), mock.patch.object(
+            AUTOREVIEW, "resolve_engine_binary", side_effect=resolve,
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            status = AUTOREVIEW.dry_run_preflight(reviewer, [reviewer], Path.cwd(), "local", None)
+        self.assertEqual(status, 1)
+        self.assertIn("engine check: claude model=anthropic.claude-opus-5-5[1m] thinking=xhigh OK",
+                      stdout.getvalue())
+        self.assertIn(
+            "route fallback check: claude auth=subscription model=claude-opus-5-5 thinking=xhigh "
+            "UNAVAILABLE (claude subscription login missing)",
+            stdout.getvalue(),
+        )
 
 
 class AutoreviewSecretScannerTests(unittest.TestCase):

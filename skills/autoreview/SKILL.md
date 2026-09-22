@@ -199,13 +199,41 @@ enter the isolated reviewer runtime; hooks, tools, and trust settings do not.
 Claude accepts `--claude-auth default`, `subscription`, `bedrock`, or `mantle`
 and `--claude-bedrock-region`. Bedrock Runtime and Mantle have different model
 availability; select the model ID and region that work on the chosen route.
+Mantle defaults to `anthropic.claude-opus-5-5[1m]` at `xhigh`; Bedrock Runtime
+to `global.anthropic.claude-fable-5-1[1m]` at `high`.
 Explicit auth routes require Claude CLI 2.1.237 or newer.
 
 The retained Fable refusal policy retries a model-refusal result once in a
 fresh Claude session. Only after a second refusal, the same engine may retry
-Opus 5 at max effort (through Mantle for Bedrock or Mantle callers). Other
+Opus 5.5 at max effort (through Mantle for Bedrock or Mantle callers). Other
 failures and non-Fable refusals do not trigger this model switch. Each attempt
 and route change is recorded in private run history.
+
+Route fallback is opt-in and off when unset. After the primary route is
+exhausted (including the retries above) and the reviewer is unavailable —
+engine failure, auth or entitlement failure, unavailable model, any model
+refusal, invalid or empty report, or timeout — the helper retries the same
+frozen prompt once on another route:
+
+- `--claude-fallback-auth` / `AUTOREVIEW_CLAUDE_FALLBACK_AUTH`: `subscription`,
+  `mantle`, `bedrock`, or `default`.
+- `--claude-fallback-auth-model` / `AUTOREVIEW_CLAUDE_FALLBACK_AUTH_MODEL`:
+  defaults to the primary model adapted to the route; subscription strips the
+  provider prefix and `[1m]` (`anthropic.claude-opus-5-5[1m]` → `claude-opus-5-5`).
+- `--codex-fallback-auth` / `AUTOREVIEW_CODEX_FALLBACK_AUTH`: `chatgpt`.
+- `--codex-fallback-auth-model` / `AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL`:
+  defaults to the primary model without `openai.` (`openai.gpt-6-sol` → `gpt-6-sol`).
+
+The fallback keeps the primary thinking level (validated for the fallback
+model). The Codex fallback drops `--codex-profile` and any `model_provider`
+override and uses the same ChatGPT-auth isolation as `--codex-auth chatgpt`; a
+profile-selected model needs `--model` or an explicit fallback model. A
+fallback equal to the primary route is ignored. Interrupts, source or evidence
+changes, pre-send scan refusals, setup and isolation errors, and completed
+reviews never fall back. Later review passes stay on the fallback route. A
+failed fallback reports its own failure plus a one-line primary summary. Run
+history records a `route_fallback` attempt; the status sidecar is unchanged.
+Dry runs also check the fallback route's startup.
 
 For two independent opinions, run two invocations with `--engine codex` and
 `--engine claude`, using the same pinned Git scope and unchanged source, in

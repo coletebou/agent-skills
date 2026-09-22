@@ -393,8 +393,20 @@ DEFAULT_MODEL_BY_ENGINE = {
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
 DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-fable-5-1[1m]"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "high"
-DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-5[1m]"
-DEFAULT_CLAUDE_MANTLE_THINKING = "low"
+DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-5-5[1m]"
+DEFAULT_CLAUDE_MANTLE_THINKING = "xhigh"
+# Canonical Claude ids that AWS routes address with a provider prefix.
+CLAUDE_AWS_PREFIXED_MODELS = frozenset(
+    {"claude-fable-5", "claude-fable-5-1", "claude-opus-5", "claude-opus-5-5"}
+)
+CLAUDE_PROVIDER_MODEL_PREFIXES = (
+    "global.anthropic.",
+    "us-gov.anthropic.",
+    "us.anthropic.",
+    "anthropic.",
+)
+CLAUDE_AUTH_MODES = ("default", "subscription", "bedrock", "mantle")
+CODEX_FALLBACK_AUTH_MODES = ("chatgpt",)
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
@@ -5416,9 +5428,13 @@ SAFE_CODEX_CONFIG_KEYS = {
 
 
 def codex_config_overrides(args: argparse.Namespace) -> list[str]:
-    raw = list(getattr(args, "codex_config", None) or [])
-    if not raw:
-        raw = os.environ.get("AUTOREVIEW_CODEX_CONFIG", "").split(";")
+    configured = getattr(args, "codex_config", None)
+    # An explicit empty list (a route-fallback clone) must not re-read the env.
+    raw = (
+        list(configured)
+        if configured is not None
+        else os.environ.get("AUTOREVIEW_CODEX_CONFIG", "").split(";")
+    )
     overrides: list[str] = []
     for item in raw:
         item = item.strip()
@@ -5805,9 +5821,9 @@ def claude_refusal_fallback_args(args: argparse.Namespace) -> argparse.Namespace
     fallback.fallback_model = None
     if claude_auth_mode(args) in {"bedrock", "mantle"}:
         fallback.claude_auth = "mantle"
-        fallback.model = "anthropic.claude-opus-5[1m]"
+        fallback.model = "anthropic.claude-opus-5-5[1m]"
     else:
-        fallback.model = "claude-opus-5"
+        fallback.model = "claude-opus-5-5"
     return fallback
 
 
@@ -7201,6 +7217,19 @@ def parse_args() -> argparse.Namespace:
         argument == "--claude-auth" or argument.startswith("--claude-auth=")
         for argument in sys.argv[1:]
     )
+    explicit_route_fallback_options = {
+        option
+        for option in (
+            "--claude-fallback-auth",
+            "--claude-fallback-auth-model",
+            "--codex-fallback-auth",
+            "--codex-fallback-auth-model",
+        )
+        if any(
+            argument == option or argument.startswith(f"{option}=")
+            for argument in sys.argv[1:]
+        )
+    }
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
@@ -7245,12 +7274,34 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("AUTOREVIEW_CODEX_PROFILE", "").strip() or None,
         help="Stage a capability-free top-level NAME.config.toml Amazon Bedrock profile. Env: AUTOREVIEW_CODEX_PROFILE.",
     )
+    parser.add_argument(
+        "--codex-fallback-auth",
+        choices=CODEX_FALLBACK_AUTH_MODES,
+        default=os.environ.get("AUTOREVIEW_CODEX_FALLBACK_AUTH", "").strip() or None,
+        help="Retry once on this Codex auth route after the primary route is unavailable. Unset disables route fallback. Env: AUTOREVIEW_CODEX_FALLBACK_AUTH.",
+    )
+    parser.add_argument(
+        "--codex-fallback-auth-model",
+        default=os.environ.get("AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL", "").strip() or None,
+        help="Codex route-fallback model. Default: the primary model without an openai. prefix. Env: AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL.",
+    )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument(
         "--claude-auth",
         choices=["default", "subscription", "bedrock", "mantle"],
         default=os.environ.get("AUTOREVIEW_CLAUDE_AUTH", "default"),
         help="Claude auth route. Bedrock and Mantle isolate competing provider settings. Env: AUTOREVIEW_CLAUDE_AUTH.",
+    )
+    parser.add_argument(
+        "--claude-fallback-auth",
+        choices=CLAUDE_AUTH_MODES,
+        default=os.environ.get("AUTOREVIEW_CLAUDE_FALLBACK_AUTH", "").strip() or None,
+        help="Retry once on this Claude auth route after the primary route is unavailable. Unset disables route fallback. Env: AUTOREVIEW_CLAUDE_FALLBACK_AUTH.",
+    )
+    parser.add_argument(
+        "--claude-fallback-auth-model",
+        default=os.environ.get("AUTOREVIEW_CLAUDE_FALLBACK_AUTH_MODEL", "").strip() or None,
+        help="Claude route-fallback model. Default: the primary model adapted to the fallback route. Env: AUTOREVIEW_CLAUDE_FALLBACK_AUTH_MODEL.",
     )
     parser.add_argument(
         "--claude-bedrock-region",
@@ -7317,6 +7368,7 @@ def parse_args() -> argparse.Namespace:
     args.codex_auth_explicit = codex_auth_explicit
     args.codex_profile_explicit = codex_profile_explicit
     args.claude_auth_explicit = claude_auth_explicit
+    args.route_fallback_explicit = explicit_route_fallback_options
     if args.engine not in ENGINES:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
     return args
@@ -7440,7 +7492,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     if (
         engine == "claude"
         and claude_auth in {"bedrock", "mantle"}
-        and model in {"claude-fable-5", "claude-fable-5-1", "claude-opus-5"}
+        and model in CLAUDE_AWS_PREFIXED_MODELS
     ):
         prefix = "anthropic." if claude_auth == "mantle" else "global.anthropic."
         model = f"{prefix}{model}"
@@ -7474,6 +7526,17 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
     else:
         fallback_model = None
+    validate_thinking_level(engine, model, thinking)
+    clone = copy.copy(args)
+    clone.model = model
+    clone.thinking = thinking
+    clone.fallback_model = fallback_model
+    clone.tools = False if engine in {"amp", "pi", "kimi"} else args.tools
+    clone.route_fallback = route_fallback_template(clone)
+    return [clone]
+
+
+def validate_thinking_level(engine: str, model: str | None, thinking: str | None) -> None:
     thinking_levels = THINKING_LEVELS_BY_ENGINE[engine]
     thinking_target = engine
     if engine == "codex" and model == "gpt-6-astra":
@@ -7482,12 +7545,91 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     if thinking and thinking not in thinking_levels:
         valid = ", ".join(sorted(thinking_levels)) or "none"
         raise SystemExit(f"invalid thinking level for {thinking_target}: {thinking} (valid: {valid})")
-    clone = copy.copy(args)
-    clone.model = model
-    clone.thinking = thinking
-    clone.fallback_model = fallback_model
-    clone.tools = False if engine in {"amp", "pi", "kimi"} else args.tools
-    return [clone]
+
+
+def claude_route_model(model: str, auth: str) -> str:
+    """Adapt a Claude model id to the id form the target auth route expects."""
+    bare = model
+    for prefix in CLAUDE_PROVIDER_MODEL_PREFIXES:
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    if auth in {"subscription", "default"}:
+        return bare.removesuffix("[1m]")
+    if bare.removesuffix("[1m]") not in CLAUDE_AWS_PREFIXED_MODELS:
+        return model
+    return f"{'anthropic.' if auth == 'mantle' else 'global.anthropic.'}{bare}"
+
+
+def reviewer_route(reviewer: argparse.Namespace) -> str:
+    if reviewer.engine == "codex":
+        profile = codex_profile_name(reviewer)
+        return f"profile={profile}" if profile is not None else codex_auth_mode(reviewer)
+    return claude_auth_mode(reviewer)
+
+
+def route_fallback_template(primary: argparse.Namespace) -> argparse.Namespace | None:
+    """Build the single cross-route retry reviewer, or None when not configured."""
+    engine = primary.engine
+    explicit = getattr(primary, "route_fallback_explicit", None) or set()
+    for option in sorted(explicit):
+        owner = "claude" if option.startswith("--claude-") else "codex"
+        if engine != owner:
+            raise SystemExit(f"{option} is only supported for {owner}")
+    if engine not in {"claude", "codex"}:
+        return None
+    raw_auth = getattr(primary, f"{engine}_fallback_auth", None)
+    explicit_model = (getattr(primary, f"{engine}_fallback_auth_model", None) or "").strip() or None
+    auth = (raw_auth or "").strip().lower() or None
+    if auth is None:
+        if f"--{engine}-fallback-auth-model" in explicit:
+            raise SystemExit(f"--{engine}-fallback-auth-model requires --{engine}-fallback-auth")
+        return None
+    valid = CLAUDE_AUTH_MODES if engine == "claude" else CODEX_FALLBACK_AUTH_MODES
+    if auth not in valid:
+        raise SystemExit(
+            f"invalid {engine.title()} fallback auth mode: {auth!r} (valid: {', '.join(valid)})"
+        )
+    fallback = copy.copy(primary)
+    if engine == "claude":
+        if auth == claude_auth_mode(primary):
+            return None
+        if auth in {"bedrock", "mantle"}:
+            claude_bedrock_region(primary, "Mantle" if auth == "mantle" else "Bedrock")
+        model = explicit_model or claude_route_model(primary.model, auth)
+        fallback.claude_auth = auth
+        fallback.fallback_model = None
+    else:
+        if auth == codex_auth_mode(primary):
+            return None
+        model = explicit_model or (primary.model or "").removeprefix("openai.") or None
+        if model is None:
+            raise SystemExit(
+                "--codex-fallback-auth needs a model when the Codex profile selects it; "
+                "set --model, AUTOREVIEW_CODEX_MODEL, or --codex-fallback-auth-model"
+            )
+        # ChatGPT auth and a Bedrock profile or provider selector are exclusive.
+        fallback.codex_auth = auth
+        fallback.codex_profile = None
+        fallback.codex_config = [
+            override
+            for override in codex_config_overrides(primary)
+            if override.partition("=")[0].strip() != "model_provider"
+        ]
+        fallback.fallback_model = (
+            DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
+            if model == DEFAULT_MODEL_BY_ENGINE["codex"]
+            else None
+        )
+    validate_thinking_level(engine, model, primary.thinking)
+    fallback.model = model
+    fallback.route_fallback = None
+    fallback.route_fallback_origin = {
+        "route": reviewer_route(primary),
+        "model": primary.model,
+        "thinking": primary.thinking,
+    }
+    return fallback
 
 
 def run_log_enabled(args: argparse.Namespace) -> bool:
@@ -7628,7 +7770,7 @@ class RunEvidence:
                 "web_search": bool(args.web_search),
                 "parallel_tests": False,
             },
-            "reviewers": [self.reviewer_metadata(reviewer) for reviewer in reviewers],
+            "reviewers": [self.configured_reviewer_metadata(reviewer) for reviewer in reviewers],
             "reviewer_runs": [],
             "attempts": [],
         }
@@ -7668,6 +7810,17 @@ class RunEvidence:
             )
             if metadata["auth"] in {"bedrock", "mantle"}:
                 metadata["region"] = claude_bedrock_region(reviewer, str(metadata["auth"]).title())
+        return metadata
+
+    @classmethod
+    def configured_reviewer_metadata(cls, reviewer: argparse.Namespace) -> dict[str, Any]:
+        metadata = cls.reviewer_metadata(reviewer)
+        fallback = getattr(reviewer, "route_fallback", None)
+        if isinstance(fallback, argparse.Namespace):
+            route = cls.reviewer_metadata(fallback)
+            metadata["route_fallback"] = {
+                key: route.get(key) for key in ("auth", "profile", "model", "thinking")
+            }
         return metadata
 
     def persist_locked(self) -> None:
@@ -7722,6 +7875,10 @@ class RunEvidence:
                     },
                 }
             )
+            origin = getattr(reviewer, "route_fallback_origin", None)
+            if origin is not None:
+                # A later pass after the primary route was exhausted.
+                run["route_fallback_from"] = dict(origin)
             self.data["reviewer_runs"].append(run)
             index = len(self.data["reviewer_runs"]) - 1
             reviewer.run_evidence_reviewer_index = index
@@ -7729,7 +7886,7 @@ class RunEvidence:
                 index,
                 reviewer,
                 model=reviewer.model,
-                reason="primary",
+                reason="primary" if origin is None else "route_fallback",
                 pass_index=pass_index,
             )
             self.persist_locked()
@@ -7788,6 +7945,39 @@ class RunEvidence:
             )
             self.persist_locked()
 
+    def transition_route_fallback(
+        self,
+        reviewer_index: int,
+        fallback: argparse.Namespace,
+        *,
+        returncode: int | None,
+        refusal: bool = False,
+    ) -> None:
+        with self.lock:
+            reviewer_run = self.data["reviewer_runs"][reviewer_index]
+            self.finish_attempt_locked(
+                reviewer_index,
+                status="refused" if refusal else "failed",
+                returncode=returncode,
+                refusal=refusal,
+            )
+            self.start_attempt_locked(
+                reviewer_index,
+                fallback,
+                model=fallback.model,
+                reason="route_fallback",
+                pass_index=int(reviewer_run["pass"]),
+            )
+            route = self.reviewer_metadata(fallback)
+            for key in ("region",):
+                if key not in route:
+                    reviewer_run.pop(key, None)
+            reviewer_run.update(route)
+            reviewer_run["route_fallback_from"] = dict(
+                getattr(fallback, "route_fallback_origin", None) or {}
+            )
+            self.persist_locked()
+
     def transition_claude_attempt(
         self,
         reviewer_index: int,
@@ -7828,7 +8018,7 @@ class RunEvidence:
         reviewer_index: int,
         *,
         status: str,
-        returncode: int,
+        returncode: int | None,
         refusal: bool = False,
     ) -> None:
         attempt_index = self.active_attempt_by_reviewer.pop(reviewer_index, None)
@@ -7983,6 +8173,15 @@ def reviewer_label(args: argparse.Namespace) -> str:
     thinking = getattr(args, "actual_thinking", None) or args.thinking
     if thinking:
         parts.append(f"thinking={thinking}")
+    return " ".join(parts)
+
+
+def route_fallback_label(fallback: argparse.Namespace) -> str:
+    parts = [f"auth={reviewer_route(fallback)}"]
+    if fallback.model:
+        parts.append(f"model={fallback.model}")
+    if fallback.thinking:
+        parts.append(f"thinking={fallback.thinking}")
     return " ".join(parts)
 
 
@@ -8213,8 +8412,39 @@ def dry_run_preflight(
         else:
             ok = False
             print(f"engine check: {label} UNAVAILABLE ({reason})")
+        route_fallback = getattr(reviewer, "route_fallback", None)
+        if route_fallback is None:
+            continue
+        with PreparationProgress("route fallback isolation preflight"):
+            available, reason = resolve_engine_binary(route_fallback, repo)
+        label = f"{route_fallback.engine} {route_fallback_label(route_fallback)}"
+        if available:
+            print(f"route fallback check: {label} OK")
+        else:
+            ok = False
+            print(f"route fallback check: {label} UNAVAILABLE ({reason})")
 
     return 0 if ok else 1
+
+
+def route_fallback_reviewer(args: argparse.Namespace) -> argparse.Namespace | None:
+    template = getattr(args, "route_fallback", None)
+    if not isinstance(template, argparse.Namespace):
+        return None
+    fallback = copy.copy(template)
+    for attribute in ("run_evidence", "run_evidence_reviewer_index"):
+        if hasattr(args, attribute):
+            setattr(fallback, attribute, getattr(args, attribute))
+    return fallback
+
+
+def route_failure_summary(failure: ReviewerUnavailable) -> str:
+    """One bounded line: never the captured provider diagnostics that follow."""
+    lines = str(failure.code or "").splitlines()
+    summary = f"{failure.reason}: {lines[0] if lines else 'no detail'}"
+    if failure.timed_out:
+        summary += " (timed out)"
+    return display_escape(summary, 300)
 
 
 def run_reviewer(
@@ -8244,25 +8474,65 @@ def run_reviewer(
         if isinstance(run_evidence, RunEvidence)
         else None
     )
+
+    def attempt(reviewer: argparse.Namespace) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        raw = run_engine(reviewer, repo, outgoing)
+        try:
+            report = extract_json(raw)
+            completion = report.pop("review_completion", None)
+            if not isinstance(completion, str) or completion not in {"complete", "incomplete"}:
+                raise SystemExit("review engine returned missing or invalid review_completion")
+            provider_report = copy.deepcopy(report)
+            validate_report(report, repo, paths, [], mixed, available)
+        except (SystemExit, ValueError, RecursionError) as exc:
+            # Only parsing/schema validation is inside this boundary. Scanner,
+            # isolation, attribution refusals, and required-finding gates stay distinct.
+            raise ReviewerUnavailable(str(exc), reason="invalid_report") from None
+        return report, completion, provider_report
+
     try:
-        raw = run_engine(args, repo, outgoing)
+        try:
+            report, completion, provider_report = attempt(args)
+        except ReviewerUnavailable as primary_failure:
+            fallback = route_fallback_reviewer(args)
+            if fallback is None:
+                raise
+            # Same-route retries already ran inside the engine; the primary
+            # route is exhausted. Refuse a resend if inputs moved meanwhile.
+            with PreparationProgress("evidence verification"):
+                verify_evidence(repo, evidence or [])
+                verify_mixed_sources(repo, mixed)
+            primary_summary = route_failure_summary(primary_failure)
+            if isinstance(run_evidence, RunEvidence) and evidence_index is not None:
+                run_evidence.transition_route_fallback(
+                    evidence_index, fallback, returncode=primary_failure.returncode,
+                    refusal=primary_failure.reason == "model_refusal",
+                )
+            print(
+                display_escape(
+                    f"{args.engine} route {reviewer_route(args)} failed ({primary_summary}); "
+                    f"retrying on {reviewer_route(fallback)} with {fallback.model}",
+                    1000,
+                ),
+                file=sys.stderr,
+            )
+            try:
+                report, completion, provider_report = attempt(fallback)
+            except ReviewerUnavailable as fallback_failure:
+                combined = ReviewerUnavailable(
+                    f"{fallback_failure.code}\n"
+                    f"{args.engine} primary route {reviewer_route(args)} failed first: {primary_summary}",
+                    reason=fallback_failure.reason,
+                )
+                combined.returncode = fallback_failure.returncode
+                combined.timed_out = fallback_failure.timed_out
+                raise combined from None
+            # Later passes skip the exhausted primary route.
+            args.route_fallback_engaged = fallback
     except BaseException as exc:
         if isinstance(run_evidence, RunEvidence) and evidence_index is not None:
             run_evidence.finish_reviewer(evidence_index, status="failed", error=str(exc))
         raise
-    try:
-        report = extract_json(raw)
-        completion = report.pop("review_completion", None)
-        if not isinstance(completion, str) or completion not in {"complete", "incomplete"}:
-            raise SystemExit("review engine returned missing or invalid review_completion")
-        provider_report = copy.deepcopy(report)
-        validate_report(report, repo, paths, [], mixed, available)
-    except (SystemExit, ValueError, RecursionError) as exc:
-        if isinstance(run_evidence, RunEvidence) and evidence_index is not None:
-            run_evidence.finish_reviewer(evidence_index, status="failed", error=str(exc))
-        # Only parsing/schema validation is inside this boundary. Scanner,
-        # isolation, attribution refusals, and required-finding gates stay distinct.
-        raise ReviewerUnavailable(str(exc), reason="invalid_report") from None
     try:
         filter_findings_by_priority(report, args.max_priority)
         report["provider_report"] = provider_report
@@ -8360,6 +8630,7 @@ def run_review_passes(
     evidence: list[EvidenceFile] | None = None,
 ) -> list[tuple[str, ReviewResult]]:
     chunk_reports: list[tuple[str, ReviewResult]] = []
+    reviewer = reviewers[0]
     for index, prompt in enumerate(prompts, start=1):
         if len(prompts) > 1:
             print(
@@ -8367,7 +8638,7 @@ def run_review_passes(
                 f"({utf8_size(prompt.prompt if isinstance(prompt, ReviewPass) else prompt)} prompt bytes)"
             )
         chunk_report = run_reviewer(
-            reviewers[0],
+            reviewer,
             repo,
             prompt,
             changed_paths,
@@ -8377,6 +8648,7 @@ def run_review_passes(
             input_scanned=True,
         )
         chunk_reports.append((f"chunk {index}/{len(prompts)}", chunk_report))
+        reviewer = getattr(reviewer, "route_fallback_engaged", None) or reviewer
     return chunk_reports
 
 
@@ -8493,6 +8765,9 @@ def main_impl() -> int:
         print(f"fallback_model: {reviewer.fallback_model}", flush=True)
     if reviewer.thinking:
         print(f"thinking: {reviewer.thinking}", flush=True)
+    route_fallback = getattr(reviewer, "route_fallback", None)
+    if route_fallback is not None:
+        print(f"route_fallback: {route_fallback_label(route_fallback)}", flush=True)
     if reviewer.engine == "codex":
         config_keys = codex_config_keys(reviewer)
         if config_keys:
