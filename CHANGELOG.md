@@ -2,10 +2,15 @@
 
 ## Unreleased
 
-**Highlights:** Authenticated proxy support for isolated reviews, explicit reviewer availability, and controlled session sharing.
+## 0.1.0 - 2026-09-22
 
+**Highlights:** Safer Git collection and installation, explicit review completion, and reusable review and session workflows.
+
+- Prevent checkout-controlled Git execution during Autoreview PR-base discovery and collection; refuse executable conversion before review while preserving local diffs that need no converter and committed branch/commit reviews.
+- Refuse installer destinations that overlap source skills before any mutation, preventing recursive installs and source deletion with `--force`.
+- Keep unfinished Autoreview assessments incomplete while retaining validated provider observations and existing public report contracts. Thanks @vincentkoc.
 - Preflight Autoreview Git within 10 seconds, honor a trusted `AUTOREVIEW_GIT` override and macOS `DEVELOPER_DIR`, and accept absolute in-repository prompt files with existing evidence safeguards.
-- Reject unsupported GPT-6 Astra reasoning efforts before Autoreview preparation, document explicit invocation, and keep source instructions subordinate to the noninteractive review contract. Thanks @coygeek.
+- Validate requested reasoning levels before Autoreview preparation and keep source instructions subordinate to the noninteractive review contract. Thanks @coygeek.
 - Support launcher-provided authenticated HTTP/SOCKS proxies in Autoreview, preserve external transport trust settings, and redact proxy credentials from diagnostics and reports without changing reviewer isolation. Thanks @fuller-stack-dev.
 - Fix Claude reviewer startup when the CLI truncates piped help output, while retaining mandatory isolation checks. Thanks @phyrexia.
 - Add opt-in Autoreview `--status-output` to distinguish unavailable reviewers from clean, adverse, filtered, and incomplete reviews without changing existing report JSON or exit codes. Thanks @coygeek.

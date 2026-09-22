@@ -68,6 +68,56 @@ class InstallSkillsTest(unittest.TestCase):
             self.assertTrue((target / "sample" / "SKILL.md").exists())
             self.assertTrue((repo / "skills" / "sample" / "SKILL.md").exists())
 
+    def test_install_rejects_target_inside_source_before_mutating(self) -> None:
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                repo = self.make_repo(Path(tmp))
+                source = repo / "skills" / "sample"
+                target = source / "installed"
+                args = ["--target", str(target), "--force", "sample"]
+                if dry_run:
+                    args.insert(0, "--dry-run")
+                result = self.run_installer(repo, *args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("overlaps source", result.stderr)
+                self.assertFalse(target.exists())
+                self.assertTrue((source / "SKILL.md").is_file())
+
+    def test_force_rejects_target_containing_source_before_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root, ("repo",))
+            result = self.run_installer(repo, "--target", str(root), "--force", "repo")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("overlaps source", result.stderr)
+            self.assertFalse(repo.is_symlink())
+            self.assertTrue((repo / "skills" / "repo" / "SKILL.md").is_file())
+
+    def test_install_checks_all_destinations_before_creating_any(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root, ("alpha", "repo"))
+            result = self.run_installer(repo, "--target", str(root), "--force")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertFalse((root / "alpha").exists())
+            self.assertTrue((repo / "skills" / "repo" / "SKILL.md").is_file())
+
+    def test_install_resolves_target_parent_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self.make_repo(root)
+            alias = root / "alias"
+            try:
+                alias.symlink_to(repo / "skills" / "sample", target_is_directory=True)
+            except OSError as error:
+                if os.name == "nt":
+                    self.skipTest(f"symlink creation unavailable: {error}")
+                raise
+            result = self.run_installer(repo, "--target", str(alias / "nested"), "sample")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("overlaps source", result.stderr)
+            self.assertFalse((alias / "nested").exists())
+
     def test_list_is_sorted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = self.make_repo(Path(tmp), ("zeta", "alpha"))

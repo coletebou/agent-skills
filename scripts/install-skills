@@ -74,6 +74,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     target_root = Path(args.target).expanduser().absolute()
+    sources = [skills_root.resolve(), *(skills_root.joinpath(name).resolve() for name in available)]
+    for name in selected:
+        source = skills_root / name
+        target = target_root / name
+        if not target.is_symlink() and same_real_path(source, target):
+            continue
+        # Resolve the parent, not the entry: --force replaces a symlink itself.
+        entry = target.parent.resolve() / target.name
+        if any(entry.is_relative_to(path) or path.is_relative_to(entry) for path in sources):
+            print(f"target overlaps source, refusing: {target}", file=sys.stderr)
+            return 1
+
     if not args.dry_run:
         target_root.mkdir(parents=True, exist_ok=True)
 
