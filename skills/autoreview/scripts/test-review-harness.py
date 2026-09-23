@@ -200,7 +200,10 @@ def fixture_git(repo: Path, *args: str, **kwargs) -> subprocess.CompletedProcess
         for entry in env.get("PATH", "").split(os.pathsep):
             path = Path(entry)
             if fixture_external_path(path, roots):
-                paths.append(path)
+                # Wrappers may search again after their own PATH entry.
+                candidate = shutil.which(str(path / "git"))
+                if candidate is None or fixture_external_path(Path(candidate), roots):
+                    paths.append(path)
         env["PATH"] = os.pathsep.join(str(path) for path in dict.fromkeys(paths))
         return subprocess.run([binary, *args], cwd=repo, env=env, **kwargs)
 

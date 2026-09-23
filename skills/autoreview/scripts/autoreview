@@ -652,9 +652,19 @@ def safe_git_env(repo: Path) -> dict[str, str]:
         "HOME": caller_home if caller_home is not None else str(Path.home()),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        "PATH": safe_engine_path(repo),
+        "PATH": safe_git_path(repo),
     })
     return env
+
+
+def safe_git_path(repo: Path) -> str:
+    # Trusted Git wrappers can search PATH again for their native backend.
+    # Exclude unsafe later candidates as well as the initially selected Git.
+    return os.pathsep.join(
+        directory for directory in safe_engine_path(repo).split(os.pathsep)
+        if (candidate := first_executable_candidate(Path(directory) / "git")) is None
+        or external_env_path(repo, candidate)
+    )
 
 
 def git_line_ending_args(repo: Path) -> list[str]:

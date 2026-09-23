@@ -1,6 +1,6 @@
 ---
 name: autoreview
-description: "Structured Codex, Claude, Amp, Pi, or Kimi code review when explicitly requested."
+description: "Structured code review when explicitly requested, preferring OpenAI/Codex before Claude."
 ---
 
 # Auto Review
@@ -119,9 +119,16 @@ parent-relative patch; otherwise leave the attribution unknown.
 
 ## Engines
 
-Codex is the default: `gpt-5.6-sol`, high reasoning, with a `gpt-5.6-terra` retry
-only for an account-access failure. Honor explicit engine/model choices; do not
-switch because a review is slow or rate-limited.
+For automatic reviewer selection, try OpenAI models through Codex before Claude.
+Start with `--engine codex` even when the invoking agent uses Codex or asks for
+an independent second opinion. Use Claude only when the user explicitly selects
+it or Codex is unavailable for the review; report the concrete availability failure
+before switching. Do not switch because a review is slow, rate-limited, or returns
+findings, or to bypass a safety refusal or isolation failure.
+
+Codex defaults to `gpt-5.6-sol`, high reasoning, with a `gpt-5.6-terra` retry
+only for an account-access failure. Honor explicit user engine/model choices.
+The helper does not automatically fall back between engines.
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
@@ -300,10 +307,10 @@ reviewed repository. When using `--status-output`, all output paths must differ;
 case-only and Unicode normalization aliases are conservatively refused on every
 platform, even when the filesystem would permit distinct files.
 
-| Exit | Meaning                                                                         |
-| ---- | ------------------------------------------------------------------------------- |
-| `0`  | `scoped-clean`, or a correct verdict with only filtered lower-priority findings |
-| `1`  | Accepted findings, an incorrect provider verdict, or a failed review attempt    |
+| Exit | Meaning                                                                            |
+| ---- | ---------------------------------------------------------------------------------- |
+| `0`  | `scoped-clean`, or a correct verdict with only filtered lower-priority findings    |
+| `1`  | Accepted findings, an incorrect provider verdict, or a failed review attempt       |
 | `2`  | Unfinished assessment, incomplete scope/attribution, or a missing required finding |
 
 Treat `scoped-clean` as clean only for the selected target and requested priority.

@@ -15,6 +15,25 @@ from .test_autoreview_hardening import SCRIPT, git, init_repo, load_helper
 ORACLE_TOOLS = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))
 
 
+def git_wrapper_path(root: Path, original_path: str) -> str:
+    directory = root / "git-wrapper"
+    directory.mkdir()
+    wrapper = directory / "git"
+    wrapper.write_text(f"#!{sys.executable}\n" + '''
+import os, shutil, sys
+from pathlib import Path
+directory = Path(__file__).resolve().parent
+(directory / "used").touch()
+os.environ["PATH"] = os.pathsep.join(
+    entry for entry in os.environ["PATH"].split(os.pathsep)
+    if Path(entry).resolve() != directory
+)
+os.execv(shutil.which("git"), ["git", *sys.argv[1:]])
+''')
+    wrapper.chmod(0o755)
+    return os.pathsep.join((str(directory), original_path))
+
+
 class GitFixtureIsolationTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="autoreview-git-fixture.")
@@ -169,6 +188,14 @@ class GitFixtureIsolationTests(unittest.TestCase):
                           f"Path({str(marker)!r}).touch()\nraise SystemExit(97)\n")
         unsafe.chmod(0o755)
         (external / "git").symlink_to(unsafe)
+        wrapper_path = git_wrapper_path(self.root, self.oracle_env["PATH"])
+        wrapped = self.root / "git-wrapper"
+        control = subprocess.run([str(wrapped / "git"), "--version"], env={
+            **self.oracle_env, "PATH": os.pathsep.join((str(external), wrapper_path)),
+        }, capture_output=True)
+        self.assertEqual(control.returncode, 97)
+        self.assertTrue(marker.exists())
+        marker.unlink()
         original_cwd = Path.cwd()
         try:
             os.chdir(caller)
@@ -177,11 +204,13 @@ class GitFixtureIsolationTests(unittest.TestCase):
                     with self.subTest(owner=owner, path=prefix.name):
                         parent = self.root / f"path-{owner}-{prefix.name}"
                         parent.mkdir()
+                        (wrapped / "used").unlink(missing_ok=True)
                         with mock.patch.dict(os.environ, {
-                            "PATH": os.pathsep.join((str(prefix), self.oracle_env["PATH"])),
+                            "PATH": os.pathsep.join((str(prefix), wrapper_path)),
                         }):
                             repo = self.fixture(owner, parent)
                         self.assertFalse(marker.exists())
+                        self.assertTrue((wrapped / "used").exists())
                         self.assertEqual(self.native(repo, "rev-list", "--count", "HEAD").strip(), "1")
         finally:
             os.chdir(original_cwd)
@@ -229,6 +258,7 @@ print("maintenance")
 ''')
             gh.chmod(0o755)
             env = {key: os.environ[key] for key in ("PATH", "DEVELOPER_DIR") if key in os.environ}
+            env["PATH"] = git_wrapper_path(root, env["PATH"])
             env.update({
                 "HOME": str(home), "GH_CONFIG_DIR": str(home),
                 "GH_TOKEN": "synthetic-gh-test", "HTTPS_PROXY": "http://127.0.0.1:1",
@@ -245,7 +275,13 @@ print("maintenance")
                 with self.subTest(path=prefix.name), mock.patch.dict(os.environ, {
                     **env, "PATH": os.pathsep.join((str(prefix), str(trusted), env["PATH"])),
                 }, clear=True):
+                    used = root / "git-wrapper" / "used"
+                    used.unlink(missing_ok=True)
+                    with mock.patch.object(Path, "cwd", return_value=repo):
+                        self.assertTrue(helper["preflight_git"]())
+                    self.assertEqual(helper["git"](repo, "rev-parse", "--show-toplevel").strip(), str(repo))
                     self.assertEqual(helper["detect_pr_base"](repo), "origin/maintenance")
+                    self.assertTrue(used.exists())
                     self.assertFalse(marker.exists())
             self.assertEqual(before, {str(p): p.read_bytes() for p in sentinel.rglob("*") if p.is_file()})
 
