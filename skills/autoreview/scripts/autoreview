@@ -2164,6 +2164,9 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
                 trufflehog_bin, "filesystem", str(pack_path), "--json",
                 "--no-color", "--results=verified,unknown", "--fail",
                 "--fail-on-scan-errors",
+                # The self-updater replaces the binary in place, so two engines
+                # scanning at once fail with "cannot move binary".
+                "--no-update",
             ],
             Path(tempdir),
             check=False,

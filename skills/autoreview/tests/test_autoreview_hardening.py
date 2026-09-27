@@ -194,6 +194,7 @@ expected = {
     "--results=verified,unknown",
     "--fail",
     "--fail-on-scan-errors",
+    "--no-update",
 }
 args = sys.argv[1:]
 if len(args) < 2 or args[0] != "filesystem" or not expected.issubset(args[2:]):
@@ -1049,6 +1050,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 **_kwargs: object,
             ) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(command[1], "filesystem")
+                # Concurrent engines must not race on TruffleHog's self-updater.
+                self.assertIn("--no-update", command)
                 self.assertEqual(cwd, Path(command[2]).parent)
                 self.assertEqual(Path(command[2]).read_text(encoding="utf-8"), prompt)
                 return subprocess.CompletedProcess(command, 0, "", "")
