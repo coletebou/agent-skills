@@ -1210,6 +1210,166 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
         )
         self.assertNotIn("synthetic-provider-log", stderr.getvalue())
 
+    def test_codex_runtime_profile_fallback_keeps_bedrock_route(self) -> None:
+        reviewer = route_reviewer(
+            [*CODEX_PROFILE_ARGV, "--codex-fallback-profile", "autoreview-bedrock-runtime"],
+            {"AUTOREVIEW_CODEX_CONFIG": 'model_verbosity="low"'},
+        )
+        fallback = reviewer.route_fallback
+        self.assertEqual(
+            (fallback.codex_auth, fallback.codex_profile, fallback.model, fallback.thinking),
+            ("default", "autoreview-bedrock-runtime", "global.openai.gpt-6-sol", "max"),
+        )
+        self.assertIsNone(fallback.fallback_model)
+        self.assertIsNone(fallback.route_fallback)
+        self.assertEqual(AUTOREVIEW.reviewer_route(fallback), "profile=autoreview-bedrock-runtime")
+        self.assertEqual(reviewer.codex_profile, "autoreview-bedrock")
+
+        env = {"OPENAI_API_KEY": "synthetic", "AWS_BEARER_TOKEN_BEDROCK": "synthetic"}
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-runtime.") as tmpdir, \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                mock.patch.object(AUTOREVIEW, "safe_engine_env",
+                                  side_effect=lambda *_a, **_k: dict(env)):
+            root = Path(tmpdir)
+            command = AUTOREVIEW.codex_command(
+                fallback, root, root, root, root / "schema.json", root / "out.json",
+                fallback.model, auth_config=[],
+            )
+            engine_env = AUTOREVIEW.codex_engine_env(fallback, root)
+        self.assertEqual(command[command.index("--profile") + 1], "autoreview-bedrock-runtime")
+        self.assertEqual(command[command.index("--model") + 1], "global.openai.gpt-6-sol")
+        self.assertFalse(any(part.startswith("model_provider=") for part in command))
+        self.assertIn("model_verbosity=\"low\"", command)
+        self.assertEqual(engine_env.get("AWS_BEARER_TOKEN_BEDROCK"), "synthetic")
+
+        env_reviewer = route_reviewer(CODEX_PROFILE_ARGV, {
+            "AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-runtime",
+            "AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL": "us.openai.gpt-6-sol",
+        })
+        self.assertEqual(
+            (env_reviewer.route_fallback.codex_profile, env_reviewer.route_fallback.model),
+            ("autoreview-bedrock-runtime", "us.openai.gpt-6-sol"),
+        )
+
+    def test_codex_runtime_route_model_derivation(self) -> None:
+        for model, expected in (
+            ("openai.gpt-6-sol", "global.openai.gpt-6-sol"),
+            ("gpt-6-sol", "global.openai.gpt-6-sol"),
+            ("global.openai.gpt-6-sol", "global.openai.gpt-6-sol"),
+            ("us.openai.gpt-6-astra", "us.openai.gpt-6-astra"),
+            (None, None),
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(AUTOREVIEW.codex_runtime_route_model(model), expected)
+
+    @unittest.skipIf(os.name == "nt", "POSIX profile staging")
+    def test_codex_mantle_failure_runs_runtime_profile_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-route-runtime-e2e.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            codex_home = root / "codex-home"
+            repo.mkdir()
+            codex_home.mkdir()
+            (codex_home / "autoreview-bedrock.config.toml").write_text(
+                'model = "openai.gpt-6-sol"\nmodel_provider = "amazon-bedrock"\n'
+                '\n[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n',
+                encoding="utf-8",
+            )
+            (codex_home / "autoreview-bedrock-runtime.config.toml").write_text(
+                'model = "global.openai.gpt-6-sol"\nmodel_provider = "amazon-bedrock-runtime"\n'
+                'model_reasoning_effort = "max"\nservice_tier = "default"\n'
+                'approvals_reviewer = "user"\n'
+                '\n[model_providers.amazon-bedrock-runtime.aws]\nregion = "us-east-1"\n',
+                encoding="utf-8",
+            )
+            reviewer = route_reviewer(
+                CODEX_PROFILE_ARGV,
+                {"AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-runtime"},
+            )
+            reviewer.stream_engine_output = False
+            events: list[tuple[str, str, bool, str]] = []
+
+            def fake_run(command, _cwd, **kwargs):
+                profile = command[command.index("--profile") + 1]
+                staged = Path(kwargs["env"]["CODEX_HOME"]) / f"{profile}.config.toml"
+                events.append((
+                    profile,
+                    command[command.index("--model") + 1],
+                    kwargs["env"].get("AWS_BEARER_TOKEN_BEDROCK") == "synthetic-bearer",
+                    staged.read_text(encoding="utf-8"),
+                ))
+                if profile == "autoreview-bedrock":
+                    return subprocess.CompletedProcess(
+                        command, 1, "", "HTTP 529 Overloaded synthetic-provider-log",
+                    )
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text(COMPLETE_REPORT, encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {
+                "AWS_BEARER_TOKEN_BEDROCK": "synthetic-bearer",
+                "CODEX_HOME": str(codex_home),
+                "HOME": str(root),
+                "PATH": os.environ.get("PATH", ""),
+            }, clear=True), mock.patch.object(
+                AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex",
+            ), mock.patch.object(
+                AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex",
+            ), mock.patch.object(
+                AUTOREVIEW, "codex_auth_config_flags", return_value=[],
+            ), mock.patch.object(
+                AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None,
+            ), mock.patch.object(
+                AUTOREVIEW, "safe_temp_root", return_value=root,
+            ), mock.patch.object(
+                AUTOREVIEW, "scan_outgoing_review_pack",
+            ), mock.patch.object(
+                AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run,
+            ), contextlib.redirect_stderr(stderr):
+                result = AUTOREVIEW.run_reviewer(reviewer, repo, "frozen", set(), [])
+
+        self.assertTrue(result.complete)
+        self.assertEqual([event[:3] for event in events], [
+            ("autoreview-bedrock", "openai.gpt-6-sol", True),
+            ("autoreview-bedrock-runtime", "global.openai.gpt-6-sol", True),
+        ])
+        staged_runtime = events[1][3]
+        self.assertIn('model_provider = "amazon-bedrock-runtime"', staged_runtime)
+        self.assertIn("[model_providers.amazon-bedrock-runtime.aws]", staged_runtime)
+        self.assertIn('region = "us-east-1"', staged_runtime)
+        self.assertNotIn("approvals_reviewer", staged_runtime)
+        self.assertIn(
+            "retrying on profile=autoreview-bedrock-runtime with global.openai.gpt-6-sol",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("synthetic-provider-log", stderr.getvalue())
+
+    def test_codex_fallback_profile_configuration(self) -> None:
+        same = route_reviewer(CODEX_PROFILE_ARGV, {
+            "AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock",
+        })
+        self.assertIsNone(same.route_fallback)
+        for argv, env, message in (
+            ([*CODEX_PROFILE_ARGV, "--codex-fallback-profile", "autoreview-bedrock-runtime",
+              "--codex-fallback-auth", "chatgpt"], {},
+             "--codex-fallback-auth and --codex-fallback-profile are exclusive"),
+            ([*CLAUDE_MANTLE_ARGV, "--codex-fallback-profile", "autoreview-bedrock-runtime"],
+             MANTLE_ENV, "--codex-fallback-profile is only supported for codex"),
+            ([*CODEX_PROFILE_ARGV, "--codex-fallback-profile", "../escape"], {},
+             "invalid Codex profile"),
+            (["--engine", "codex", "--codex-profile", "autoreview-bedrock",
+              "--codex-fallback-profile", "autoreview-bedrock-runtime"], {},
+             "--codex-fallback-profile needs a model"),
+            ([*CODEX_PROFILE_ARGV[:-2], "--thinking", "minimal",
+              "--codex-fallback-auth-model", "gpt-6-astra"],
+             {"AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-runtime"},
+             "invalid thinking level for codex model gpt-6-astra"),
+        ):
+            with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, message):
+                route_reviewer(argv, env)
+
     def test_route_fallback_runs_after_same_route_refusal_policy(self) -> None:
         refusal = subprocess.CompletedProcess(
             ["claude"], 0, json.dumps({"terminal_reason": "model_refusal"}), "",

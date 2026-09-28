@@ -7237,6 +7237,7 @@ def parse_args() -> argparse.Namespace:
             "--claude-fallback-auth-model",
             "--codex-fallback-auth",
             "--codex-fallback-auth-model",
+            "--codex-fallback-profile",
         )
         if any(
             argument == option or argument.startswith(f"{option}=")
@@ -7294,9 +7295,14 @@ def parse_args() -> argparse.Namespace:
         help="Retry once on this Codex auth route after the primary route is unavailable. Unset disables route fallback. Env: AUTOREVIEW_CODEX_FALLBACK_AUTH.",
     )
     parser.add_argument(
+        "--codex-fallback-profile",
+        default=os.environ.get("AUTOREVIEW_CODEX_FALLBACK_PROFILE", "").strip() or None,
+        help="Retry once through this capability-free NAME.config.toml Amazon Bedrock profile (for example a Bedrock Runtime profile) after the primary route is unavailable. Exclusive with --codex-fallback-auth. Env: AUTOREVIEW_CODEX_FALLBACK_PROFILE.",
+    )
+    parser.add_argument(
         "--codex-fallback-auth-model",
         default=os.environ.get("AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL", "").strip() or None,
-        help="Codex route-fallback model. Default: the primary model without an openai. prefix. Env: AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL.",
+        help="Codex route-fallback model. Default: the primary model without an openai. prefix (ChatGPT route) or its global. Bedrock Runtime inference id (profile route). Env: AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL.",
     )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument(
@@ -7581,6 +7587,50 @@ def reviewer_route(reviewer: argparse.Namespace) -> str:
     return claude_auth_mode(reviewer)
 
 
+def codex_runtime_route_model(model: str | None) -> str | None:
+    """Adapt an OpenAI model id to the Bedrock Runtime cross-Region inference id."""
+    if not model:
+        return None
+    if model.startswith(("global.openai.", "us.openai.")):
+        return model
+    return f"global.openai.{model.removeprefix('openai.')}"
+
+
+def codex_profile_route_fallback(
+    primary: argparse.Namespace,
+    profile: str,
+    explicit_model: str | None,
+) -> argparse.Namespace | None:
+    """Retry once through another capability-free Bedrock profile (e.g. Runtime)."""
+    if profile == codex_profile_name(primary):
+        return None
+    model = explicit_model or codex_runtime_route_model(primary.model)
+    if model is None:
+        raise SystemExit(
+            "--codex-fallback-profile needs a model when the Codex profile selects it; "
+            "set --model, AUTOREVIEW_CODEX_MODEL, or --codex-fallback-auth-model"
+        )
+    fallback = copy.copy(primary)
+    # A profile route is Bedrock-only: default auth, no ChatGPT, no provider selector.
+    fallback.codex_auth = "default"
+    fallback.codex_profile = profile
+    fallback.codex_config = [
+        override
+        for override in codex_config_overrides(primary)
+        if override.partition("=")[0].strip() != "model_provider"
+    ]
+    fallback.fallback_model = None
+    validate_thinking_level("codex", model, primary.thinking)
+    fallback.model = model
+    fallback.route_fallback = None
+    fallback.route_fallback_origin = {
+        "route": reviewer_route(primary),
+        "model": primary.model,
+        "thinking": primary.thinking,
+    }
+    return fallback
+
+
 def route_fallback_template(primary: argparse.Namespace) -> argparse.Namespace | None:
     """Build the single cross-route retry reviewer, or None when not configured."""
     engine = primary.engine
@@ -7594,9 +7644,25 @@ def route_fallback_template(primary: argparse.Namespace) -> argparse.Namespace |
     raw_auth = getattr(primary, f"{engine}_fallback_auth", None)
     explicit_model = (getattr(primary, f"{engine}_fallback_auth_model", None) or "").strip() or None
     auth = (raw_auth or "").strip().lower() or None
+    fallback_profile = None
+    if engine == "codex":
+        fallback_profile = codex_profile_name(
+            argparse.Namespace(codex_profile=getattr(primary, "codex_fallback_profile", None))
+        )
+        if auth is not None and fallback_profile is not None:
+            raise SystemExit(
+                "--codex-fallback-auth and --codex-fallback-profile are exclusive; select one route"
+            )
+        if fallback_profile is not None:
+            return codex_profile_route_fallback(primary, fallback_profile, explicit_model)
     if auth is None:
         if f"--{engine}-fallback-auth-model" in explicit:
-            raise SystemExit(f"--{engine}-fallback-auth-model requires --{engine}-fallback-auth")
+            requirement = (
+                "--codex-fallback-auth or --codex-fallback-profile"
+                if engine == "codex"
+                else f"--{engine}-fallback-auth"
+            )
+            raise SystemExit(f"--{engine}-fallback-auth-model requires {requirement}")
         return None
     valid = CLAUDE_AUTH_MODES if engine == "claude" else CODEX_FALLBACK_AUTH_MODES
     if auth not in valid:
