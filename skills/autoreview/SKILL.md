@@ -236,15 +236,16 @@ frozen prompt once on another route:
   credential environment, and is staged exactly like `--codex-profile`.
 - `--codex-fallback-auth-model` / `AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL`:
   defaults to the primary model without `openai.` for the ChatGPT route
-  (`openai.gpt-6-sol` → `gpt-6-sol`), and to its global Bedrock Runtime
-  inference id for a profile route (`openai.gpt-6-sol` → `global.openai.gpt-6-sol`;
-  Runtime has no in-Region id for GPT-6 models).
+  (`openai.gpt-6-sol` → `gpt-6-sol`). A profile route uses the fallback
+  profile's own `model` (Mantle and Runtime spell GPT-6 ids differently, e.g.
+  `openai.gpt-6-sol` vs `global.openai.gpt-6-sol`), so the primary model is not
+  carried over unless you set this explicitly.
 
 The fallback keeps the primary thinking level (validated for the fallback
 model). The Codex ChatGPT fallback drops `--codex-profile` and any `model_provider`
 override and uses the same ChatGPT-auth isolation as `--codex-auth chatgpt`; the
 Codex profile fallback swaps the profile and drops any `model_provider` override.
-Either way a profile-selected model needs `--model` or an explicit fallback model. A
+The ChatGPT route needs `--model` or an explicit fallback model when the profile selects the primary model. A
 fallback equal to the primary route is ignored. Interrupts, source or evidence
 changes, pre-send scan refusals, setup and isolation errors, and completed
 reviews never fall back. Later review passes stay on the fallback route. A

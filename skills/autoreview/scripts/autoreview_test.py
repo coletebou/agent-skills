@@ -1164,7 +1164,7 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
                 profile = "--profile" in command
                 events.append((
                     profile,
-                    command[command.index("--model") + 1],
+                    command[command.index("--model") + 1] if "--model" in command else "(profile)",
                     "AWS_BEARER_TOKEN_BEDROCK" in kwargs["env"],
                 ))
                 if profile:
@@ -1218,7 +1218,7 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
         fallback = reviewer.route_fallback
         self.assertEqual(
             (fallback.codex_auth, fallback.codex_profile, fallback.model, fallback.thinking),
-            ("default", "autoreview-bedrock-runtime", "global.openai.gpt-6-sol", "max"),
+            ("default", "autoreview-bedrock-runtime", None, "max"),
         )
         self.assertIsNone(fallback.fallback_model)
         self.assertIsNone(fallback.route_fallback)
@@ -1238,7 +1238,8 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
             )
             engine_env = AUTOREVIEW.codex_engine_env(fallback, root)
         self.assertEqual(command[command.index("--profile") + 1], "autoreview-bedrock-runtime")
-        self.assertEqual(command[command.index("--model") + 1], "global.openai.gpt-6-sol")
+        # The fallback profile owns its model id; the primary's Mantle id is not carried over.
+        self.assertNotIn("--model", command)
         self.assertFalse(any(part.startswith("model_provider=") for part in command))
         self.assertIn("model_verbosity=\"low\"", command)
         self.assertEqual(engine_env.get("AWS_BEARER_TOKEN_BEDROCK"), "synthetic")
@@ -1252,16 +1253,23 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
             ("autoreview-bedrock-runtime", "us.openai.gpt-6-sol"),
         )
 
-    def test_codex_runtime_route_model_derivation(self) -> None:
-        for model, expected in (
-            ("openai.gpt-6-sol", "global.openai.gpt-6-sol"),
-            ("gpt-6-sol", "global.openai.gpt-6-sol"),
-            ("global.openai.gpt-6-sol", "global.openai.gpt-6-sol"),
-            ("us.openai.gpt-6-astra", "us.openai.gpt-6-astra"),
-            (None, None),
-        ):
-            with self.subTest(model=model):
-                self.assertEqual(AUTOREVIEW.codex_runtime_route_model(model), expected)
+    def test_codex_profile_fallback_model_is_the_profile_or_explicit_id(self) -> None:
+        # Mantle -> Mantle (another region) keeps no rewritten id: the profile decides.
+        mantle = route_reviewer(CODEX_PROFILE_ARGV, {
+            "AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-west",
+        })
+        self.assertEqual(
+            (mantle.route_fallback.codex_profile, mantle.route_fallback.model),
+            ("autoreview-bedrock-west", None),
+        )
+        # An explicit id is passed through untouched, whatever its geo prefix.
+        for explicit in ("eu.openai.gpt-6-sol", "global.openai.gpt-6-sol", "openai.gpt-6-sol"):
+            with self.subTest(explicit=explicit):
+                reviewer = route_reviewer(CODEX_PROFILE_ARGV, {
+                    "AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-runtime",
+                    "AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL": explicit,
+                })
+                self.assertEqual(reviewer.route_fallback.model, explicit)
 
     @unittest.skipIf(os.name == "nt", "POSIX profile staging")
     def test_codex_mantle_failure_runs_runtime_profile_end_to_end(self) -> None:
@@ -1295,7 +1303,7 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
                 staged = Path(kwargs["env"]["CODEX_HOME"]) / f"{profile}.config.toml"
                 events.append((
                     profile,
-                    command[command.index("--model") + 1],
+                    command[command.index("--model") + 1] if "--model" in command else "(profile)",
                     kwargs["env"].get("AWS_BEARER_TOKEN_BEDROCK") == "synthetic-bearer",
                     staged.read_text(encoding="utf-8"),
                 ))
@@ -1333,15 +1341,16 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
         self.assertTrue(result.complete)
         self.assertEqual([event[:3] for event in events], [
             ("autoreview-bedrock", "openai.gpt-6-sol", True),
-            ("autoreview-bedrock-runtime", "global.openai.gpt-6-sol", True),
+            ("autoreview-bedrock-runtime", "(profile)", True),
         ])
         staged_runtime = events[1][3]
+        self.assertIn('model = "global.openai.gpt-6-sol"', staged_runtime)
         self.assertIn('model_provider = "amazon-bedrock-runtime"', staged_runtime)
         self.assertIn("[model_providers.amazon-bedrock-runtime.aws]", staged_runtime)
         self.assertIn('region = "us-east-1"', staged_runtime)
         self.assertNotIn("approvals_reviewer", staged_runtime)
         self.assertIn(
-            "retrying on profile=autoreview-bedrock-runtime with global.openai.gpt-6-sol",
+            "retrying on profile=autoreview-bedrock-runtime with the profile model",
             stderr.getvalue(),
         )
         self.assertNotIn("synthetic-provider-log", stderr.getvalue())
@@ -1359,9 +1368,6 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
              MANTLE_ENV, "--codex-fallback-profile is only supported for codex"),
             ([*CODEX_PROFILE_ARGV, "--codex-fallback-profile", "../escape"], {},
              "invalid Codex profile"),
-            (["--engine", "codex", "--codex-profile", "autoreview-bedrock",
-              "--codex-fallback-profile", "autoreview-bedrock-runtime"], {},
-             "--codex-fallback-profile needs a model"),
             ([*CODEX_PROFILE_ARGV[:-2], "--thinking", "minimal",
               "--codex-fallback-auth-model", "gpt-6-astra"],
              {"AUTOREVIEW_CODEX_FALLBACK_PROFILE": "autoreview-bedrock-runtime"},

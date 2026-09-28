@@ -7302,7 +7302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--codex-fallback-auth-model",
         default=os.environ.get("AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL", "").strip() or None,
-        help="Codex route-fallback model. Default: the primary model without an openai. prefix (ChatGPT route) or its global. Bedrock Runtime inference id (profile route). Env: AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL.",
+        help="Codex route-fallback model. Default: the primary model without an openai. prefix (ChatGPT route), or the fallback profile's own model (profile route; the primary model is not carried over). Env: AUTOREVIEW_CODEX_FALLBACK_AUTH_MODEL.",
     )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument(
@@ -7587,29 +7587,20 @@ def reviewer_route(reviewer: argparse.Namespace) -> str:
     return claude_auth_mode(reviewer)
 
 
-def codex_runtime_route_model(model: str | None) -> str | None:
-    """Adapt an OpenAI model id to the Bedrock Runtime cross-Region inference id."""
-    if not model:
-        return None
-    if model.startswith(("global.openai.", "us.openai.")):
-        return model
-    return f"global.openai.{model.removeprefix('openai.')}"
-
-
 def codex_profile_route_fallback(
     primary: argparse.Namespace,
     profile: str,
     explicit_model: str | None,
 ) -> argparse.Namespace | None:
-    """Retry once through another capability-free Bedrock profile (e.g. Runtime)."""
+    """Retry once through another capability-free Bedrock profile (e.g. Runtime).
+
+    The fallback profile owns its model id (Mantle and Runtime spell GPT-6 ids
+    differently), so without an explicit fallback model the primary's --model is
+    not carried over and the staged profile's own model is used.
+    """
     if profile == codex_profile_name(primary):
         return None
-    model = explicit_model or codex_runtime_route_model(primary.model)
-    if model is None:
-        raise SystemExit(
-            "--codex-fallback-profile needs a model when the Codex profile selects it; "
-            "set --model, AUTOREVIEW_CODEX_MODEL, or --codex-fallback-auth-model"
-        )
+    model = explicit_model
     fallback = copy.copy(primary)
     # A profile route is Bedrock-only: default auth, no ChatGPT, no provider selector.
     fallback.codex_auth = "default"
@@ -8590,7 +8581,8 @@ def run_reviewer(
             print(
                 display_escape(
                     f"{args.engine} route {reviewer_route(args)} failed ({primary_summary}); "
-                    f"retrying on {reviewer_route(fallback)} with {fallback.model}",
+                    f"retrying on {reviewer_route(fallback)} with "
+                    f"{fallback.model or 'the profile model'}",
                     1000,
                 ),
                 file=sys.stderr,
