@@ -2,7 +2,42 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-30
+
+**Highlights:** Review with GPT-6.1 Sol by default, with early effort validation and an access-only GPT-6 Sol retry.
+
+- Default Autoreview's Codex reviewer to GPT-6.1 Sol at high reasoning, reject unsupported efforts before preparation, and retry GPT-6 Sol only on account-access failure while preserving explicit older-model behavior. Thanks @coygeek.
+
+## 0.3.0 - 2026-09-30
+
+**Highlights:** Review deleted binary assets safely, with stronger result validation and reviewer deadlines.
+
+- Review deleted binary assets as Git deletion metadata in local, branch, and commit reviews, while preserving added-image review and refusing unsupported binary content changes. Thanks @roboclaw-bot.
+- Reject invalid final Autoreview terminal results without reusing earlier reports, and keep validated output paths consistent through status cleanup and atomic report publication.
+- Refuse Autoreview output symlinks inside the reviewed repository even when their referents are outside, preserving repository entries and stale status on validation failure.
+- Keep Autoreview's configured reviewer deadline active after streamed output closes, so a still-running reviewer cannot overrun the limit and return a successful review.
+- Preserve literal Unicode separators inside Autoreview JSONL records so final reports remain authoritative and valid Amp streams are accepted.
+- Reject invalid Amp model names during Autoreview dry runs with the same provider/model diagnostic used for execution.
+- Preserve feasible Autoreview partitions when intact context leaves less room than the estimated continuation reserve, while retaining complete evidence and the prompt limit.
+- Reject colliding Autoreview JSON and human output entries before review, while preserving separate symlink and hardlink destinations when no status sidecar is requested.
+- Refuse Kimi reviews and dry runs before startup until a private prompt input channel is supported, preventing review bundles from entering process arguments without silently changing engines.
+- Reject invalid Autoreview priority environment defaults before preparation or reviewer startup, while preserving explicit priority overrides.
+- Normalize absolute in-repository Autoreview finding paths without losing other findings, while preserving literal filenames and refusing traversal and outside paths. Thanks @kennykankush.
+- Update the native macOS sandbox-test Codex CLI to 0.159.3.
+
+## 0.2.0 - 2026-09-24
+
+**Highlights:** Native image review, committed source context, and more efficient multi-pass reviews.
+
+- Review added single-frame PNG, JPEG, and WebP assets in Codex branch reviews through native image attachments, with pinned bytes and per-pass manifests. Thanks @mgunnin.
+- Add Autoreview `--source-context-file` to keep explicitly selected committed source intact in every pass, with the existing provenance, mutation, path and finding-scope guards and unchanged prompt limits.
+- Add Autoreview `--source-context` for complete source bytes bound to the reviewed commit and blob, with validated same-role deduplication and strict credential-path and mutation guards, without expanding finding scope or changing generic evidence restrictions.
+- Reduce repeated Autoreview evidence without increasing passes or dropping change/evidence coverage; show planned work, add an explicit preflight pass budget, and aggregate observed Codex usage across passes and access retries with incomplete telemetry marked as a lower bound.
+- Keep complete Autoreview evidence in every change partition when it leaves sufficient change space, before splitting datasets or optimizing their allocation; preserve feasible terminal plans when batch framing cannot fit.
+- Update Autoreview’s default Codex model and account-access-only fallback; preserve explicit model choices and validate supported reasoning levels.
 - Prefer OpenAI/Codex before Claude when choosing an Autoreview engine, including independent second opinions; retain explicit user choices and require a concrete Codex availability failure before switching.
+- Split Windows skill validation into core, hardening, and boundary jobs while retaining the complete default check sequence and existing job timeouts.
+- Split Windows Autoreview hardening validation into two deterministic test-ID shards, preserving the full test union, aggregate local commands and existing job timeouts.
 
 ## 0.1.0 - 2026-09-22
 

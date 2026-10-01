@@ -14,17 +14,33 @@ concurrency:
 
 jobs:
   validate:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            group: all
+            name: validate (ubuntu-latest)
+          - os: windows-latest
+            group: core
+            name: validate (windows-latest, core)
+          - os: windows-latest
+            group: hardening-1
+            name: validate (windows-latest, hardening-1)
+          - os: windows-latest
+            group: hardening-2
+            name: validate (windows-latest, hardening-2)
+          - os: windows-latest
+            group: boundaries
+            name: validate (windows-latest, boundaries)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '26.9.0'
+          node-version: '26.10.0'
           cache: npm
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -36,7 +52,7 @@ jobs:
       - name: Install development typechecker
         run: npm ci --ignore-scripts
       - name: Check skills
-        run: python scripts/check-skills
+        run: python scripts/check-skills --group ${{ matrix.group }}
 
   macos-sandbox:
     runs-on: macos-latest
@@ -45,13 +61,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '26.9.0'
+          node-version: '26.10.0'
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Install sandbox CLI
         run: |
-          npm install --prefix "$RUNNER_TEMP/autoreview-codex" --ignore-scripts --no-audit --no-fund @openai/codex@0.155.1
+          npm install --prefix "$RUNNER_TEMP/autoreview-codex" --ignore-scripts --no-audit --no-fund @openai/codex@0.159.3
           echo "$RUNNER_TEMP/autoreview-codex/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Exercise native sandbox and Git boundaries without provider access
         run: |
