@@ -5157,7 +5157,7 @@ def prepare_codex_runtime_profile(
             f"Codex profile {profile!r} has invalid model_reasoning_effort={effort!r}"
         )
     service_tier = safe_scalars.get("service_tier")
-    if service_tier is not None and service_tier not in {"fast", "flex", "default"}:
+    if service_tier is not None and service_tier not in CODEX_SPEEDS:
         raise SystemExit(f"Codex profile {profile!r} has invalid service_tier={service_tier!r}")
 
     aws: dict[str, str] = {}

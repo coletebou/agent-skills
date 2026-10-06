@@ -1036,6 +1036,45 @@ class AutoreviewSingleEngineRoutingTests(unittest.TestCase):
                 0o600,
             )
 
+    def test_codex_profile_service_tier_accepts_every_codex_speed(self) -> None:
+        # A profile's service_tier and --codex-speed name the same Codex setting,
+        # so the profile validator must accept exactly the CODEX_SPEEDS tiers.
+        tiers = (*AUTOREVIEW.CODEX_SPEEDS, "warp")
+        for tier in tiers:
+            with self.subTest(tier=tier), tempfile.TemporaryDirectory(
+                prefix="autoreview-codex-profile-tier-test."
+            ) as tmpdir:
+                root = Path(tmpdir)
+                repo = root / "repo"
+                codex_home = root / "codex-home"
+                runtime_home = root / "runtime-codex-home"
+                repo.mkdir()
+                codex_home.mkdir()
+                (codex_home / "autoreview-bedrock.config.toml").write_text(
+                    "\n".join(
+                        (
+                            'model = "openai.gpt-6-sol"',
+                            'model_provider = "amazon-bedrock"',
+                            f'service_tier = "{tier}"',
+                            "",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                args = argparse.Namespace(codex_profile="autoreview-bedrock")
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                    if tier in AUTOREVIEW.CODEX_SPEEDS:
+                        self.assertTrue(
+                            AUTOREVIEW.prepare_codex_runtime_profile(args, repo, runtime_home)
+                        )
+                        projected = (
+                            runtime_home / "autoreview-bedrock.config.toml"
+                        ).read_text(encoding="utf-8")
+                        self.assertIn(f'service_tier = "{tier}"', projected)
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "invalid service_tier='warp'"):
+                            AUTOREVIEW.prepare_codex_runtime_profile(args, repo, runtime_home)
+
     def test_codex_profile_preflight_uses_isolated_runtime_and_aws_route(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-codex-preflight-test.") as tmpdir:
             root = Path(tmpdir)
