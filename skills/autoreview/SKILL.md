@@ -437,18 +437,20 @@ the private run-history root (`<root>/snapshots/`), prints `snapshot:` and
 `snapshot_commit:`, and runs the whole review there, so later changes to your
 checkout cannot abort it. The snapshot is removed and unregistered on success,
 failure, timeout and interrupt. A hard kill can leave one behind; clear it with
-`git worktree remove --force <path>` and `git worktree prune`.
+`git worktree remove --force <path>`, which also works once the directory is gone.
 
 - Committed content only: `--mode local`, and `--mode auto` on a dirty checkout,
   are refused. `--prompt-file` and `--dataset` must be committed and identical to
   the frozen commit; untracked, staged-only or modified files are refused, never copied.
-- Prompt text, path rules, sensitive-path refusals, pre-send scanning, isolation and
-  run history match a direct review of that commit. A ref that names another commit
-  inside the detached snapshot (`--base @{-1}`, `--commit HEAD~1`) is pinned to the
-  commit it named in your checkout.
+- Base and commit refs resolve once in your checkout, to object ids, so a background
+  fetch or a new commit cannot change the target mid-review. Prompt text keeps your
+  spelling: prompts, path rules, sensitive-path refusals, pre-send scanning,
+  isolation and run history match a direct review of that commit.
 - Your checkout stays repository-owned for executables, environment paths and
   outputs. Creation runs no Git hooks, filters or sparse cone, checks out the whole
-  commit, and never fetches missing objects.
+  commit, and never fetches missing objects. Config-defined hooks (`hook.*`) and
+  `includeIf.gitdir` includes are refused: Git applies them differently, or despite
+  an empty hooks path, inside a linked worktree.
 
 ## Diagnostics and results
 

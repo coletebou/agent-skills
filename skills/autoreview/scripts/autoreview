@@ -3706,8 +3706,9 @@ def source_tree_snapshot(
     return head, index_entries, tuple(sorted(fingerprints))
 
 
-def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
-    base_label = base_ref
+def branch_bundle(repo: Path, base_ref: str, base_label: str | None = None) -> CapturedBundle:
+    # A snapshot passes its pinned base id with the operator's spelling as label.
+    base_label = base_ref if base_label is None else base_label
     base_ref = validate_git_ref(repo, base_ref, "base", pin=True)
     head_ref = validate_git_ref(repo, "HEAD", "commit", pin=True)
     merge_base = git(repo, "merge-base", base_ref, head_ref).strip()
@@ -3818,12 +3819,15 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     return CapturedBundle(text, paths, commit=refs[-1])
 
 
-def build_bundle(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> CapturedBundle:
+def build_bundle(
+    repo: Path, target: str, target_ref: str | None, commit_ref: str,
+    *, base_label: str | None = None,
+) -> CapturedBundle:
     if target == "local":
         return local_bundle(repo, target_ref)
     if target == "branch":
         assert target_ref
-        return branch_bundle(repo, target_ref)
+        return branch_bundle(repo, target_ref, base_label)
     return commit_bundle(repo, commit_ref)
 
 
@@ -8945,6 +8949,9 @@ def dry_run_preflight(
     repo: Path,
     target: str,
     target_ref: str | None,
+    *,
+    bundle_ref: str | None = None,
+    bundle_commit: str | None = None,
 ) -> int:
     """Build and verify real review inputs, then probe reviewer startup.
 
@@ -8965,7 +8972,12 @@ def dry_run_preflight(
     bundle_ok = True
     try:
         with PreparationProgress("bundle preparation"):
-            captured = build_bundle(repo, target, target_ref, args.commit)
+            captured = build_bundle(
+                repo, target,
+                target_ref if bundle_ref is None else bundle_ref,
+                args.commit if bundle_commit is None else bundle_commit,
+                base_label=target_ref,
+            )
             for reviewer in reviewers:
                 require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
@@ -9358,7 +9370,7 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
 class ReviewSnapshot(NamedTuple):
     root: Path
     commit: str
-    target_ref: str | None
+    base: str | None
 
 
 def snapshot_local_refusal(*, auto_selected: bool) -> str:
@@ -9428,19 +9440,16 @@ def freeze_snapshot_evidence(
         args.dataset = [record.raw_path for record in records[prompt_files:]]
 
 
-def snapshot_ref(snapshot: Path, ref: str, commit: str, label: str) -> str:
-    """Keep the operator's spelling when the snapshot resolves it to `commit`.
-
-    `commit` is what the ref named in the operator checkout. Per-worktree refs
-    (HEAD-relative, @{upstream}, @{-1}, FETCH_HEAD, ORIG_HEAD) can resolve
-    differently in a detached snapshot; those use the pinned commit instead.
-    """
-    try:
-        if validate_git_ref(snapshot, ref, label, pin=True) == commit:
-            return ref
-    except SystemExit:
-        pass
-    return commit
+def snapshot_creation_error(
+    commit: str, result: subprocess.CompletedProcess[str] | None,
+) -> SystemExit:
+    detail = "" if result is None else (result.stderr or result.stdout).strip()
+    return SystemExit(
+        f"could not create the review snapshot of {commit}"
+        + (f":\n{display_escape(detail, 1000, multiline=True)}" if detail else "")
+        + "\nSnapshots check out the whole frozen commit without hooks, filters or "
+        "object fetching; rerun without --snapshot if that is not possible."
+    )
 
 
 def create_snapshot_parent(args: argparse.Namespace, repo: Path) -> Path:
@@ -9464,29 +9473,71 @@ def create_snapshot_parent(args: argparse.Namespace, repo: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix="autoreview-snapshot-", dir=safe_temp_root(repo)))
 
 
-def snapshot_git_env(repo: Path, hooks: Path) -> dict[str, str]:
-    """Git environment that creates and removes a snapshot without checkout code.
+def git_config_keys(context: Path, env: dict[str, str]) -> list[str]:
+    """Effective config key names, following includes, as Git sees them in `context`."""
+    listed = git_result(context, "config", "--includes", "--null", "--name-only", "--list",
+                        env=env, check=False)
+    if listed.returncode != 0 or (listed.stdout and not listed.stdout.endswith("\0")):
+        raise SystemExit("cannot establish Git configuration for the review snapshot")
+    return [key for key in listed.stdout.split("\0") if key]
+
+
+def conditional_include_refusal(keys: Sequence[str]) -> str | None:
+    """Refuse includes that Git evaluates differently inside the snapshot.
+
+    A linked worktree has its own gitdir, so a gitdir include can add config,
+    including config-defined hooks, that applies only there. Git can run such a
+    hook while `worktree add` records the snapshot HEAD, before the snapshot's
+    own config can be read.
+    """
+    if any(re.match(r"includeif\.gitdir(?:/i)?:", key, re.IGNORECASE) for key in keys):
+        return (
+            "--snapshot refuses Git config with gitdir-conditional includes (includeIf.gitdir): "
+            "Git evaluates them differently inside the snapshot worktree, so its hooks and filters "
+            "cannot be ruled out before it exists; rerun without --snapshot"
+        )
+    return None
+
+
+def config_hook_refusal(keys: Sequence[str]) -> str | None:
+    # Refuse by key, whether or not this Git version runs config-defined hooks.
+    if any(key.casefold().startswith("hook.") for key in keys):
+        return (
+            "--snapshot refuses config-defined Git hooks (hook.* keys), which an empty "
+            "core.hooksPath does not disable; rerun without --snapshot"
+        )
+    return None
+
+
+def refuse_snapshot_config(keys: Sequence[str]) -> None:
+    for refusal in (conditional_include_refusal(keys), config_hook_refusal(keys)):
+        if refusal:
+            raise SystemExit(refusal)
+
+
+def config_filter_drivers(keys: Sequence[str]) -> set[str]:
+    drivers: set[str] = set()
+    for key in keys:
+        if not key.casefold().startswith("filter."):
+            continue
+        driver, separator, _field = key[len("filter."):].rpartition(".")
+        if separator:
+            drivers.add(driver)
+    return drivers
+
+
+def snapshot_git_env(
+    repo: Path, hooks: Path, drivers: set[str], context: Path | None = None,
+) -> dict[str, str]:
+    """Git environment that creates, fills and removes a snapshot without checkout code.
 
     Plain `git worktree add` runs reference-transaction, post-index-change and
     post-checkout hooks, applies configured smudge/process filters, and copies
     the current sparse-checkout cone. Hooks and filters can be checkout-owned
-    (a repository hooksPath, for example). Disable them and check out the whole
-    frozen tree; built-in line-ending conversion stays enabled.
+    (a repository hooksPath, for example). Disable hooks, every given filter
+    driver and sparse checkout; built-in line-ending conversion stays enabled.
     """
     env = safe_git_env(repo)
-    listed = git_result(
-        repo, "config", "--includes", "--null", "--name-only", "--get-regexp", r"^filter\.",
-        env=env, check=False,
-    )
-    if listed.returncode not in {0, 1} or (listed.returncode == 0 and not listed.stdout.endswith("\0")):
-        raise SystemExit("cannot establish executable Git filter configuration")
-    drivers: set[str] = set()
-    for key in listed.stdout.split("\0")[:-1]:
-        if not key.startswith("filter."):
-            raise SystemExit("invalid Git filter configuration key")
-        driver, separator, _field = key.removeprefix("filter.").rpartition(".")
-        if separator:
-            drivers.add(driver)
     overrides = [
         ("core.hooksPath", str(hooks)),
         ("core.sparseCheckout", "false"),
@@ -9501,7 +9552,8 @@ def snapshot_git_env(repo: Path, hooks: Path) -> dict[str, str]:
         # Keep arbitrary driver names separate from values, including '='.
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
-    applied = git_result(repo, "config", "--null", "--get", "core.hooksPath", env=env, check=False)
+    applied = git_result(context or repo, "config", "--null", "--get", "core.hooksPath",
+                         env=env, check=False)
     if applied.returncode != 0 or applied.stdout != f"{hooks}\0":
         # Git versions without command-env configuration must fail closed.
         raise SystemExit("Git cannot apply review snapshot hook and filter protection")
@@ -9525,10 +9577,38 @@ def snapshot_registered(repo: Path, worktree: Path, env: dict[str, str]) -> bool
     )
 
 
+def snapshot_admin_dir(repo: Path, worktree: Path, env: dict[str, str]) -> Path | None:
+    """This snapshot's own administrative entry, confirmed by its gitdir back-pointer."""
+    common = snapshot_git(repo, env, "rev-parse", "--git-common-dir")
+    if common is None or common.returncode != 0:
+        return None
+    entries = (repo / common.stdout.removesuffix("\n")).resolve() / "worktrees"
+    expected = worktree / ".git"
+    matches = []
+    try:
+        candidates = list(entries.iterdir())
+    except OSError:
+        return None
+    for entry in candidates:
+        gitdir = entry / "gitdir"
+        try:
+            if entry.is_symlink() or not entry.is_dir() or gitdir.is_symlink():
+                continue
+            recorded = Path(gitdir.read_bytes().decode("utf-8").rstrip("\r\n"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if recorded == expected or recorded.resolve() == expected:
+            matches.append(entry)
+    return matches[0] if len(matches) == 1 else None
+
+
 def remove_review_snapshot(
     repo: Path, parent: Path, worktree: Path | None, env: dict[str, str] | None,
 ) -> bool:
-    """Remove and unregister one snapshot; True only when nothing remains."""
+    """Remove and unregister one snapshot; True only when nothing remains.
+
+    Never a repository-wide prune: other missing worktrees stay registered.
+    """
     with deferred_owned_process_signals():
         registered: bool | None = False
         if worktree is not None and env is not None:
@@ -9537,8 +9617,11 @@ def remove_review_snapshot(
         if worktree is not None and env is not None:
             registered = snapshot_registered(repo, worktree, env)
             if registered:
-                # Its directory is gone; prune the stale administrative entry.
-                snapshot_git(repo, env, "worktree", "prune")
+                # With its directory gone, Git drops just this registration.
+                snapshot_git(repo, env, "worktree", "remove", "--force", "--force", str(worktree))
+                registered = snapshot_registered(repo, worktree, env)
+            if registered and (admin := snapshot_admin_dir(repo, worktree, env)) is not None:
+                shutil.rmtree(admin, ignore_errors=True)
                 registered = snapshot_registered(repo, worktree, env)
         return registered is False and not os.path.lexists(parent)
 
@@ -9549,20 +9632,23 @@ def review_snapshot(
 ):
     """Freeze the selected commit into a private detached worktree outside the repo.
 
-    Target, base and evidence selection ran in the operator checkout. The review
-    then runs as if invoked in the snapshot, which nothing else writes, so later
-    commits, edits and scratch files there cannot invalidate it. The snapshot is
-    removed and unregistered on every exit, including failures and interrupts.
+    Target, base, evidence and config checks run in the operator checkout. The
+    review then runs as if invoked in the snapshot, which nothing else writes, so
+    later commits, edits, scratch files and ref updates there cannot invalidate it.
+    The snapshot is removed and unregistered on every exit, including failures
+    and interrupts.
     """
+    # Every later Git operation uses these object ids: shared refs such as
+    # origin/main or a branch can move during a long review. Only prompt and
+    # display text keep the operator's spelling.
     commit = validate_git_ref(repo, "HEAD" if target == "branch" else args.commit, "commit", pin=True)
     base = None
     if target == "branch":
         assert target_ref is not None
-        try:
-            base = validate_git_ref(repo, target_ref, "base", pin=True)
-        except SystemExit:
-            pass  # Bundle preparation reports it exactly as a direct review does.
+        base = validate_git_ref(repo, target_ref, "base", pin=True)
     evidence = committed_evidence_files(args, repo, commit)
+    operator_keys = git_config_keys(repo, safe_git_env(repo))
+    refuse_snapshot_config(operator_keys)
     parent: Path | None = None
     worktree: Path | None = None
     env: dict[str, str] | None = None
@@ -9576,34 +9662,38 @@ def review_snapshot(
         _SNAPSHOT_ORIGINS[worktree] = SnapshotOrigin(repo.resolve(), branch)
         hooks = parent / "no-hooks"
         hooks.mkdir(mode=0o700)
-        env = snapshot_git_env(repo, hooks)
+        drivers = config_filter_drivers(operator_keys)
+        env = snapshot_git_env(repo, hooks, drivers)
         print(f"snapshot: {display_escape(worktree, 1000)}", flush=True)
         print(f"snapshot_commit: {commit}", flush=True)
         with PreparationProgress("snapshot creation"):
+            # No checkout yet: only the snapshot HEAD is recorded, hooks disabled.
             created = snapshot_git(
-                repo, env, *git_line_ending_args(repo),
-                "worktree", "add", "--detach", "--quiet", str(worktree), commit,
+                repo, env, "worktree", "add", "--detach", "--no-checkout", "--quiet",
+                str(worktree), commit,
             )
-        if created is None or created.returncode != 0:
-            detail = "" if created is None else (created.stderr or created.stdout).strip()
-            raise SystemExit(
-                f"could not create the review snapshot of {commit}"
-                + (f":\n{display_escape(detail, 1000, multiline=True)}" if detail else "")
-                + "\nSnapshots check out the whole frozen commit without hooks, filters or "
-                "object fetching; rerun without --snapshot if that is not possible."
+            if created is None or created.returncode != 0:
+                raise snapshot_creation_error(commit, created)
+            # Git evaluates config for the snapshot's own gitdir. Read that context
+            # before any file exists and neutralize filters visible in either one.
+            snapshot_keys = git_config_keys(worktree, safe_git_env(repo))
+            refuse_snapshot_config(snapshot_keys)
+            env = snapshot_git_env(
+                repo, hooks, drivers | config_filter_drivers(snapshot_keys), context=worktree,
             )
+            populated = snapshot_git(
+                worktree, env, *git_line_ending_args(repo),
+                "reset", "--hard", "--quiet", "--no-recurse-submodules", commit,
+            )
+            if populated is None or populated.returncode != 0:
+                raise snapshot_creation_error(commit, populated)
         worktree.chmod(0o700)
         if validate_git_ref(worktree, "HEAD", "commit", pin=True) != commit:
             raise SystemExit("review snapshot does not match the frozen commit")
         freeze_snapshot_evidence(args, worktree, evidence, commit)
-        if target == "commit":
-            args.commit = snapshot_ref(worktree, args.commit, commit, "commit")
-        elif base is not None:
-            assert target_ref is not None
-            target_ref = snapshot_ref(worktree, target_ref, base, "base")
         # Outputs stay outside the snapshot as well as the operator checkout.
         prepare_output_paths(args, worktree)
-        yield ReviewSnapshot(worktree, commit, target_ref)
+        yield ReviewSnapshot(worktree, commit, base)
     finally:
         if worktree is not None:
             _SNAPSHOT_ORIGINS.pop(worktree, None)
@@ -9616,8 +9706,7 @@ def review_snapshot(
                 print(
                     display_escape(
                         f"autoreview snapshot cleanup incomplete: {location}\nRemove it with: "
-                        f"git -C {checkout} worktree remove --force {location}; "
-                        f"git -C {checkout} worktree prune",
+                        f"git -C {checkout} worktree remove --force {location}",
                         2000, multiline=True,
                     ),
                     file=sys.stderr, flush=True,
@@ -9707,11 +9796,14 @@ def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) ->
         print(f"ref: {display_ref}", flush=True)
     history_repo = repo
     frozen = None
+    # Git reads these; target_ref and args.commit stay the prompt/display spelling.
+    bundle_ref, bundle_commit = target_ref, args.commit
     if snapshot:
         frozen = cleanup.enter_context(review_snapshot(args, repo, target, target_ref, branch))
-        repo, target_ref = frozen.root, frozen.target_ref
+        repo, bundle_ref, bundle_commit = frozen.root, frozen.base, frozen.commit
     if args.dry_run:
-        return dry_run_preflight(args, reviewers, repo, target, target_ref)
+        return dry_run_preflight(args, reviewers, repo, target, target_ref,
+                                 bundle_ref=bundle_ref, bundle_commit=bundle_commit)
 
     run_evidence = (
         create_run_evidence(args, history_repo, target, display_ref, reviewers)
@@ -9731,7 +9823,7 @@ def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) ->
     with PreparationProgress("initial source snapshot") as progress:
         review_source_snapshot = source_tree_snapshot(repo, progress)
     with PreparationProgress("bundle/evidence preparation"):
-        captured = build_bundle(repo, target, target_ref, args.commit)
+        captured = build_bundle(repo, target, bundle_ref, bundle_commit, base_label=target_ref)
         require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
             target_ref = args.commit

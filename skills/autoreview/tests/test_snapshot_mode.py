@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -199,9 +200,9 @@ class SnapshotModeTests(unittest.TestCase):
         self.assertIn("snapshot: removed", self.stderr)
         self.assert_no_snapshot_left()
 
-    def test_commit_snapshot_uses_the_commit_ref_and_pins_worktree_relative_refs(self):
+    def test_commit_snapshot_reviews_the_frozen_commit_under_the_operator_spelling(self):
         git(self.repo, "commit", "--allow-empty", "-qm", "later commit")
-        for ref, label in (("HEAD~1", self.head), (self.head, self.head)):
+        for ref in ("HEAD~1", self.head):
             with self.subTest(ref=ref):
                 self.observed.clear()
                 self.assertEqual(self.invoke("--mode", "commit", "--commit", ref, *self.snapshot_args()), 0)
@@ -209,8 +210,9 @@ class SnapshotModeTests(unittest.TestCase):
                 self.assertEqual(seen["head"], self.head)
                 self.assertIn(f"snapshot_commit: {self.head}", self.stdout)
                 self.assertIn(f"ref: {ref}", self.stdout)
-                # HEAD~1 would name a different commit inside the snapshot.
-                self.assertIn(f"Review target: commit {label}", seen["prompt"])
+                # Prompt text keeps the direct-review spelling; HEAD~1 inside the
+                # snapshot would name another commit, so the bundle uses the id.
+                self.assertIn(f"Review target: commit {ref}", seen["prompt"])
                 self.assertIn(f"commit: {self.head}", seen["prompt"])
                 self.assertIn("+def div(a, b):", seen["prompt"])
                 self.assert_no_snapshot_left()
@@ -219,10 +221,48 @@ class SnapshotModeTests(unittest.TestCase):
         # @{-1} is per-worktree reflog state: main here, unknown in a fresh snapshot.
         self.assertEqual(self.invoke("--mode", "branch", "--base", "@{-1}", *self.snapshot_args()), 0)
         prompt = self.observed[0]["prompt"]
-        self.assertIn(f"Review target: branch {self.base}", prompt)
-        self.assertIn(f"base: {self.base}", prompt)
+        self.assertIn("Review target: branch @{-1}", prompt)
+        self.assertIn("base: @{-1}", prompt)
         self.assertIn("+def div(a, b):", prompt)
         self.assertIn("ref: @{-1}", self.stdout)
+        self.assert_no_snapshot_left()
+
+    def test_shared_refs_moved_after_snapshot_creation_do_not_change_the_review(self):
+        capture = self.helper["capture_evidence_inputs"]
+
+        def moved(ref, target):
+            def capture_after_move(args, repo):
+                # A background fetch or an operator commit lands after the freeze.
+                git(self.repo, "update-ref", ref, target)
+                return capture(args, repo)
+            return capture_after_move
+
+        # A live base would now equal HEAD and review an empty diff.
+        self.assertEqual(self.invoke(
+            "--mode", "branch", "--base", "main", *self.snapshot_args(),
+            patches={"capture_evidence_inputs": moved("refs/heads/main", self.head)},
+        ), 0, self.stderr)
+        prompt = self.observed[0]["prompt"]
+        self.assertIn("Review target: branch main", prompt)
+        self.assertIn("base: main", prompt)
+        self.assertIn("+def div(a, b):", prompt)
+        self.assertEqual(git(self.repo, "rev-parse", "main").strip(), self.head)
+        self.assert_no_snapshot_left()
+        git(self.repo, "update-ref", "refs/heads/main", self.base)
+        # A live commit ref would now review the operator's later, empty commit.
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}").strip()
+        later = git(self.repo, "commit-tree", "-p", self.head, "-m", "later", tree).strip()
+        self.observed.clear()
+        self.assertEqual(self.invoke(
+            "--mode", "commit", "--commit", "feature", *self.snapshot_args(),
+            patches={"capture_evidence_inputs": moved("refs/heads/feature", later)},
+        ), 0, self.stderr)
+        prompt = self.observed[0]["prompt"]
+        self.assertIn("Review target: commit feature", prompt)
+        self.assertIn(f"commit: {self.head}", prompt)
+        self.assertNotIn(later, prompt)
+        self.assertIn("+def div(a, b):", prompt)
+        git(self.repo, "update-ref", "refs/heads/feature", self.head)
         self.assert_no_snapshot_left()
 
     def test_relative_run_log_root_still_yields_absolute_private_snapshot(self):
@@ -289,9 +329,15 @@ class SnapshotModeTests(unittest.TestCase):
                                 engine=failing_engine)
                 self.assertTrue(self.observed.pop()["repo"].is_relative_to(self.state.resolve()))
                 self.assert_no_snapshot_left()
-        # The bundle reports an unknown base after the snapshot exists.
+        # An unknown base is refused before any snapshot exists.
         with self.assertRaisesRegex(SystemExit, "unknown base ref: missing-base"):
             self.invoke("--mode", "branch", "--base", "missing-base", *self.snapshot_args())
+        self.assertNotIn("snapshot: ", self.stdout)
+        self.assert_no_snapshot_left()
+        # Bundle/evidence preparation fails after the snapshot exists.
+        with self.assertRaisesRegex(SystemExit, "evidence changed or became unreadable: missing.py"):
+            self.invoke("--mode", "branch", "--base", "main", "--source-context", "missing.py",
+                        *self.snapshot_args())
         self.assertIn("snapshot: ", self.stdout)
         self.assert_no_snapshot_left()
 
@@ -316,6 +362,7 @@ class SnapshotModeTests(unittest.TestCase):
             self.assertEqual(self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args()), 0)
         self.assertIn("autoreview snapshot cleanup incomplete", self.stderr)
         self.assertIn("worktree remove --force", self.stderr)
+        self.assertNotIn("prune", self.stderr)
         # The real removal still works afterwards.
         snapshot = self.observed[0]["repo"]
         git(self.repo, "worktree", "remove", "--force", str(snapshot))
@@ -323,6 +370,42 @@ class SnapshotModeTests(unittest.TestCase):
             for child in parent.iterdir():
                 child.rmdir()
             parent.rmdir()
+        self.assert_no_snapshot_left()
+
+    def failing_remove(self):
+        original = self.helper["snapshot_git"]
+
+        def snapshot_git(repo, env, *args):
+            if args[:2] == ("worktree", "remove"):
+                return subprocess.CompletedProcess(args, 1, "", "fatal: synthetic remove failure")
+            return original(repo, env, *args)
+
+        return snapshot_git
+
+    def test_cleanup_fallback_removes_only_this_snapshot_registration(self):
+        other = self.root / "other-worktree"
+        git(self.repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+        # Someone else's registration whose directory is missing must survive.
+        shutil.rmtree(other)
+        self.assertEqual(self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args(),
+                                     patches={"snapshot_git": self.failing_remove()}), 0, self.stderr)
+        self.assertIn("snapshot: removed", self.stderr)
+        self.assertEqual(self.worktree_paths(), [self.repo.resolve(), other.resolve()])
+        git(self.repo, "worktree", "remove", "--force", str(other))
+        self.assert_no_snapshot_left()
+
+    def test_unconfirmed_admin_entry_is_left_with_the_removal_command(self):
+        with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                "snapshot_admin_dir": lambda *_args: None}):
+            self.assertEqual(self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args(),
+                                         patches={"snapshot_git": self.failing_remove()}), 0)
+        snapshot = self.observed[0]["repo"]
+        self.assertIn("autoreview snapshot cleanup incomplete", self.stderr)
+        self.assertNotIn("prune", self.stderr)
+        self.assertIn(snapshot.resolve(), self.worktree_paths())
+        self.assertFalse(snapshot.exists())
+        # The printed command is targeted and works on the missing directory.
+        git(self.repo, "worktree", "remove", "--force", str(snapshot))
         self.assert_no_snapshot_left()
 
     # Refusals --------------------------------------------------------------
@@ -414,7 +497,9 @@ class SnapshotModeTests(unittest.TestCase):
 
     def test_snapshot_prompts_match_a_direct_review_byte_for_byte(self):
         for argv in (("--mode", "branch", "--base", "main"),
+                     ("--mode", "branch", "--base", "@{-1}"),
                      ("--mode", "commit"),
+                     ("--mode", "commit", "--commit", "HEAD~1"),
                      ("--mode", "branch", "--base", "main", "--prompt-file", "notes.md",
                       "--dataset", "data.json", "--source-context-file", "calc.py",
                       "--max-priority", "P2")):
@@ -520,6 +605,83 @@ class SnapshotModeTests(unittest.TestCase):
                                      engine=self.recording_engine(inspect)), 0, self.stderr)
         self.assertFalse(markers.exists(), markers.read_text(encoding="utf-8") if markers.exists() else "")
         self.assertEqual(seen, {"raw": "raw bytes\n", "outside": True, "skip_worktree": []})
+        self.assert_no_snapshot_left()
+
+    def worktree_only_config(self, body):
+        """Config that Git applies only inside linked worktrees such as the snapshot."""
+        markers = self.root / "markers"
+        smudge = write_executable(self.root / "smudge", (
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"open({str(markers)!r}, 'a').write('smudge\\n')\n"
+            "sys.stdout.write(sys.stdin.read())\n"
+        ))
+        included = self.root / "worktree-only.cfg"
+        included.write_text(body.format(smudge=Path(smudge).as_posix()), encoding="utf-8")
+        git(self.repo, "config", "includeIf.gitdir:**/worktrees/**.path", included.as_posix())
+        (self.repo / ".gitattributes").write_text("*.dat filter=evil\n", encoding="utf-8")
+        (self.repo / "raw.dat").write_text("raw bytes\n", encoding="utf-8")
+        git(self.repo, "add", ".gitattributes", "raw.dat")
+        git(self.repo, "commit", "-qm", "attributes")
+        self.assertNotIn("filter.evil.smudge", git(self.repo, "config", "--includes", "--list"))
+        return markers
+
+    @unittest.skipIf(os.name == "nt", "POSIX filter execution and gitdir matching")
+    def test_worktree_only_conditional_include_is_refused_before_any_snapshot(self):
+        markers = self.worktree_only_config('[filter "evil"]\n\tsmudge = "{smudge}"\n')
+        # Control: a plain linked worktree of this repository runs the hidden filter.
+        control = self.root / "control"
+        git(self.repo, "worktree", "add", "-q", "--detach", str(control), "HEAD")
+        self.assertIn("smudge", markers.read_text(encoding="utf-8"))
+        git(self.repo, "worktree", "remove", "--force", str(control))
+        markers.unlink()
+        with self.assertRaisesRegex(SystemExit, "--snapshot refuses Git config with gitdir-conditional includes"):
+            self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args())
+        self.assertFalse(markers.exists())
+        self.assertNotIn("snapshot: ", self.stdout)
+        self.assertEqual(self.observed, [])
+        self.assert_no_snapshot_left()
+
+    @unittest.skipIf(os.name == "nt", "POSIX filter execution and gitdir matching")
+    def test_snapshot_context_filters_are_neutralized_before_population(self):
+        # Defense in depth behind the include refusal: the snapshot's own config
+        # context is enumerated after a no-checkout add and before any file exists.
+        markers = self.worktree_only_config('[filter "evil"]\n\tsmudge = "{smudge}"\n')
+        seen = {}
+
+        def inspect(snapshot):
+            seen["raw"] = (snapshot / "raw.dat").read_text(encoding="utf-8")
+            seen["visible"] = git(snapshot, "config", "--includes", "--get", "filter.evil.smudge").strip()
+
+        self.assertEqual(self.invoke(
+            "--mode", "branch", "--base", "main", *self.snapshot_args(),
+            engine=self.recording_engine(inspect),
+            patches={"conditional_include_refusal": lambda _keys: None},
+        ), 0, self.stderr)
+        self.assertFalse(markers.exists(), "the worktree-only smudge filter ran")
+        self.assertEqual(seen["raw"], "raw bytes\n")
+        self.assertTrue(seen["visible"])
+        self.assert_no_snapshot_left()
+
+    def test_config_defined_hooks_refuse_before_any_snapshot(self):
+        # Refused by key, independent of whether this Git runs config-defined hooks.
+        git(self.repo, "config", "hook.probe.command", "probe-hook")
+        git(self.repo, "config", "hook.probe.event", "post-checkout")
+        with self.assertRaisesRegex(SystemExit, "--snapshot refuses config-defined Git hooks"):
+            self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args())
+        self.assertNotIn("snapshot: ", self.stdout)
+        self.assertEqual(self.observed, [])
+        self.assert_no_snapshot_left()
+
+    @unittest.skipIf(os.name == "nt", "POSIX gitdir matching")
+    def test_snapshot_only_config_hooks_refuse_after_no_checkout_add(self):
+        # Visible only inside the snapshot: refused after the no-checkout add.
+        self.worktree_only_config('[hook "probe"]\n\tcommand = probe-hook\n\tevent = post-checkout\n')
+        with self.assertRaisesRegex(SystemExit, "--snapshot refuses config-defined Git hooks"):
+            self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args(),
+                        patches={"conditional_include_refusal": lambda _keys: None})
+        self.assertIn("snapshot: ", self.stdout)
+        self.assertEqual(self.observed, [])
         self.assert_no_snapshot_left()
 
     def test_run_history_keeps_operator_identity_and_records_snapshot(self):
