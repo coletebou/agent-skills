@@ -4,6 +4,7 @@
 
 - Accept `ultrafast` for Autoreview's `--codex-speed` and `AUTOREVIEW_CODEX_SPEED`, sending Codex the Ultrafast service tier when the active model catalog lists it.
 - Add `team-handoff`: start a worktree session on a shared OpenClaw Gateway behind Cloudflare Access as the operator's own identity in one `sessions.create` request, with status/archive helpers and an opt-in SSH operator fallback.
+- Add opt-in Autoreview `--snapshot` (`AUTOREVIEW_SNAPSHOT=1`) for branch and commit reviews: the frozen commit is reviewed in a private detached worktree outside the repository, so later commits, edits and scratch files no longer abort the run. The snapshot is removed on every exit, local mode and uncommitted prompt files or datasets are refused, and existing safety controls are unchanged.
 
 ## 0.4.0 - 2026-09-30
 

@@ -35,7 +35,8 @@ exit codes or reviewer isolation.
 
 `--output`, `--json-output`, and `--status-output` paths must be outside the
 reviewed repository, both for the final directory entry after resolving parent
-symlinks and for the resolved referent. Without `--status-output`, `--output` and
+symlinks and for the resolved referent. With `--snapshot`, they must also be
+outside the snapshot worktree. Without `--status-output`, `--output` and
 `--json-output` must name different final directory entries after resolving parent
 symlinks. Distinct final symlinks or hardlinks may share an existing referent because
 publication replaces their separate entries. With `--status-output`, all output

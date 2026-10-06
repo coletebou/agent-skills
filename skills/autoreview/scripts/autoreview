@@ -659,7 +659,7 @@ def safe_git_env(repo: Path) -> dict[str, str]:
     if developer := env.get("DEVELOPER_DIR"):
         bases = (Path(developer), Path(developer) / "Contents" / "Developer")
         paths = (base / suffix for base in bases for suffix in (".", "usr/bin/xcrun", "usr/bin/git"))
-        if any(not path.is_absolute() or is_within(Path(os.path.abspath(path)), repo.resolve())
+        if any(not path.is_absolute() or repository_owned(Path(os.path.abspath(path)), repo)
                or not external_env_path(repo, str(path)) for path in paths):
             raise SystemExit("Git refuses relative or repository-owned DEVELOPER_DIR")
     env.update({
@@ -755,7 +755,7 @@ def global_excludes_file(repo: Path) -> Path | None:
         resolved = candidate.resolve(strict=True)
     except OSError:
         return None
-    if is_within(resolved, repo.resolve()) or not resolved.is_file():
+    if repository_owned(resolved, repo) or not resolved.is_file():
         return None
     return resolved
 
@@ -768,7 +768,7 @@ def global_excludes_git_args(repo: Path) -> list[str]:
 
 def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
     entries: list[str] = []
-    resolved_repo = repo.resolve()
+    owned_roots = repository_roots(repo)
 
     def add(path: str | Path) -> None:
         candidate = Path(path).expanduser()
@@ -778,7 +778,7 @@ def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
             resolved = candidate.resolve()
         except OSError:
             return
-        if is_within(resolved, resolved_repo):
+        if any(is_within(resolved, root) for root in owned_roots):
             return
         value = str(resolved)
         if value not in entries:
@@ -807,7 +807,7 @@ def external_env_path(repo: Path, value: str) -> bool:
         resolved = Path(value).expanduser().resolve()
     except OSError:
         return False
-    return not is_within(resolved, repo.resolve())
+    return not repository_owned(resolved, repo)
 
 
 def normalize_external_env_path_value(
@@ -824,7 +824,7 @@ def normalize_external_env_path_value(
             resolved = Path(item).expanduser().resolve()
         except OSError:
             return None
-        if is_within(resolved, repo.resolve()):
+        if repository_owned(resolved, repo):
             return None
         normalized.append(str(resolved))
     return os.pathsep.join(normalized) if normalized else None
@@ -846,7 +846,7 @@ def safe_temp_root(repo: Path, *, engine: str | None = None) -> Path:
         root = Path(tempfile.gettempdir()).resolve(strict=True)
     except OSError as exc:
         raise SystemExit(f"unable to resolve temporary directory: {exc}") from exc
-    if is_within(root, repo.resolve()):
+    if repository_owned(root, repo):
         raise SystemExit(
             "temporary directory must be outside the reviewed repository; "
             "unset or relocate TMPDIR/TMP/TEMP"
@@ -2099,6 +2099,9 @@ def discover_repo_root(start: Path) -> Path | None:
 
 
 def current_branch(repo: Path) -> str:
+    if _SNAPSHOT_ORIGINS and (origin := _SNAPSHOT_ORIGINS.get(repo.resolve())) is not None:
+        # A detached snapshot keeps the branch label of the checkout it froze.
+        return origin.branch
     return git(repo, "branch", "--show-current", check=False).strip() or "detached"
 
 
@@ -2156,7 +2159,7 @@ def safe_gh_env(repo: Path) -> dict[str, str]:
         values = raw.split(os.pathsep) if key == "SSL_CERT_DIR" else [raw]
         if any(not Path(value).is_absolute() for value in values):
             raise SystemExit(f"PR-base discovery refuses relative {key}; pass --base explicitly")
-        if any(is_within(Path(os.path.abspath(value)), repo.resolve()) for value in values):
+        if any(repository_owned(Path(os.path.abspath(value)), repo) for value in values):
             raise SystemExit(f"PR-base discovery refuses repository-owned {key}; pass --base explicitly")
         normalized = normalize_external_env_path_value(repo, key, raw)
         if normalized is None:
@@ -2174,7 +2177,7 @@ def safe_gh_env(repo: Path) -> dict[str, str]:
             raise SystemExit("PR-base discovery has no GitHub CLI home; pass --base explicitly")
         config_dir = Path(env[home_key]) / ".config" / "gh"
     for path in (config_dir, config_dir / "config.yml", config_dir / "hosts.yml"):
-        if (is_within(Path(os.path.abspath(path)), repo.resolve())
+        if (repository_owned(Path(os.path.abspath(path)), repo)
                 or not external_env_path(repo, str(path))):
             raise SystemExit("PR-base discovery refuses repository-owned GitHub CLI configuration; pass --base explicitly")
     env["GH_CONFIG_DIR"] = str(config_dir.resolve())
@@ -2242,14 +2245,18 @@ def preflight_git() -> bool:
 
 def find_command(name: str, repo: Path) -> str | None:
     command = Path(name)
+    # A review snapshot keeps the operator checkout it froze untrusted as well.
+    origin_roots = snapshot_origin_roots(repo)
     if has_directory_component(name, command):
         base = command if command.is_absolute() else repo / command
-        if is_within(
-            Path(os.path.abspath(base)),
-            Path(os.path.abspath(repo)),
+        lexical_base = Path(os.path.abspath(base))
+        if is_within(lexical_base, Path(os.path.abspath(repo))) or any(
+            is_within(lexical_base, root) for root in origin_roots
         ):
             return None
-        return first_executable_candidate(base, reject_root=repo.resolve())
+        return first_executable_candidate(
+            base, reject_root=repo.resolve(), reject_roots=origin_roots,
+        )
     for part in os.environ.get("PATH", "").split(os.pathsep):
         if not part or part == ".":
             continue
@@ -2261,9 +2268,13 @@ def find_command(name: str, repo: Path) -> str | None:
             resolved_repo = repo.resolve()
         except OSError:
             continue
-        if is_within(resolved_part, resolved_repo):
+        if is_within(resolved_part, resolved_repo) or any(
+            is_within(resolved_part, root) for root in origin_roots
+        ):
             continue
-        found = first_executable_candidate(resolved_part / name, reject_root=resolved_repo)
+        found = first_executable_candidate(
+            resolved_part / name, reject_root=resolved_repo, reject_roots=origin_roots,
+        )
         if found:
             return found
     return None
@@ -2447,12 +2458,41 @@ def is_within(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
 
 
+class SnapshotOrigin(NamedTuple):
+    root: Path
+    branch: str
+
+
+# A --snapshot review reads content from a private linked worktree, but the
+# operator checkout it froze stays repository-owned: its executables, config
+# and environment paths remain as untrusted as in a direct review.
+_SNAPSHOT_ORIGINS: dict[Path, SnapshotOrigin] = {}
+
+
+def snapshot_origin_roots(repo: Path) -> tuple[Path, ...]:
+    if not _SNAPSHOT_ORIGINS:
+        return ()
+    origin = _SNAPSHOT_ORIGINS.get(repo.resolve())
+    return () if origin is None else (origin.root,)
+
+
+def repository_roots(repo: Path) -> tuple[Path, ...]:
+    return (repo.resolve(), *snapshot_origin_roots(repo))
+
+
+def repository_owned(path: Path, repo: Path) -> bool:
+    return any(is_within(path, root) for root in repository_roots(repo))
+
+
 def has_directory_component(name: str, command: Path) -> bool:
     separators = [separator for separator in (os.sep, os.altsep) if separator]
     return command.is_absolute() or bool(command.drive) or any(separator in name for separator in separators)
 
 
-def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -> str | None:
+def first_executable_candidate(
+    path: Path, *, reject_root: Path | None = None, reject_roots: Sequence[Path] = (),
+) -> str | None:
+    rejected = (*(() if reject_root is None else (reject_root,)), *reject_roots)
     if os.name == "nt" and not path.suffix:
         extensions = [ext for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if ext]
         candidates = [path.with_suffix(ext.lower()) for ext in extensions]
@@ -2467,9 +2507,9 @@ def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -
                 resolved_candidate = candidate.resolve(strict=True)
             except OSError:
                 continue
-            if reject_root is not None and (
-                is_within(lexical_candidate, reject_root)
-                or is_within(resolved_candidate, reject_root)
+            if any(
+                is_within(lexical_candidate, root) or is_within(resolved_candidate, root)
+                for root in rejected
             ):
                 continue
             return str(lexical_candidate)
@@ -5198,7 +5238,7 @@ def codex_auth_helper_home(repo: Path) -> Path:
         resolved = home.resolve(strict=True)
         if not home.is_absolute() or not resolved.is_dir():
             raise ValueError("unavailable HOME")
-        roots = (repo.absolute(), repo.resolve())
+        roots = (repo.absolute(), *repository_roots(repo))
         pending = [home, *home.parents]
         seen: set[Path] = set()
         while pending:
@@ -7449,8 +7489,14 @@ def _validate_report(
             try:
                 if ".." in native_path.parts:
                     raise ValueError("parent traversal")
-                repo_root = repo.resolve()
-                raw_rel = native_path.resolve().relative_to(repo_root).as_posix()
+                resolved_path = native_path.resolve()
+                # A snapshot review also maps paths in the checkout it froze.
+                for repo_root in repository_roots(repo):
+                    if is_within(resolved_path, repo_root):
+                        break
+                else:
+                    raise ValueError("outside repository")
+                raw_rel = resolved_path.relative_to(repo_root).as_posix()
                 # Prefer a changed symlink's identity over its resolved target.
                 for candidate_root in reversed(native_path.parents):
                     try:
@@ -7668,6 +7714,19 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def snapshot_enabled(explicit: bool | None) -> bool:
+    if explicit is not None:
+        return explicit
+    value = os.environ.get("AUTOREVIEW_SNAPSHOT", "0").strip().casefold()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise SystemExit(
+        "invalid AUTOREVIEW_SNAPSHOT value; use 1/true/yes/on or 0/false/no/off"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     codex_auth_explicit = any(
         argument == "--codex-auth" or argument.startswith("--codex-auth=")
@@ -7699,6 +7758,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
+    snapshot_group = parser.add_mutually_exclusive_group()
+    snapshot_group.add_argument(
+        "--snapshot",
+        dest="snapshot",
+        action="store_true",
+        default=None,
+        help="Branch/commit modes: review a private detached worktree of the frozen commit (branch HEAD or --commit) outside the repository, removed on exit, so later edits or commits in this checkout cannot abort the run. --prompt-file/--dataset must be committed and unchanged. Env: AUTOREVIEW_SNAPSHOT=1.",
+    )
+    snapshot_group.add_argument(
+        "--no-snapshot",
+        dest="snapshot",
+        action="store_false",
+        help="Review the checkout in place even when AUTOREVIEW_SNAPSHOT is enabled.",
+    )
     parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument(
         "--model",
@@ -7848,6 +7921,7 @@ def parse_args() -> argparse.Namespace:
     args.codex_profile_explicit = codex_profile_explicit
     args.claude_auth_explicit = claude_auth_explicit
     args.route_fallback_explicit = explicit_route_fallback_options
+    args.snapshot = snapshot_enabled(args.snapshot)
     if args.engine not in ENGINES:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
     if args.max_priority not in ("P0", "P1", "P2", "P3"):
@@ -8382,6 +8456,11 @@ class RunEvidence:
                     self.run_dir / "prompts.json",
                     json.dumps(prompts, indent=2) + "\n",
                 )
+            self.persist_locked()
+
+    def record_snapshot(self, commit: str, path: Path) -> None:
+        with self.lock:
+            self.data["snapshot"] = {"commit": commit, "path": str(path)}
             self.persist_locked()
 
     def start_reviewer(self, reviewer: argparse.Namespace, pass_index: int) -> int:
@@ -9187,7 +9266,7 @@ def run_review_passes(
 
 def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
     """Validate all destinations, then freeze their original cwd/tilde meaning."""
-    repo_root_path = repo.resolve()
+    repo_roots = repository_roots(repo)
     distinct_referents = bool(getattr(args, "status_output", None))
     outputs: list[tuple[str, Path]] = []
     destinations: dict[str, str] = {}
@@ -9219,7 +9298,8 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
             if same:
                 raise SystemExit(f"{option} must use a different path from {previous_option}")
         outputs.append((option, comparison_path))
-        for candidate in (entry, resolved):
+        for candidate, repo_root_path in ((candidate, root) for candidate in (entry, resolved)
+                                          for root in repo_roots):
             inside_repo = candidate.is_relative_to(repo_root_path)
             if not inside_repo:
                 for ancestor in (candidate, *candidate.parents):
@@ -9275,6 +9355,275 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
     atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n")
 
 
+class ReviewSnapshot(NamedTuple):
+    root: Path
+    commit: str
+    target_ref: str | None
+
+
+def snapshot_local_refusal(*, auto_selected: bool) -> str:
+    reason = (
+        "--mode auto selected local work because the checkout has uncommitted changes"
+        if auto_selected
+        else "local mode reviews the index and working tree"
+    )
+    return (
+        f"--snapshot reviews committed content only; {reason}, which a frozen commit "
+        "cannot represent. Commit the work and use --mode branch or --mode commit, "
+        "or rerun without --snapshot (--no-snapshot overrides AUTOREVIEW_SNAPSHOT)"
+    )
+
+
+def snapshot_evidence_refusal(label: str, path: str, problem: str, commit: str) -> str:
+    return (
+        f"--snapshot reviews committed content only: {label} {display_escape(path, 500)} "
+        f"{problem} {commit}; commit it, or rerun without --snapshot"
+    )
+
+
+def committed_evidence_files(
+    args: argparse.Namespace, repo: Path, commit: str,
+) -> list[EvidenceFile]:
+    """Validate prompt files and datasets in the operator checkout before freezing.
+
+    The snapshot holds only the frozen commit. A path it would read differently
+    is refused; uncommitted bytes are never copied into the snapshot.
+    """
+    records = []
+    for label, paths in (("--prompt-file", args.prompt_file), ("--dataset", args.dataset)):
+        for raw_path in paths or []:
+            # Direct-review validation first, with its exact refusals.
+            record = capture_evidence_file(repo, raw_path, label)
+            try:
+                committed = git_source_version(repo, record.raw_path, commit).mode is not None
+            except SystemExit:
+                committed = False  # A symlink or gitlink entry is not a committed file.
+            if not committed:
+                raise SystemExit(snapshot_evidence_refusal(
+                    label, record.raw_path, "is untracked or uncommitted; it is not a file in frozen commit",
+                    commit,
+                ))
+            records.append(record)
+    return records
+
+
+def freeze_snapshot_evidence(
+    args: argparse.Namespace, snapshot: Path, records: list[EvidenceFile], commit: str,
+) -> None:
+    for record in records:
+        try:
+            frozen = capture_evidence_file(snapshot, record.raw_path, record.label)
+        except SystemExit:
+            frozen = None
+        if frozen is None or frozen.content != record.content:
+            raise SystemExit(snapshot_evidence_refusal(
+                record.label, record.raw_path,
+                "has uncommitted or later changes; it differs from frozen commit", commit,
+            ))
+    # Absolute in-checkout prompt files now name the same snapshot-relative path.
+    prompt_files = len(args.prompt_file or [])
+    if args.prompt_file:
+        args.prompt_file = [record.raw_path for record in records[:prompt_files]]
+    if args.dataset:
+        args.dataset = [record.raw_path for record in records[prompt_files:]]
+
+
+def snapshot_ref(snapshot: Path, ref: str, commit: str, label: str) -> str:
+    """Keep the operator's spelling when the snapshot resolves it to `commit`.
+
+    `commit` is what the ref named in the operator checkout. Per-worktree refs
+    (HEAD-relative, @{upstream}, @{-1}, FETCH_HEAD, ORIG_HEAD) can resolve
+    differently in a detached snapshot; those use the pinned commit instead.
+    """
+    try:
+        if validate_git_ref(snapshot, ref, label, pin=True) == commit:
+            return ref
+    except SystemExit:
+        pass
+    return commit
+
+
+def create_snapshot_parent(args: argparse.Namespace, repo: Path) -> Path:
+    """Create the owner-only directory for one snapshot under the run-history root."""
+    explicit = (getattr(args, "run_log_dir", None) or "").strip()
+    strict = bool(explicit or os.environ.get("AUTOREVIEW_RUN_LOG_DIR", "").strip())
+    root = Path(explicit).expanduser() if explicit else default_run_log_root()
+    try:
+        if path_overlaps_repo(root, repo):
+            raise RunLogStorageError(
+                f"autoreview snapshot root must not overlap the reviewed repository: {root}"
+            )
+        ensure_private_directory(root, parents=True)
+        snapshots = root / "snapshots"
+        ensure_private_directory(snapshots)
+        return Path(tempfile.mkdtemp(prefix="run-", dir=snapshots))
+    except OSError as exc:
+        if strict:
+            raise SystemExit(display_escape(exc, 1000)) from None
+    print("autoreview snapshot root unavailable; using private temp root", file=sys.stderr)
+    return Path(tempfile.mkdtemp(prefix="autoreview-snapshot-", dir=safe_temp_root(repo)))
+
+
+def snapshot_git_env(repo: Path, hooks: Path) -> dict[str, str]:
+    """Git environment that creates and removes a snapshot without checkout code.
+
+    Plain `git worktree add` runs reference-transaction, post-index-change and
+    post-checkout hooks, applies configured smudge/process filters, and copies
+    the current sparse-checkout cone. Hooks and filters can be checkout-owned
+    (a repository hooksPath, for example). Disable them and check out the whole
+    frozen tree; built-in line-ending conversion stays enabled.
+    """
+    env = safe_git_env(repo)
+    listed = git_result(
+        repo, "config", "--includes", "--null", "--name-only", "--get-regexp", r"^filter\.",
+        env=env, check=False,
+    )
+    if listed.returncode not in {0, 1} or (listed.returncode == 0 and not listed.stdout.endswith("\0")):
+        raise SystemExit("cannot establish executable Git filter configuration")
+    drivers: set[str] = set()
+    for key in listed.stdout.split("\0")[:-1]:
+        if not key.startswith("filter."):
+            raise SystemExit("invalid Git filter configuration key")
+        driver, separator, _field = key.removeprefix("filter.").rpartition(".")
+        if separator:
+            drivers.add(driver)
+    overrides = [
+        ("core.hooksPath", str(hooks)),
+        ("core.sparseCheckout", "false"),
+        ("core.sparseCheckoutCone", "false"),
+        ("submodule.recurse", "false"),
+        *((f"filter.{driver}.{field}", value)
+          for driver in sorted(drivers)
+          for field, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))),
+    ]
+    env["GIT_CONFIG_COUNT"] = str(len(overrides))
+    for index, (key, value) in enumerate(overrides):
+        # Keep arbitrary driver names separate from values, including '='.
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    applied = git_result(repo, "config", "--null", "--get", "core.hooksPath", env=env, check=False)
+    if applied.returncode != 0 or applied.stdout != f"{hooks}\0":
+        # Git versions without command-env configuration must fail closed.
+        raise SystemExit("Git cannot apply review snapshot hook and filter protection")
+    return env
+
+
+def snapshot_git(repo: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return git_result(repo, *args, env=env, check=False)
+    except SystemExit:
+        return None
+
+
+def snapshot_registered(repo: Path, worktree: Path, env: dict[str, str]) -> bool | None:
+    listed = snapshot_git(repo, env, "worktree", "list", "--porcelain", "-z")
+    if listed is None or listed.returncode != 0:
+        return None
+    return any(
+        record.startswith("worktree ") and Path(record.removeprefix("worktree ")).resolve() == worktree
+        for record in listed.stdout.split("\0")
+    )
+
+
+def remove_review_snapshot(
+    repo: Path, parent: Path, worktree: Path | None, env: dict[str, str] | None,
+) -> bool:
+    """Remove and unregister one snapshot; True only when nothing remains."""
+    with deferred_owned_process_signals():
+        registered: bool | None = False
+        if worktree is not None and env is not None:
+            snapshot_git(repo, env, "worktree", "remove", "--force", "--force", str(worktree))
+        shutil.rmtree(parent, ignore_errors=True)
+        if worktree is not None and env is not None:
+            registered = snapshot_registered(repo, worktree, env)
+            if registered:
+                # Its directory is gone; prune the stale administrative entry.
+                snapshot_git(repo, env, "worktree", "prune")
+                registered = snapshot_registered(repo, worktree, env)
+        return registered is False and not os.path.lexists(parent)
+
+
+@contextlib.contextmanager
+def review_snapshot(
+    args: argparse.Namespace, repo: Path, target: str, target_ref: str | None, branch: str,
+):
+    """Freeze the selected commit into a private detached worktree outside the repo.
+
+    Target, base and evidence selection ran in the operator checkout. The review
+    then runs as if invoked in the snapshot, which nothing else writes, so later
+    commits, edits and scratch files there cannot invalidate it. The snapshot is
+    removed and unregistered on every exit, including failures and interrupts.
+    """
+    commit = validate_git_ref(repo, "HEAD" if target == "branch" else args.commit, "commit", pin=True)
+    base = None
+    if target == "branch":
+        assert target_ref is not None
+        try:
+            base = validate_git_ref(repo, target_ref, "base", pin=True)
+        except SystemExit:
+            pass  # Bundle preparation reports it exactly as a direct review does.
+    evidence = committed_evidence_files(args, repo, commit)
+    parent: Path | None = None
+    worktree: Path | None = None
+    env: dict[str, str] | None = None
+    try:
+        # Absolute: a relative hooksPath would resolve inside the operator checkout.
+        parent = create_snapshot_parent(args, repo).resolve()
+        if path_overlaps_repo(parent, repo):
+            raise SystemExit("autoreview snapshot must be outside the reviewed repository")
+        # Fixed distinct names: the checkout can never land in the empty hooks path.
+        worktree = parent / "checkout"
+        _SNAPSHOT_ORIGINS[worktree] = SnapshotOrigin(repo.resolve(), branch)
+        hooks = parent / "no-hooks"
+        hooks.mkdir(mode=0o700)
+        env = snapshot_git_env(repo, hooks)
+        print(f"snapshot: {display_escape(worktree, 1000)}", flush=True)
+        print(f"snapshot_commit: {commit}", flush=True)
+        with PreparationProgress("snapshot creation"):
+            created = snapshot_git(
+                repo, env, *git_line_ending_args(repo),
+                "worktree", "add", "--detach", "--quiet", str(worktree), commit,
+            )
+        if created is None or created.returncode != 0:
+            detail = "" if created is None else (created.stderr or created.stdout).strip()
+            raise SystemExit(
+                f"could not create the review snapshot of {commit}"
+                + (f":\n{display_escape(detail, 1000, multiline=True)}" if detail else "")
+                + "\nSnapshots check out the whole frozen commit without hooks, filters or "
+                "object fetching; rerun without --snapshot if that is not possible."
+            )
+        worktree.chmod(0o700)
+        if validate_git_ref(worktree, "HEAD", "commit", pin=True) != commit:
+            raise SystemExit("review snapshot does not match the frozen commit")
+        freeze_snapshot_evidence(args, worktree, evidence, commit)
+        if target == "commit":
+            args.commit = snapshot_ref(worktree, args.commit, commit, "commit")
+        elif base is not None:
+            assert target_ref is not None
+            target_ref = snapshot_ref(worktree, target_ref, base, "base")
+        # Outputs stay outside the snapshot as well as the operator checkout.
+        prepare_output_paths(args, worktree)
+        yield ReviewSnapshot(worktree, commit, target_ref)
+    finally:
+        if worktree is not None:
+            _SNAPSHOT_ORIGINS.pop(worktree, None)
+        if parent is not None:
+            if remove_review_snapshot(repo, parent, worktree, env):
+                print("snapshot: removed", file=sys.stderr, flush=True)
+            else:
+                location = shlex.quote(str(worktree or parent))
+                checkout = shlex.quote(str(repo))
+                print(
+                    display_escape(
+                        f"autoreview snapshot cleanup incomplete: {location}\nRemove it with: "
+                        f"git -C {checkout} worktree remove --force {location}; "
+                        f"git -C {checkout} worktree prune",
+                        2000, multiline=True,
+                    ),
+                    file=sys.stderr, flush=True,
+                )
+
+
 def main() -> int:
     with OwnedProcessSignalHandlers():
         try:
@@ -9310,7 +9659,16 @@ def main_impl() -> int:
 
 
 def main_with_args(args: argparse.Namespace) -> int:
+    # A snapshot review registers its worktree removal here, for every exit path.
+    with contextlib.ExitStack() as cleanup:
+        return review_with_args(args, cleanup)
+
+
+def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) -> int:
     reviewers = reviewer_args(args)
+    snapshot = getattr(args, "snapshot", False) is True
+    if snapshot and args.mode in {"local", "uncommitted"}:
+        raise SystemExit(snapshot_local_refusal(auto_selected=False))
     if not preflight_git():
         return 2
     with PreparationProgress("target selection"):
@@ -9320,6 +9678,8 @@ def main_with_args(args: argparse.Namespace) -> int:
             Path(args.status_output).unlink(missing_ok=True)
         target, target_ref = choose_target(repo, args.mode, args.base)
         branch = current_branch(repo)
+    if snapshot and target == "local":
+        raise SystemExit(snapshot_local_refusal(auto_selected=True))
     print(f"autoreview target: {target}", flush=True)
     print(f"branch: {branch}", flush=True)
     reviewer = reviewers[0]
@@ -9345,11 +9705,16 @@ def main_with_args(args: argparse.Namespace) -> int:
     display_ref = args.commit if target == "commit" else target_ref
     if display_ref:
         print(f"ref: {display_ref}", flush=True)
+    history_repo = repo
+    frozen = None
+    if snapshot:
+        frozen = cleanup.enter_context(review_snapshot(args, repo, target, target_ref, branch))
+        repo, target_ref = frozen.root, frozen.target_ref
     if args.dry_run:
         return dry_run_preflight(args, reviewers, repo, target, target_ref)
 
     run_evidence = (
-        create_run_evidence(args, repo, target, display_ref, reviewers)
+        create_run_evidence(args, history_repo, target, display_ref, reviewers)
         if run_log_enabled(args)
         else None
     )
@@ -9358,6 +9723,8 @@ def main_with_args(args: argparse.Namespace) -> int:
         for selected_reviewer in reviewers:
             selected_reviewer.run_evidence = run_evidence
         print(f"run_log: {run_evidence.run_dir}", flush=True)
+        if frozen is not None:
+            run_evidence.record_snapshot(frozen.commit, frozen.root)
 
     with PreparationProgress("evidence selection"):
         evidence = capture_evidence_inputs(args, repo)

@@ -409,7 +409,9 @@ private completion field must confirm a finished assessment; deferring to
 another pass leaves the overall review incomplete.
 
 Do not edit inputs during a review: the helper verifies captured sources before
-sending and publishing results. Long reviews are normal; advancing heartbeats
+sending and publishing results, and any change aborts the run after the review.
+To keep working in the same checkout, use [snapshot mode](#keep-working-during-a-review).
+Long reviews are normal; advancing heartbeats
 mean progress. Use `--stream-engine-output` for visibility, not extra reviewer
 runs. `--dry-run` checks preparation and startup without contacting a reviewer.
 Both dry runs and execution print planned pass count and total prompt bytes.
@@ -419,6 +421,35 @@ There is no default pass ceiling. `--engine-timeout-seconds` remains an optional
 deadline per process attempt. Pass counts, prompt bytes, and deadlines are not
 token hard caps; they do not bound model reasoning or tool use.
 
+### Keep working during a review
+
+When you will keep editing, committing, or creating scratch files in the checkout
+while a branch or commit review runs, add `--snapshot` (or `AUTOREVIEW_SNAPSHOT=1`;
+`--no-snapshot` overrides it):
+
+```bash
+"$AUTOREVIEW" --mode branch --base origin/main --snapshot
+```
+
+Target, base and frozen commit (branch HEAD or `--commit`) resolve in your checkout.
+The helper then creates an owner-only detached `git worktree` of that commit under
+the private run-history root (`<root>/snapshots/`), prints `snapshot:` and
+`snapshot_commit:`, and runs the whole review there, so later changes to your
+checkout cannot abort it. The snapshot is removed and unregistered on success,
+failure, timeout and interrupt. A hard kill can leave one behind; clear it with
+`git worktree remove --force <path>` and `git worktree prune`.
+
+- Committed content only: `--mode local`, and `--mode auto` on a dirty checkout,
+  are refused. `--prompt-file` and `--dataset` must be committed and identical to
+  the frozen commit; untracked, staged-only or modified files are refused, never copied.
+- Prompt text, path rules, sensitive-path refusals, pre-send scanning, isolation and
+  run history match a direct review of that commit. A ref that names another commit
+  inside the detached snapshot (`--base @{-1}`, `--commit HEAD~1`) is pinned to the
+  commit it named in your checkout.
+- Your checkout stays repository-owned for executables, environment paths and
+  outputs. Creation runs no Git hooks, filters or sparse cone, checks out the whole
+  commit, and never fetches missing objects.
+
 ## Diagnostics and results
 
 Follow the [diagnostic and result guidance](references/diagnostics-and-results.md)
@@ -427,7 +458,8 @@ for local stage observation, output paths, exit codes, status, and usage.
 ## Private run history
 
 Owner-only metadata records model, effort, route, duration, retries, refusals,
-service tier, and outcome. `--no-run-log` disables it. Set
+service tier, and outcome; snapshot reviews also record the snapshot path and
+commit. `--no-run-log` disables it. Set
 `AUTOREVIEW_RUN_LOG_DIR` to an external private history root; set
 `AUTOREVIEW_RUN_LOG_BUNDLE=1` to retain scanner-approved bundles, prompts, and
 final reports. Do not store history inside the reviewed repository or commit it.
