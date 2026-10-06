@@ -9754,6 +9754,8 @@ def main_with_args(args: argparse.Namespace) -> int:
 
 
 def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) -> int:
+    # sanitized_main() finalizes this run's history after the review returns.
+    global _ACTIVE_RUN_EVIDENCE
     reviewers = reviewer_args(args)
     snapshot = getattr(args, "snapshot", False) is True
     if snapshot and args.mode in {"local", "uncommitted"}:
@@ -9944,6 +9946,17 @@ def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) ->
     return exit_code
 
 
+def finish_run_evidence(exit_code: int, *, error_type: str | None = None) -> None:
+    """Finalize private run history; a storage failure never changes the review result."""
+    if _ACTIVE_RUN_EVIDENCE is None:
+        return
+    try:
+        _ACTIVE_RUN_EVIDENCE.finish(exit_code, error_type=error_type)
+    except OSError as exc:
+        print(f"autoreview history could not be finalized: {display_escape(exc, 500)}",
+              file=sys.stderr, flush=True)
+
+
 def sanitized_main() -> int:
     stdout = ProxyRedactedOutput(sys.stdout)
     stderr = ProxyRedactedOutput(sys.stderr)
@@ -9957,19 +9970,16 @@ def sanitized_main() -> int:
             stderr.finish()
     except SystemExit as exc:
         exit_code = exc.code if isinstance(exc.code, int) else 1
-        if _ACTIVE_RUN_EVIDENCE is not None:
-            _ACTIVE_RUN_EVIDENCE.finish(exit_code, error_type="SystemExit")
+        finish_run_evidence(exit_code, error_type="SystemExit")
         if isinstance(exc.code, str):
             raise SystemExit(
                 display_escape(exc.code, 4000, multiline=True)
             ) from None
         raise
     except BaseException as exc:
-        if _ACTIVE_RUN_EVIDENCE is not None:
-            _ACTIVE_RUN_EVIDENCE.finish(1, error_type=type(exc).__name__)
+        finish_run_evidence(1, error_type=type(exc).__name__)
         raise
-    if _ACTIVE_RUN_EVIDENCE is not None:
-        _ACTIVE_RUN_EVIDENCE.finish(exit_code)
+    finish_run_evidence(exit_code)
     return exit_code
 
 

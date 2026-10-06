@@ -1746,6 +1746,40 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
             self.assertEqual(saved_prompts, scans)
 
+    def test_run_history_records_completed_and_error_status(self):
+        def metadata(history):
+            runs = list((Path(history) / "runs").iterdir())
+            self.assertEqual(len(runs), 1)
+            return json.loads((runs[0] / "metadata.json").read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-finish.") as history, \
+                self.preparation_fixture("--run-log-dir", history):
+            self.assertEqual(self.helper["sanitized_main"](), 0)
+            finished = metadata(history)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["exit_code"], 0)
+        self.assertIsNone(finished["error_type"])
+        self.assertIn("finished_at", finished)
+
+        failure = self.helper["ReviewerUnavailable"]("synthetic reviewer failure", reason="engine_failed")
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-error.") as history, \
+                self.preparation_fixture("--run-log-dir", history):
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                    "run_engine": mock.Mock(side_effect=failure)}), self.assertRaises(SystemExit):
+                self.helper["sanitized_main"]()
+            failed = metadata(history)
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["exit_code"], 1)
+        self.assertEqual(failed["error_type"], "SystemExit")
+
+    def test_run_history_finalization_failure_keeps_the_review_exit_code(self):
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-finalize.") as history, \
+                self.preparation_fixture("--run-log-dir", history) as (_repo, sends, _stdout, stderr), \
+                mock.patch.object(self.helper["RunEvidence"], "finish", side_effect=OSError("disk full")):
+            self.assertEqual(self.helper["sanitized_main"](), 0)
+        self.assertTrue(sends)
+        self.assertIn("autoreview history could not be finalized", stderr.getvalue())
+
     @contextlib.contextmanager
     def without_reviewer_defaults(self):
         with mock.patch.dict(os.environ):
