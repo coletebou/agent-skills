@@ -3819,16 +3819,27 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     return CapturedBundle(text, paths, commit=refs[-1])
 
 
-def build_bundle(
-    repo: Path, target: str, target_ref: str | None, commit_ref: str,
-    *, base_label: str | None = None,
-) -> CapturedBundle:
+def build_bundle(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> CapturedBundle:
     if target == "local":
         return local_bundle(repo, target_ref)
     if target == "branch":
         assert target_ref
-        return branch_bundle(repo, target_ref, base_label)
+        return branch_bundle(repo, target_ref)
     return commit_bundle(repo, commit_ref)
+
+
+def build_review_bundle(
+    repo: Path, target: str, target_ref: str | None, commit_ref: str,
+    frozen: ReviewSnapshot | None,
+) -> CapturedBundle:
+    """Direct reviews resolve refs as before; a snapshot reads its pinned ids."""
+    if frozen is None:
+        return build_bundle(repo, target, target_ref, commit_ref)
+    if target == "branch":
+        assert target_ref and frozen.base
+        # The bundle text keeps the operator's spelling, as in a direct review.
+        return branch_bundle(repo, frozen.base, base_label=target_ref)
+    return build_bundle(repo, target, target_ref, frozen.commit)
 
 
 def relative_evidence_path(repo: Path, raw_path: str, label: str) -> Path:
@@ -8950,8 +8961,7 @@ def dry_run_preflight(
     target: str,
     target_ref: str | None,
     *,
-    bundle_ref: str | None = None,
-    bundle_commit: str | None = None,
+    frozen: ReviewSnapshot | None = None,
 ) -> int:
     """Build and verify real review inputs, then probe reviewer startup.
 
@@ -8972,12 +8982,7 @@ def dry_run_preflight(
     bundle_ok = True
     try:
         with PreparationProgress("bundle preparation"):
-            captured = build_bundle(
-                repo, target,
-                target_ref if bundle_ref is None else bundle_ref,
-                args.commit if bundle_commit is None else bundle_commit,
-                base_label=target_ref,
-            )
+            captured = build_review_bundle(repo, target, target_ref, args.commit, frozen)
             for reviewer in reviewers:
                 require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
@@ -9798,14 +9803,15 @@ def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) ->
         print(f"ref: {display_ref}", flush=True)
     history_repo = repo
     frozen = None
-    # Git reads these; target_ref and args.commit stay the prompt/display spelling.
-    bundle_ref, bundle_commit = target_ref, args.commit
     if snapshot:
+        # Git reads frozen's pinned ids; target_ref and args.commit stay the
+        # prompt and display spelling.
         frozen = cleanup.enter_context(review_snapshot(args, repo, target, target_ref, branch))
-        repo, bundle_ref, bundle_commit = frozen.root, frozen.base, frozen.commit
+        repo = frozen.root
     if args.dry_run:
-        return dry_run_preflight(args, reviewers, repo, target, target_ref,
-                                 bundle_ref=bundle_ref, bundle_commit=bundle_commit)
+        if frozen is not None:
+            return dry_run_preflight(args, reviewers, repo, target, target_ref, frozen=frozen)
+        return dry_run_preflight(args, reviewers, repo, target, target_ref)
 
     run_evidence = (
         create_run_evidence(args, history_repo, target, display_ref, reviewers)
@@ -9825,7 +9831,7 @@ def review_with_args(args: argparse.Namespace, cleanup: contextlib.ExitStack) ->
     with PreparationProgress("initial source snapshot") as progress:
         review_source_snapshot = source_tree_snapshot(repo, progress)
     with PreparationProgress("bundle/evidence preparation"):
-        captured = build_bundle(repo, target, bundle_ref, bundle_commit, base_label=target_ref)
+        captured = build_review_bundle(repo, target, target_ref, args.commit, frozen)
         require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
             target_ref = args.commit
