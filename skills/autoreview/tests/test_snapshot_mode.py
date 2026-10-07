@@ -700,6 +700,34 @@ class SnapshotModeTests(unittest.TestCase):
         # Control: the same config is fine for a direct review.
         self.assertEqual(self.invoke("--mode", "branch", "--base", "main", "--run-log-dir", str(self.state)), 0, self.stderr)
 
+    def test_worktree_scoped_diff_settings_reach_the_snapshot_so_the_review_matches_a_direct_one(self):
+        # With extensions.worktreeConfig, `git worktree add` copies the main worktree's config.worktree into
+        # the snapshot, so a diff driver set only there classifies the change the same way in both reviews.
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(self.repo, "config", "--worktree", "diff.doc.binary", "true")
+        (self.repo / ".gitattributes").write_text("*.txt diff=doc\n", encoding="utf-8")
+        (self.repo / "doc.txt").write_text("one\n", encoding="utf-8")
+        git(self.repo, "add", ".gitattributes", "doc.txt")
+        git(self.repo, "commit", "-qm", "doc")
+        (self.repo / "doc.txt").write_text("two\n", encoding="utf-8")
+        git(self.repo, "commit", "-qam", "change doc")
+        # Control: the setting changes this diff in the operator checkout.
+        self.assertIn("Binary files", git(self.repo, "diff", "HEAD~1", "HEAD", "--", "doc.txt"))
+
+        def outcome(*argv):
+            self.observed.clear()
+            try:
+                code = self.invoke("--mode", "branch", "--base", "HEAD~1", *argv)
+            except SystemExit as exc:
+                return "refused", str(exc)
+            return "ran", code, self.observed[-1]["prompt"]
+
+        direct = outcome()
+        frozen = outcome(*self.snapshot_args())
+        self.assertIn("inary", direct[1] if direct[0] == "refused" else direct[2])
+        self.assertEqual(frozen, direct)
+        self.assert_no_snapshot_left()
+
     @unittest.skipIf(os.name == "nt", "POSIX gitdir matching")
     def test_snapshot_only_config_hooks_refuse_after_no_checkout_add(self):
         # Visible only inside the snapshot: refused after the no-checkout add.
