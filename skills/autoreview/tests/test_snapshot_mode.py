@@ -673,6 +673,33 @@ class SnapshotModeTests(unittest.TestCase):
         self.assertEqual(self.observed, [])
         self.assert_no_snapshot_left()
 
+    @unittest.skipIf(os.name == "nt", "POSIX path handling")
+    def test_shared_work_tree_setting_cannot_point_the_snapshot_reset_at_the_operator_checkout(self):
+        # With extensions.worktreeConfig a shared core.worktree applies to linked worktrees too,
+        # so `reset --hard` run inside the snapshot would rewrite the operator checkout.
+        (self.repo / "notes.md").write_bytes(b"LOCAL EDIT\n")  # tracked edit the reset would erase
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(self.repo, "config", "core.worktree", str(self.repo))
+        with self.assertRaisesRegex(SystemExit, "--snapshot refuses a Git work tree setting"):
+            self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args())
+        self.assertEqual((self.repo / "notes.md").read_bytes(), b"LOCAL EDIT\n")
+        self.assertEqual(self.observed, [])
+        self.assert_no_snapshot_left()
+
+    def test_branch_conditional_include_is_refused_before_any_snapshot(self):
+        # The detached snapshot never matches onbranch:, so Git would read other config there
+        # (here diff.foo.binary): the snapshot bundle could differ from a direct review's.
+        included = self.root / "onbranch.cfg"
+        included.write_text('[diff "foo"]\n\tbinary = true\n', encoding="utf-8")
+        git(self.repo, "config", "includeIf.onbranch:feature.path", included.as_posix())
+        with self.assertRaisesRegex(SystemExit, "--snapshot refuses Git config with branch-conditional includes"):
+            self.invoke("--mode", "branch", "--base", "main", *self.snapshot_args())
+        self.assertNotIn("snapshot: ", self.stdout)
+        self.assertEqual(self.observed, [])
+        self.assert_no_snapshot_left()
+        # Control: the same config is fine for a direct review.
+        self.assertEqual(self.invoke("--mode", "branch", "--base", "main", "--run-log-dir", str(self.state)), 0, self.stderr)
+
     @unittest.skipIf(os.name == "nt", "POSIX gitdir matching")
     def test_snapshot_only_config_hooks_refuse_after_no_checkout_add(self):
         # Visible only inside the snapshot: refused after the no-checkout add.

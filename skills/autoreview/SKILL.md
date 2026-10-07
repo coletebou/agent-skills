@@ -448,9 +448,10 @@ failure, timeout and interrupt. A hard kill can leave one behind; clear it with
   isolation and run history match a direct review of that commit.
 - Your checkout stays repository-owned for executables, environment paths and
   outputs. Creation runs no Git hooks, filters or sparse cone, checks out the whole
-  commit, and never fetches missing objects. Config-defined hooks (`hook.*`) and
-  `includeIf.gitdir` includes are refused: Git applies them differently, or despite
-  an empty hooks path, inside a linked worktree.
+  commit, and never fetches missing objects. Config-defined hooks (`hook.*`),
+  `includeIf.gitdir` and `includeIf.onbranch` includes are refused: Git applies them
+  differently, or despite an empty hooks path, in a linked, detached worktree. So is
+  a `core.worktree` setting that would place the snapshot's work tree elsewhere.
 
 ## Diagnostics and results
 

@@ -9493,13 +9493,20 @@ def conditional_include_refusal(keys: Sequence[str]) -> str | None:
     A linked worktree has its own gitdir, so a gitdir include can add config,
     including config-defined hooks, that applies only there. Git can run such a
     hook while `worktree add` records the snapshot HEAD, before the snapshot's
-    own config can be read.
+    own config can be read. The snapshot is also a detached HEAD, so an onbranch
+    include never matches there and can change diff and attribute behavior.
     """
     if any(re.match(r"includeif\.gitdir(?:/i)?:", key, re.IGNORECASE) for key in keys):
         return (
             "--snapshot refuses Git config with gitdir-conditional includes (includeIf.gitdir): "
             "Git evaluates them differently inside the snapshot worktree, so its hooks and filters "
             "cannot be ruled out before it exists; rerun without --snapshot"
+        )
+    if any(re.match(r"includeif\.onbranch:", key, re.IGNORECASE) for key in keys):
+        return (
+            "--snapshot refuses Git config with branch-conditional includes (includeIf.onbranch): "
+            "the detached snapshot never matches them, so it could build other diffs than a direct "
+            "review of the branch; rerun without --snapshot"
         )
     return None
 
@@ -9512,6 +9519,21 @@ def config_hook_refusal(keys: Sequence[str]) -> str | None:
             "core.hooksPath does not disable; rerun without --snapshot"
         )
     return None
+
+
+def refuse_redirected_work_tree(worktree: Path, env: dict[str, str]) -> None:
+    """The snapshot's Git work tree must be the private checkout itself.
+
+    With extensions.worktreeConfig, a core.worktree in the shared config applies
+    to linked worktrees too, so `reset --hard` would write the frozen tree over
+    the operator checkout and erase its tracked edits.
+    """
+    top = git_result(worktree, "rev-parse", "--show-toplevel", env=env, check=False)
+    if top.returncode != 0 or Path(top.stdout.removesuffix("\n")).resolve() != worktree.resolve():
+        raise SystemExit(
+            "--snapshot refuses a Git work tree setting that places the snapshot's work tree "
+            "elsewhere (core.worktree with extensions.worktreeConfig); rerun without --snapshot"
+        )
 
 
 def refuse_snapshot_config(keys: Sequence[str]) -> None:
@@ -9686,6 +9708,7 @@ def review_snapshot(
             env = snapshot_git_env(
                 repo, hooks, drivers | config_filter_drivers(snapshot_keys), context=worktree,
             )
+            refuse_redirected_work_tree(worktree, env)
             populated = snapshot_git(
                 worktree, env, *git_line_ending_args(repo),
                 "reset", "--hard", "--quiet", "--no-recurse-submodules", commit,
