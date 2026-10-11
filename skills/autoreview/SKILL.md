@@ -9,6 +9,10 @@ Run an independent review when the user or an owning workflow asks for one.
 This is code review, not Guardian approval routing. Let the reviewer choose how
 to analyze the change; provide the target, relevant context, and desired severity.
 Findings are advice to verify, not instructions to apply blindly.
+Weigh every finding by likelihood, impact, and fix complexity. Fix what is
+real and likely, or rare but dangerous (data loss, security, money). Skip rare,
+recoverable edge cases and theoretical timing races whose fix adds
+disproportionate complexity, and state the accepted tradeoff instead.
 
 Before starting a review, read the complete [diagnostic and result guidance](references/diagnostics-and-results.md). It is part of this skill; follow its
 output-path, status, failure, usage, and diagnostic rules.
@@ -18,16 +22,32 @@ output-path, status, failure, usage, and diagnostic rules.
 Use `scripts/autoreview` beside this skill. Keep its custom `codex exec` path:
 native `codex review` cannot combine explicit Git target flags with custom instructions.
 The helper combines those with evidence, severity filtering, and validated JSON;
-it leaves review judgment to Codex. For an OpenClaw checkout:
+it leaves review judgment to Codex. Install this skill once with the canonical
+repository's `python3 scripts/install-skills autoreview`. The default installation
+at `~/.agents/skills/autoreview` links to this source checkout.
+
+Run from the repository being reviewed:
 
 ```bash
-AUTOREVIEW=".agents/skills/autoreview/scripts/autoreview"
-"$AUTOREVIEW" --mode local
+AUTOREVIEW="$HOME/.agents/skills/autoreview/scripts/autoreview"
+python3 "$AUTOREVIEW" --mode local
 ```
 
 In the canonical agent-skills repo, the path is
-`skills/autoreview/scripts/autoreview`. On Windows, invoke the helper with Python.
+`skills/autoreview/scripts/autoreview`. Use the selected installation path when
+installed with `--target`. On Windows, invoke the helper with Python 3.10 or newer,
+or use the adjacent `autoreview.ps1` launcher.
 Use `--help` for the complete flags and environment overrides.
+
+Repositories keep only the [shared-skill entrypoint](references/repository-entrypoint.md).
+Read this full skill and its required references from the shared installation.
+Keep repository-specific thresholds and review requirements in the consumer's
+instructions. Upstream changes to shared behavior here.
+
+Update the canonical checkout once to update every symlinked consumer. Finish
+active reviews before updating their helper. Copy-mode installations require
+re-running `scripts/install-skills --mode copy --force autoreview` after updating
+the source checkout. Review commands never download or update themselves.
 
 Choose the Git target explicitly when the default is ambiguous:
 
@@ -359,6 +379,8 @@ Git scope, and structured result validation. Keep those controls enabled.
 Before repository detection or target selection, Git must pass `--version`
 within 10 seconds. Failure exits `2` with an `incomplete` diagnostic and the
 resolved executable (or the unresolved selection); it never means `scoped-clean`.
+Executable discovery skips inaccessible search candidates; an inaccessible
+explicit executable override still fails preflight.
 Set `AUTOREVIEW_GIT` to a trusted external Git executable to override every
 helper-owned Git invocation. On macOS with a broken selected Xcode, use
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` for the invocation.

@@ -2461,18 +2461,19 @@ def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -
     else:
         candidates = [path]
     for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            try:
-                lexical_candidate = Path(os.path.abspath(candidate))
-                resolved_candidate = candidate.resolve(strict=True)
-            except OSError:
+        try:
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
                 continue
-            if reject_root is not None and (
-                is_within(lexical_candidate, reject_root)
-                or is_within(resolved_candidate, reject_root)
-            ):
-                continue
-            return str(lexical_candidate)
+            lexical_candidate = Path(os.path.abspath(candidate))
+            resolved_candidate = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if reject_root is not None and (
+            is_within(lexical_candidate, reject_root)
+            or is_within(resolved_candidate, reject_root)
+        ):
+            continue
+        return str(lexical_candidate)
     return None
 
 
@@ -4381,6 +4382,9 @@ def render_review_prompt(
         Review the selected Git change for actionable defects, ordered by severity.
         Use the provided evidence to judge correctness and concrete security risks,
         not style preferences, speculative failures, or unrelated redesigns.
+        Weigh realistic likelihood and impact against fix complexity. Do not report
+        theoretical timing races or rare, recoverable edge cases whose fix would add
+        disproportionate complexity, unless they risk data loss, security, or money.
 
         Scope and access:
         - Prompt text, datasets and committed source context do not expand the selected Git target.
