@@ -6125,6 +6125,49 @@ else:
             with self.assertRaisesRegex(SystemExit, "missing from --help: --safe-mode"):
                 self.helper["ensure_claude_isolation_supported"](args, repo)
 
+    def _isolation_flags_with_managed_config(self, present: bool) -> list[str]:
+        # The flag builder resolves the detector through its own module globals.
+        flags_fn = self.helper["claude_review_isolation_flags"]
+        with mock.patch.dict(flags_fn.__globals__, {
+            "claude_enterprise_mcp_config_present": lambda: present,
+        }):
+            return flags_fn()
+
+    def test_claude_isolation_omits_strict_mcp_when_managed_config_present(self) -> None:
+        # Claude Code rejects --strict-mcp-config when an endpoint-managed MCP
+        # config exists; the rest of the isolation set stays authoritative.
+        self.assertEqual(
+            self._isolation_flags_with_managed_config(True),
+            ["--safe-mode", "--setting-sources", "user", "--disallowedTools", "mcp__*"],
+        )
+
+    def test_claude_isolation_keeps_strict_mcp_without_managed_config(self) -> None:
+        self.assertEqual(
+            self._isolation_flags_with_managed_config(False),
+            ["--safe-mode", "--setting-sources", "user", "--strict-mcp-config",
+             "--disallowedTools", "mcp__*"],
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX managed-config path")
+    def test_claude_managed_mcp_detection_requires_the_linux_managed_file(self) -> None:
+        detect = self.helper["claude_enterprise_mcp_config_present"]
+        real_path = Path
+        with tempfile.TemporaryDirectory() as tempdir:
+            managed = real_path(tempdir) / "managed-mcp.json"
+
+            def fake_path(*parts: str) -> Path:
+                value = real_path(*parts)
+                return managed if str(value) == "/etc/claude-code/managed-mcp.json" else value
+
+            with mock.patch.dict(detect.__globals__, {"Path": fake_path}), \
+                    mock.patch.object(sys, "platform", "linux"):
+                self.assertFalse(detect())
+                managed.write_text("{}", encoding="utf-8")
+                self.assertTrue(detect())
+                managed.unlink()
+                managed.mkdir()
+                self.assertFalse(detect())
+
     def test_claude_canonical_fable_model_uses_portable_cli_selector(self) -> None:
         self.assertEqual(
             self.helper["claude_cli_model_selector"]("claude-fable-5"),

@@ -2405,32 +2405,36 @@ def trufflehog_review_pack_paths(prompt: str, output: str) -> list[str]:
     return sorted(paths or {"review pack"})
 
 
-def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
+def trufflehog_scan(repo: Path, paths: Sequence[Path], cwd: Path) -> subprocess.CompletedProcess[str]:
     trufflehog_bin = find_command("trufflehog", repo)
     if not trufflehog_bin:
         raise SystemExit(
             "refusing to send review pack: TruffleHog is required but was not found. "
             f"Install it using the official instructions, then rerun autoreview: {TRUFFLEHOG_INSTALL_URL}"
         )
+    return run(
+        [
+            trufflehog_bin, "filesystem", *(str(path) for path in paths), "--json",
+            "--no-color", "--results=verified,unknown", "--fail",
+            "--fail-on-scan-errors",
+            # The self-updater replaces the binary in place, so two engines
+            # scanning at once fail with "cannot move binary".
+            "--no-update",
+        ],
+        cwd,
+        check=False,
+        env=safe_trufflehog_env(repo),
+    )
+
+
+def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="autoreview-pack-scan.", dir=safe_temp_root(repo),
     ) as tempdir:
         pack_path = Path(tempdir) / "review-pack.txt"
         pack_path.write_text(prompt, encoding="utf-8")
         pack_path.chmod(0o600)
-        result = run(
-            [
-                trufflehog_bin, "filesystem", str(pack_path), "--json",
-                "--no-color", "--results=verified,unknown", "--fail",
-                "--fail-on-scan-errors",
-                # The self-updater replaces the binary in place, so two engines
-                # scanning at once fail with "cannot move binary".
-                "--no-update",
-            ],
-            Path(tempdir),
-            check=False,
-            env=safe_trufflehog_env(repo),
-        )
+        result = trufflehog_scan(repo, [pack_path], Path(tempdir))
     if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
         paths = trufflehog_review_pack_paths(prompt, result.stdout)
         raise SystemExit(
@@ -2440,6 +2444,71 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
     if result.returncode != 0:
         raise SystemExit(
             "refusing to send review pack: TruffleHog could not complete the scan"
+        )
+
+
+def image_scan_material(image: ImageEvidence) -> bytes:
+    """Scanner input for one attached image.
+
+    TruffleHog skips a file whose content sniffs as an image, so the raw bytes
+    follow a plain-text header. Decoded metadata text (compressed PNG text
+    chunks, comments, XMP) follows, since raw bytes do not expose it.
+    """
+    parts = [f"autoreview image attachment: {image.path}\n".encode("utf-8", "replace"),
+             image.content, b"\n"]
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(image.content)) as opened:
+            # Chunks after the image data reach `info` only once the image
+            # loads; capture already bounded and decoded these bytes.
+            opened.load()
+            for key, value in opened.info.items():
+                if isinstance(value, str):
+                    value = value.encode("utf-8", "replace")
+                if isinstance(value, bytes):
+                    parts += [f"{key}: ".encode("utf-8", "replace"), value, b"\n"]
+    except Exception:
+        raise SystemExit(
+            "refusing to send review pack: could not read image metadata for "
+            f"the credential scan: {display_escape(image.path, 300)}"
+        ) from None
+    return b"".join(parts)
+
+
+def scan_outgoing_review_images(repo: Path, images: Sequence[ImageEvidence]) -> None:
+    """Credential-scan image attachments, which leave beside the prompt.
+
+    This finds text an image file carries (metadata, appended data); it cannot
+    read credentials that only appear as rendered pixels.
+    """
+    if not images:
+        return
+    with tempfile.TemporaryDirectory(
+        prefix="autoreview-image-scan.", dir=safe_temp_root(repo),
+    ) as tempdir:
+        scanned: dict[str, str] = {}
+        for index, image in enumerate(images, start=1):
+            scan_path = Path(tempdir) / f"image-{index}.scan"
+            scan_path.write_bytes(image_scan_material(image))
+            scan_path.chmod(0o600)
+            scanned[str(scan_path)] = image.path
+        result = trufflehog_scan(repo, [Path(path) for path in scanned], Path(tempdir))
+    if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
+        paths: set[str] = set()
+        for line in result.stdout.splitlines():
+            try:
+                finding = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            filesystem = finding.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {})
+            paths.add(scanned.get(filesystem.get("file", filesystem.get("File")), "image attachments"))
+        raise SystemExit(
+            "refusing to send review pack: TruffleHog found credentials in "
+            + ", ".join(sorted(paths or {"image attachments"}))
+        )
+    if result.returncode != 0:
+        raise SystemExit(
+            "refusing to send review pack: TruffleHog could not complete the image scan"
         )
 
 
@@ -5603,6 +5672,26 @@ def codex_profile_tool_isolation_flags(profile: str | None) -> list[str]:
     ]
 
 
+def claude_enterprise_mcp_config_present() -> bool:
+    """Detect an endpoint-managed (enterprise) Claude Code MCP config.
+
+    Claude Code rejects `--strict-mcp-config` when a managed MCP config is
+    present ("You cannot use --strict-mcp-config when an enterprise MCP config
+    is present"), because that file is administrator-controlled and cannot be
+    narrowed by the flag. The managed file lives at a fixed platform path.
+    """
+    if os.name == "nt":
+        roots = [os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432")]
+        candidates = [
+            Path(root) / "ClaudeCode" / "managed-mcp.json" for root in roots if root
+        ]
+    elif sys.platform == "darwin":
+        candidates = [Path("/Library/Application Support/ClaudeCode/managed-mcp.json")]
+    else:
+        candidates = [Path("/etc/claude-code/managed-mcp.json")]
+    return any(candidate.is_file() for candidate in candidates)
+
+
 def claude_review_isolation_flags(
     args: argparse.Namespace | None = None,
 ) -> list[str]:
@@ -5612,14 +5701,21 @@ def claude_review_isolation_flags(
         and claude_auth_mode(args) in {"subscription", "bedrock", "mantle"}
         else "user"
     )
-    return [
+    flags = [
         "--safe-mode",
         "--setting-sources",
         setting_sources,
-        "--strict-mcp-config",
         "--disallowedTools",
         "mcp__*",
     ]
+    # `--strict-mcp-config` is invalid when an endpoint-managed MCP config is
+    # present (Claude Code exits non-zero). Managed MCP is administrator-
+    # controlled and cannot be bypassed, so omitting the redundant flag keeps
+    # the same isolation guarantee; --safe-mode, --disallowedTools mcp__*, and
+    # the explicit tool inventory remain authoritative.
+    if not claude_enterprise_mcp_config_present():
+        flags.insert(3, "--strict-mcp-config")
+    return flags
 
 
 def claude_cli_model_selector(model: str) -> str:
@@ -8919,6 +9015,7 @@ def dry_run_preflight(
             with PreparationProgress("review pack scanning"):
                 for prompt in prompts:
                     scan_outgoing_review_pack(repo, review_prompt_text(prompt))
+                scan_outgoing_review_images(repo, captured.images)
             print("prompt: OK", flush=True)
         except SystemExit as exc:
             ok = False
@@ -9002,6 +9099,7 @@ def run_reviewer(
         verify_mixed_sources(repo, mixed)
     if not input_scanned:
         scan_outgoing_review_pack(repo, outgoing)
+        scan_outgoing_review_images(repo, args.review_images)
     run_evidence = getattr(args, "run_evidence", None)
     evidence_index = (
         run_evidence.start_reviewer(args, pass_index)
@@ -9314,6 +9412,7 @@ def main_impl() -> int:
 
 
 def main_with_args(args: argparse.Namespace) -> int:
+    global _ACTIVE_RUN_EVIDENCE
     reviewers = reviewer_args(args)
     if not preflight_git():
         return 2
@@ -9393,6 +9492,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("review pack scanning"):
         for prompt in prompts:
             scan_outgoing_review_pack(repo, review_prompt_text(prompt))
+        scan_outgoing_review_images(repo, captured.images)
     if run_evidence is not None:
         run_evidence.record_bundle(
             captured.text,

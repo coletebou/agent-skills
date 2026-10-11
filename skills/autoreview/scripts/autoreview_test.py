@@ -1276,6 +1276,28 @@ class AutoreviewRunHistoryTests(unittest.TestCase):
                     0o600,
                 )
 
+    def test_run_evidence_is_published_for_failure_finalization(self) -> None:
+        evidence = mock.Mock(run_dir="synthetic-run")
+        stubs = {
+            "preflight_git": lambda: True,
+            "repo_root": lambda: Path.cwd(),
+            "prepare_output_paths": lambda *_args: None,
+            "choose_target": lambda *_args: ("local", None),
+            "current_branch": lambda *_args: "synthetic",
+            "run_log_enabled": lambda *_args: True,
+            "create_run_evidence": lambda *_args: evidence,
+            "capture_evidence_inputs": mock.Mock(side_effect=SystemExit("stop after publish")),
+        }
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys, "argv", ["autoreview", "--engine", "codex"],
+        ), mock.patch.multiple(AUTOREVIEW, **stubs), mock.patch.object(
+            AUTOREVIEW, "_ACTIVE_RUN_EVIDENCE", None,
+        ), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(SystemExit, "stop after publish"):
+                AUTOREVIEW.main_impl()
+            # sanitized_main finalizes failed runs through the module-level handle.
+            self.assertIs(AUTOREVIEW._ACTIVE_RUN_EVIDENCE, evidence)
+
     def test_default_history_overlap_uses_private_fallback(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-history-overlap-test.") as tmpdir:
             repo = Path(tmpdir)
@@ -2145,6 +2167,76 @@ class AutoreviewSecretScannerTests(unittest.TestCase):
                 return_value="/trusted/trufflehog",
             ), mock.patch.object(AUTOREVIEW, "run", side_effect=run_scanner):
                 AUTOREVIEW.scan_outgoing_review_pack(repo, prompt)
+
+    def test_scanner_scans_attached_image_bytes_and_names_the_image(self) -> None:
+        from PIL import Image, PngImagePlugin
+
+        info = PngImagePlugin.PngInfo()
+        info.add_text("Comment", "compressed metadata text", zip=True)
+        encoded = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(encoded, "PNG", pnginfo=info)
+        image = AUTOREVIEW.ImageEvidence("docs/shot.PNG", "image/png", "0" * 64, encoded.getvalue())
+        seen: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+
+            def run_scanner(command: list[str], cwd: Path, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                scanned = Path(command[2])
+                seen["bytes"] = scanned.read_bytes()
+                seen["flags"] = command[3:]
+                finding = {"SourceMetadata": {"Data": {"Filesystem": {"file": str(scanned), "line": 1}}}}
+                return subprocess.CompletedProcess(
+                    command, AUTOREVIEW.TRUFFLEHOG_FINDINGS_EXIT_CODE, json.dumps(finding) + "\n", "",
+                )
+
+            with mock.patch.object(AUTOREVIEW, "find_command", return_value="/trusted/trufflehog"), \
+                    mock.patch.object(AUTOREVIEW, "run", side_effect=run_scanner), \
+                    self.assertRaisesRegex(SystemExit, r"credentials in docs/shot\.PNG$"):
+                AUTOREVIEW.scan_outgoing_review_images(repo, [image])
+        scanned = seen["bytes"]
+        assert isinstance(scanned, bytes)
+        # A plain-text header keeps the scanner from skipping the file as an image.
+        self.assertTrue(scanned.startswith(b"autoreview image attachment: docs/shot.PNG\n"))
+        self.assertIn(image.content, scanned)
+        self.assertIn(b"Comment: compressed metadata text", scanned)
+        self.assertEqual(seen["flags"][0], "--json")
+        with mock.patch.object(AUTOREVIEW, "run", side_effect=AssertionError("no images, no scan")):
+            AUTOREVIEW.scan_outgoing_review_images(Path.cwd(), ())
+
+    def test_reviewer_scans_attached_images_before_launch(self) -> None:
+        image = AUTOREVIEW.ImageEvidence("docs/shot.png", "image/png", "0" * 64, b"synthetic")
+        bundle = AUTOREVIEW.CapturedBundle("synthetic bundle", {"docs/shot.png"}, images=(image,))
+        args = argparse.Namespace(engine="codex", max_priority="P0")
+        events: list[str] = []
+        with mock.patch.object(AUTOREVIEW, "scan_outgoing_review_pack", side_effect=lambda *_a: events.append("pack")), \
+                mock.patch.object(AUTOREVIEW, "scan_outgoing_review_images",
+                                  side_effect=lambda _repo, images: events.append(f"images:{len(images)}")), \
+                mock.patch.object(AUTOREVIEW, "run_engine",
+                                  side_effect=lambda *_a: events.append("engine") or COMPLETE_REPORT):
+            AUTOREVIEW.run_reviewer(args, Path.cwd(), "prompt", bundle, [])
+        self.assertEqual(events, ["pack", "images:1", "engine"])
+
+    def test_image_scan_reads_compressed_text_stored_after_the_image_data(self) -> None:
+        import struct
+        import zlib
+
+        from PIL import Image
+
+        encoded = io.BytesIO()
+        Image.new("RGB", (2, 2), "white").save(encoded, "PNG")
+        png = encoded.getvalue()
+        body = b"zTXt" + b"Comment\x00\x00" + zlib.compress(b"late metadata text")
+        late_chunk = struct.pack(">I", len(body) - 4) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        end = png.rindex(b"IEND") - 4
+        image = AUTOREVIEW.ImageEvidence("docs/late.png", "image/png", "0" * 64,
+                                         png[:end] + late_chunk + png[end:])
+        # Pillow parses chunks after the image data only when the image loads.
+        self.assertIn(b"Comment: late metadata text", AUTOREVIEW.image_scan_material(image))
+
+    def test_unreadable_image_metadata_refuses_the_scan(self) -> None:
+        image = AUTOREVIEW.ImageEvidence("docs/broken.png", "image/png", "0" * 64, b"not an image")
+        with self.assertRaisesRegex(SystemExit, "could not read image metadata.*docs/broken.png"):
+            AUTOREVIEW.image_scan_material(image)
 
 
 def amp_test_stream(
