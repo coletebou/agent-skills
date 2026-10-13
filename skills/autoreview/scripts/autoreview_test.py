@@ -1036,6 +1036,92 @@ class AutoreviewSingleEngineRoutingTests(unittest.TestCase):
                 0o600,
             )
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
+    def test_codex_profile_stages_its_model_catalogue_with_the_route(self) -> None:
+        # The fleet's autoreview-bedrock profile names a catalogue that advertises
+        # the UltraFast tier for GPT-6.1 Sol (Codex 0.162.1's bundled Bedrock
+        # catalogue does not); the bytes must reach the isolated runtime with the
+        # route and the staged profile must point at the copy, not the source.
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-profile-catalogue-test.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            codex_home = root / "codex-home"
+            runtime_home = root / "runtime-codex-home"
+            repo.mkdir()
+            codex_home.mkdir()
+            catalogue = (
+                b'{"models": [{"slug": "openai.gpt-6.1-sol", '
+                b'"service_tiers": [{"id": "ultrafast"}]}]}\n'
+            )
+            (codex_home / "autoreview-bedrock.models.json").write_bytes(catalogue)
+            (codex_home / "autoreview-bedrock.config.toml").write_text(
+                "\n".join(
+                    (
+                        'model = "openai.gpt-6.1-sol"',
+                        'model_provider = "amazon-bedrock"',
+                        'model_catalog_json = "autoreview-bedrock.models.json"',
+                        'model_reasoning_effort = "max"',
+                        'service_tier = "ultrafast"',
+                        "",
+                        "[model_providers.amazon-bedrock.aws]",
+                        'region = "us-east-1"',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                self.assertTrue(
+                    AUTOREVIEW.prepare_codex_runtime_profile(
+                        argparse.Namespace(codex_profile="autoreview-bedrock"),
+                        repo,
+                        runtime_home,
+                    )
+                )
+            staged_catalogue = runtime_home / "autoreview-bedrock.models.json"
+            self.assertEqual(staged_catalogue.read_bytes(), catalogue)
+            self.assertEqual(stat.S_IMODE(staged_catalogue.stat().st_mode), 0o600)
+            projected = (runtime_home / "autoreview-bedrock.config.toml").read_text(encoding="utf-8")
+            self.assertIn(
+                f"model_catalog_json = {AUTOREVIEW.toml_string(str(staged_catalogue.resolve()))}",
+                projected,
+            )
+            self.assertNotIn(str(codex_home), projected)
+            self.assertIn('service_tier = "ultrafast"', projected)
+            self.assertIn('region = "us-east-1"', projected)
+
+    def test_codex_profile_refuses_a_missing_or_repo_owned_model_catalogue(self) -> None:
+        for case in ("missing", "inside-repo", "blank"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix="autoreview-codex-profile-catalogue-refuse."
+            ) as tmpdir:
+                root = Path(tmpdir)
+                repo = root / "repo"
+                codex_home = root / "codex-home"
+                runtime_home = root / "runtime-codex-home"
+                repo.mkdir()
+                codex_home.mkdir()
+                if case == "inside-repo":
+                    (repo / "catalogue.json").write_text("{}", encoding="utf-8")
+                    reference = str(repo / "catalogue.json")
+                elif case == "blank":
+                    reference = "  "
+                else:
+                    reference = "absent.models.json"
+                (codex_home / "autoreview-bedrock.config.toml").write_text(
+                    'model = "openai.gpt-6.1-sol"\nmodel_provider = "amazon-bedrock"\n'
+                    f"model_catalog_json = {AUTOREVIEW.toml_string(reference)}\n",
+                    encoding="utf-8",
+                )
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                    with self.assertRaisesRegex(SystemExit, "model_catalog_json|model catalogue"):
+                        AUTOREVIEW.prepare_codex_runtime_profile(
+                            argparse.Namespace(codex_profile="autoreview-bedrock"),
+                            repo,
+                            runtime_home,
+                        )
+                self.assertFalse((runtime_home / "autoreview-bedrock.models.json").exists())
+
     def test_codex_profile_service_tier_accepts_every_codex_speed(self) -> None:
         # A profile's service_tier and --codex-speed name the same Codex setting,
         # so the profile validator must accept exactly the CODEX_SPEEDS tiers.

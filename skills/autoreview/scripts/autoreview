@@ -5250,15 +5250,50 @@ def prepare_codex_runtime_profile(
                 raise SystemExit(f"Codex profile {profile!r} has invalid {provider}.aws.region")
             aws["region"] = region.strip()
 
+    # A profile may name a model catalogue (service tiers, reasoning levels,
+    # instructions). It travels with the route: without it Codex falls back to its
+    # bundled metadata, which may not advertise the profile's service tier and
+    # then drops the tier from the request without a word. Codex resolves a
+    # relative catalogue path against the profile's own directory. Like the
+    # profile, the catalogue must live outside the reviewed repository (its
+    # instructions become the reviewer's system prompt).
+    catalogue_bytes: bytes | None = None
+    raw_catalogue = config.get("model_catalog_json")
+    if raw_catalogue is not None:
+        if not isinstance(raw_catalogue, str) or not raw_catalogue.strip():
+            raise SystemExit(f"Codex profile {profile!r} has invalid model_catalog_json")
+        try:
+            catalogue_path = (
+                resolved_source.parent / Path(raw_catalogue.strip()).expanduser()
+            ).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(
+                f"Codex profile {profile!r} model catalogue is unavailable: {raw_catalogue}"
+            ) from exc
+        if not catalogue_path.is_file() or not external_env_path(repo, str(catalogue_path)):
+            raise SystemExit(
+                f"Codex profile {profile!r} model catalogue must be a file outside "
+                f"the reviewed repository: {raw_catalogue}"
+            )
+        try:
+            catalogue_bytes = catalogue_path.read_bytes()
+        except OSError as exc:
+            raise SystemExit(f"Codex profile {profile!r} model catalogue is unreadable") from exc
+
     lines = [
         f"{key} = {toml_string(safe_scalars[key])}"
         for key in ("model", "model_provider", "model_reasoning_effort", "service_tier")
         if key in safe_scalars
     ]
+    runtime_codex_home.mkdir(parents=True, exist_ok=True)
+    if catalogue_bytes is not None:
+        runtime_catalogue = runtime_codex_home / f"{profile}.models.json"
+        runtime_catalogue.write_bytes(catalogue_bytes)
+        runtime_catalogue.chmod(0o600)
+        lines.append(f"model_catalog_json = {toml_string(str(runtime_catalogue.resolve()))}")
     if aws:
         lines.extend(["", f"[model_providers.{provider}.aws]"])
         lines.append(f"region = {toml_string(aws['region'])}")
-    runtime_codex_home.mkdir(parents=True, exist_ok=True)
     runtime_profile = runtime_codex_home / f"{profile}.config.toml"
     runtime_profile.write_text("\n".join(lines) + "\n", encoding="utf-8")
     runtime_profile.chmod(0o600)

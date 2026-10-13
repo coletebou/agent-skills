@@ -204,7 +204,13 @@ The helper does not automatically fall back between engines.
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported; `--codex-speed ultrafast`
 selects Ultrafast when the active model catalog lists it (Codex otherwise silently
-sends the standard tier). Only Claude accepts
+sends the standard tier). Codex 0.162.1's bundled Bedrock catalog lists Ultrafast
+for GPT-6 Astra only; a Bedrock profile may name a `model_catalog_json` that adds it
+(the fleet's `autoreview-bedrock` profile does this for GPT-6.1 Sol until Codex
+0.163 ships openai/codex#51794) and the helper stages that catalogue with the
+route. The fleet's `~/.zshenv` selects that profile and `AUTOREVIEW_CODEX_SPEED=ultrafast`
+(GPT-6.1 Sol on Mantle us-east-1 at the Ultrafast tier, xhigh); pass
+`--codex-speed default` for the Standard tier. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
 If your account cannot access Sol or Luna, pin an available model. To require
@@ -313,8 +319,11 @@ This fork retains explicit authentication routes and private run history.
 simultaneous provider profile. `--codex-auth default` preserves the selected
 provider environment. Use `--codex-profile NAME` to select an operator-owned
 `CODEX_HOME/NAME.config.toml` alternative configuration for a built-in Amazon
-Bedrock provider. Only its validated model, effort, service tier, and AWS region
-enter the isolated reviewer runtime; hooks, tools, and trust settings do not.
+Bedrock provider. Only its validated model, effort, service tier, AWS region, and
+model catalogue (`model_catalog_json`, resolved against the profile's directory,
+required to be a file outside the reviewed repository, copied byte-for-byte into
+the runtime) enter the isolated reviewer runtime; hooks, tools, and trust
+settings do not.
 
 Claude accepts `--claude-auth default`, `subscription`, `bedrock`, or `mantle`
 and `--claude-bedrock-region`. Bedrock Runtime and Mantle have different model
