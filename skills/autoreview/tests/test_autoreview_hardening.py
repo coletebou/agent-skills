@@ -8599,5 +8599,316 @@ Path(sys.argv[sys.argv.index(flag) + 1]).write_text(json.dumps({
                 output.fileno()
 
 
+def fake_codex_usage_script() -> str:
+    """Codex stand-in that prints `codex exec --json` events like codex-cli 0.162.1."""
+    return r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if "--version" in args or "-v" in args:
+    print("codex-cli 0.0.0-test")
+    raise SystemExit(0)
+sys.stdin.read()
+if argv_log := os.environ.get("AUTOREVIEW_FAKE_ARGV_LOG"):
+    with open(argv_log, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(args) + "\n")
+for event in (
+    {"type": "thread.started", "thread_id": "SEAT-THREAD-SENTINEL"},
+    {"type": "turn.started"},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": "SEAT-MESSAGE-SENTINEL"}},
+    {"type": "turn.completed", "usage": json.loads(os.environ["AUTOREVIEW_FAKE_USAGE"])},
+):
+    print(json.dumps(event), flush=True)
+exit_code = int(os.environ.get("AUTOREVIEW_FAKE_EXIT", "0"))
+if exit_code == 0:
+    output_path = args[args.index("--output-last-message") + 1]
+    Path(output_path).write_text(os.environ["AUTOREVIEW_FAKE_REPORT"], encoding="utf-8")
+raise SystemExit(exit_code)
+'''
+
+
+def fake_claude_result_script() -> str:
+    """Claude Code stand-in that prints one `result` event per call (2.1.296 shape)."""
+    return r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if "--version" in args or "-v" in args:
+    print("2.1.296 (Claude Code)")
+    raise SystemExit(0)
+if "--help" in args or "-h" in args:
+    print("--safe-mode\n--setting-sources\n--strict-mcp-config\n--disallowedTools\n--tools\n--print\n--json-schema")
+    raise SystemExit(0)
+sys.stdin.read()
+counter = Path(os.environ["AUTOREVIEW_FAKE_COUNTER"])
+call = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+counter.write_text(str(call), encoding="utf-8")
+results = json.loads(os.environ["AUTOREVIEW_FAKE_RESULTS"])
+event = results[min(call, len(results)) - 1]
+if "stream-json" in args:
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": event["session_id"]}))
+    print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "SEAT-MESSAGE-SENTINEL"}]}}))
+print(json.dumps(event))
+'''
+
+
+SEAT_E2E_REPORT = {
+    "findings": [
+        {"title": "Blocking bug", "body": "SEAT-BODY-SENTINEL", "priority": "P1", "confidence": 0.8,
+         "category": "bug", "code_location": {"file_path": "source.txt", "line": 1}},
+        {"title": "Optional polish", "body": "SEAT-BODY-SENTINEL", "priority": "P3", "confidence": 0.4,
+         "category": "maintainability", "code_location": {"file_path": "source.txt", "line": 1}},
+    ],
+    "overall_correctness": "patch is incorrect",
+    "overall_explanation": "SEAT-BODY-SENTINEL",
+    "overall_confidence": 0.7,
+    "review_completion": "complete",
+}
+SEAT_E2E_CODEX_USAGE = {
+    "input_tokens": 112000, "cached_input_tokens": 40000, "cache_write_input_tokens": 71000,
+    "output_tokens": 13400, "reasoning_output_tokens": 13100,
+}
+SEAT_E2E_OPUS = "anthropic.claude-opus-5-5[1m]"
+
+
+def seat_e2e_claude_result(**overrides: object) -> dict[str, object]:
+    event: dict[str, object] = {
+        "type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
+        "session_id": "SEAT-SESSION-SENTINEL", "uuid": "SEAT-SESSION-SENTINEL",
+        "total_cost_usd": 1.2345,
+        "usage": {
+            "input_tokens": 20, "cache_creation_input_tokens": 65113,
+            "cache_read_input_tokens": 129646, "output_tokens": 4278,
+            "output_tokens_details": {"thinking_tokens": 3108},
+            "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 0},
+            "service_tier": "standard",
+            "cache_creation": {"ephemeral_1h_input_tokens": 65000, "ephemeral_5m_input_tokens": 113},
+        },
+        "modelUsage": {
+            SEAT_E2E_OPUS: {"inputTokens": 20, "outputTokens": 4278, "cacheReadInputTokens": 129646,
+                            "cacheCreationInputTokens": 65113, "thinkingTokens": 3108,
+                            "webSearchRequests": 2, "costUSD": 1.2345, "canonicalModel": "claude-opus-5-5",
+                            "provider": "bedrock", "costBasis": "list"},
+        },
+        "terminal_reason": "completed",
+        "result": json.dumps(SEAT_E2E_REPORT),
+        "structured_output": SEAT_E2E_REPORT,
+    }
+    event.update(overrides)
+    return event
+
+
+@unittest.skipIf(os.name == "nt", "the executable fixtures are POSIX-only")
+class AutoreviewSeatMetricsEndToEndTests(unittest.TestCase):
+    """A real autoreview process writes per-seat usage, model, and verdict metadata."""
+
+    def setUp(self) -> None:
+        install_fake_trufflehog(self)
+        self.tempdir = tempfile.TemporaryDirectory(prefix="autoreview-seat-e2e.")
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.repo = init_repo(self.root)
+        (self.repo / "source.txt").write_text("review me\n", encoding="utf-8")
+        git(self.repo, "add", "source.txt")
+        self.codex_home = self.root / "codex-home"
+        self.codex_home.mkdir()
+
+    def review(self, history: Path, argv: list[str], **fake_env: str) -> subprocess.CompletedProcess[str]:
+        # Operator review selectors from the fleet shell profile must not leak into the fixture.
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("AUTOREVIEW_")
+            and key not in {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CODEX_HOME"}
+        }
+        env.update({"CODEX_HOME": str(self.codex_home), **fake_env})
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--mode", "local", "--max-priority", "P2",
+             "--run-log-dir", str(history), *argv],
+            cwd=self.repo, env=env, text=True, capture_output=True, timeout=120, check=False,
+        )
+
+    def run_metadata(self, history: Path) -> dict[str, object]:
+        (path,) = history.glob("runs/*/metadata.json")
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        # The pre-existing bounded `error` diagnostic of a failed seat is out of
+        # scope; every other field must hold no engine-produced text.
+        scrubbed = copy.deepcopy(metadata)
+        for record in scrubbed.get("reviewer_runs", []):
+            record.pop("error", None)
+        text = json.dumps(scrubbed)
+        for sentinel in ("SEAT-SESSION-SENTINEL", "SEAT-THREAD-SENTINEL", "SEAT-MESSAGE-SENTINEL", "SEAT-BODY-SENTINEL"):
+            self.assertNotIn(sentinel, text)
+        self.assertEqual(metadata["schema_version"], 1)
+        self.assertEqual(metadata["seat_metrics_version"], 1)
+        return metadata
+
+    def assert_verdict(self, seat: dict[str, object]) -> None:
+        self.assertEqual(seat["status"], "completed")
+        self.assertEqual(seat["verdict"], "patch is incorrect")
+        self.assertEqual(seat["review_completion"], "complete")
+        self.assertEqual(seat["findings_rejected"], {"out_of_scope": 0, "attribution": 0, "below_max_priority": 1})
+        self.assertEqual(seat["overall_confidence"], 0.7)
+        self.assertEqual(seat["findings"], 1)
+        self.assertEqual(seat["findings_by_priority"], {"P0": 0, "P1": 1, "P2": 0, "P3": 0})
+        self.assertEqual(seat["provider_findings_by_priority"], {"P0": 0, "P1": 1, "P2": 0, "P3": 1})
+
+    def test_codex_cli_seat_records_tokens_settings_and_verdict(self) -> None:
+        fake = write_executable(self.root / "codex", fake_codex_usage_script())
+        history = self.root / "history"
+        result = self.review(
+            history,
+            ["--engine", "codex", "--codex-bin", str(fake), "--model", "gpt-6-sol",
+             "--thinking", "high", "--codex-speed", "fast"],
+            AUTOREVIEW_FAKE_USAGE=json.dumps(SEAT_E2E_CODEX_USAGE),
+            AUTOREVIEW_FAKE_REPORT=json.dumps(SEAT_E2E_REPORT),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        metadata = self.run_metadata(history)
+        (seat,) = metadata["reviewer_runs"]
+        (attempt,) = metadata["attempts"]
+        self.assertEqual(seat["engine"], "codex")
+        self.assertEqual(seat["model_requested"], "gpt-6-sol")
+        for record in (seat, attempt):
+            self.assertEqual(
+                (record["model_actual"], record["model_actual_source"], record["effort"],
+                 record["effort_source"], record["service_tier"], record["service_tier_source"]),
+                ("gpt-6-sol", "cli", "high", "cli", "fast", "cli"),
+            )
+            self.assertEqual(record["tokens"], {
+                "source": "codex_turn_completed", "complete": True, "input_includes_cache": True,
+                "input_tokens": 112000, "cache_read_tokens": 40000, "cache_write_tokens": 71000,
+                "cache_write_5m_tokens": None, "cache_write_1h_tokens": None,
+                "output_tokens": 13400, "reasoning_tokens": 13100, "input_total_tokens": 112000,
+                "web_search_requests": None, "web_fetch_requests": None,
+            })
+            self.assertIsNone(record["cost_usd"])
+            self.assertIsNone(record["cost_source"])
+        self.assertIsInstance(seat["duration_seconds"], float)
+        self.assert_verdict(seat)
+
+    def test_codex_profile_seat_names_the_profile_model_effort_and_tier(self) -> None:
+        (self.codex_home / "autoreview-bedrock.config.toml").write_text(
+            'model = "openai.gpt-6.1-sol"\nmodel_provider = "amazon-bedrock"\n'
+            'model_reasoning_effort = "max"\nservice_tier = "ultrafast"\n',
+            encoding="utf-8",
+        )
+        fake = write_executable(self.root / "codex", fake_codex_usage_script())
+        history = self.root / "history"
+        argv_log = self.root / "argv.jsonl"
+        result = self.review(
+            history,
+            ["--engine", "codex", "--codex-bin", str(fake), "--codex-profile", "autoreview-bedrock"],
+            AUTOREVIEW_FAKE_USAGE=json.dumps(SEAT_E2E_CODEX_USAGE),
+            AUTOREVIEW_FAKE_REPORT=json.dumps(SEAT_E2E_REPORT),
+            AUTOREVIEW_FAKE_ARGV_LOG=str(argv_log),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        (argv,) = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+        self.assertIn("--profile", argv)
+        self.assertNotIn("--model", argv)
+        (seat,) = self.run_metadata(history)["reviewer_runs"]
+        self.assertIsNone(seat["model_requested"])
+        self.assertEqual(seat["speed_requested"], "default")
+        self.assertEqual(
+            (seat["model_actual"], seat["model_actual_source"], seat["effort"],
+             seat["effort_source"], seat["service_tier"], seat["service_tier_source"]),
+            ("openai.gpt-6.1-sol", "codex_profile", "max", "codex_profile", "ultrafast", "codex_profile"),
+        )
+        self.assertTrue(seat["tokens"]["complete"])
+        self.assert_verdict(seat)
+
+    def test_claude_seat_records_actual_model_cost_tokens_and_verdict(self) -> None:
+        fake = write_executable(self.root / "claude", fake_claude_result_script())
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                history = self.root / f"history-{stream}"
+                argv = ["--engine", "claude", "--claude-bin", str(fake),
+                        "--model", "claude-opus-5-5", "--thinking", "xhigh"]
+                if stream:
+                    argv.append("--stream-engine-output")
+                result = self.review(
+                    history, argv,
+                    AUTOREVIEW_FAKE_COUNTER=str(self.root / f"counter-{stream}"),
+                    AUTOREVIEW_FAKE_RESULTS=json.dumps([seat_e2e_claude_result()]),
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                (seat,) = self.run_metadata(history)["reviewer_runs"]
+                self.assertEqual(seat["model_requested"], "claude-opus-5-5")
+                self.assertEqual(
+                    (seat["model_actual"], seat["model_actual_source"], seat["effort"],
+                     seat["effort_source"], seat["service_tier"], seat["service_tier_source"]),
+                    (SEAT_E2E_OPUS, "engine_reported", "xhigh", "cli", "standard", "engine_reported"),
+                )
+                self.assertEqual((seat["cost_usd"], seat["cost_source"]), (1.2345, "engine_reported"))
+                self.assertEqual(seat["tokens"], {
+                    "source": "claude_result", "complete": True, "input_includes_cache": False,
+                    "input_tokens": 20, "cache_read_tokens": 129646, "cache_write_tokens": 65113,
+                    "cache_write_5m_tokens": 113, "cache_write_1h_tokens": 65000,
+                    "output_tokens": 4278, "reasoning_tokens": 3108,
+                    "input_total_tokens": 20 + 129646 + 65113,
+                    "web_search_requests": 2, "web_fetch_requests": 0,
+                })
+                self.assertEqual(seat["model_usage"][SEAT_E2E_OPUS]["cost_basis"], "list")
+                self.assert_verdict(seat)
+
+    def test_claude_refusal_retry_bills_both_processes_to_the_seat(self) -> None:
+        refusal = seat_e2e_claude_result(
+            terminal_reason="model_refusal", total_cost_usd=0.5, structured_output=None, result="",
+            usage={"input_tokens": 3, "cache_creation_input_tokens": 60000, "cache_read_input_tokens": 0,
+                   "output_tokens": 12, "service_tier": "standard"},
+            modelUsage={"claude-fable-5-1": {"inputTokens": 3, "outputTokens": 12,
+                                             "cacheCreationInputTokens": 60000, "costUSD": 0.5}},
+        )
+        success = seat_e2e_claude_result(modelUsage={"claude-fable-5-1": {
+            "inputTokens": 20, "outputTokens": 4278, "costUSD": 1.2345}})
+        fake = write_executable(self.root / "claude", fake_claude_result_script())
+        history = self.root / "history"
+        result = self.review(
+            history,
+            ["--engine", "claude", "--claude-bin", str(fake), "--model", "claude-fable-5", "--thinking", "high"],
+            AUTOREVIEW_FAKE_COUNTER=str(self.root / "counter"),
+            AUTOREVIEW_FAKE_RESULTS=json.dumps([refusal, success]),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        metadata = self.run_metadata(history)
+        self.assertEqual(
+            [(attempt["reason"], attempt["status"], attempt["cost_usd"], attempt["reviewer_run_id"])
+             for attempt in metadata["attempts"]],
+            [("primary", "refused", 0.5, 1), ("refusal_retry", "completed", 1.2345, 1)],
+        )
+        (seat,) = metadata["reviewer_runs"]
+        self.assertEqual((seat["model_requested"], seat["model_actual"]), ("claude-fable-5", "claude-fable-5-1"))
+        self.assertAlmostEqual(seat["cost_usd"], 1.7345)
+        self.assertEqual(seat["tokens"]["output_tokens"], 12 + 4278)
+        self.assertEqual(seat["tokens"]["input_total_tokens"], 3 + 60000 + 20 + 129646 + 65113)
+        self.assertTrue(seat["tokens"]["complete"])
+        self.assert_verdict(seat)
+
+    def test_failed_codex_seat_keeps_observed_usage_without_a_verdict(self) -> None:
+        fake = write_executable(self.root / "codex", fake_codex_usage_script())
+        history = self.root / "history"
+        result = self.review(
+            history,
+            ["--engine", "codex", "--codex-bin", str(fake), "--model", "gpt-6-sol", "--thinking", "high"],
+            AUTOREVIEW_FAKE_USAGE=json.dumps(SEAT_E2E_CODEX_USAGE),
+            AUTOREVIEW_FAKE_REPORT=json.dumps(SEAT_E2E_REPORT),
+            AUTOREVIEW_FAKE_EXIT="17",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        (seat,) = self.run_metadata(history)["reviewer_runs"]
+        self.assertEqual(seat["status"], "failed")
+        self.assertFalse(seat["tokens"]["complete"])
+        self.assertEqual(seat["tokens"]["output_tokens"], 13400)
+        self.assertEqual(seat["model_actual"], "gpt-6-sol")
+        self.assertIsNone(seat["verdict"])
+        self.assertIsNone(seat["findings_by_priority"])
+
+
 if __name__ == "__main__":
     unittest.main()

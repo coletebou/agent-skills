@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Record per-seat efficiency metrics in Autoreview's private run history (`seat_metrics_version: 1`): tokens by type, engine-reported cost (Claude; Codex reports none), requested and actually-run model, effort, service tier, and each seat's verdict and finding counts by priority, summed across refusal retries and fallbacks. Additive only; review behavior is unchanged.
 - Weigh Autoreview findings by likelihood, impact, and fix complexity: the reviewer skips theoretical races and rare recoverable edge cases, and callers may decline unlikely findings with a stated tradeoff.
 - Update development Node.js types to 26.6.5 and the native macOS sandbox-test Codex CLI to 0.162.1.
 - Update development Node.js types to 26.6.4 and the native macOS sandbox-test Codex CLI to 0.160.1.

@@ -3122,6 +3122,535 @@ class AutoreviewEfficiencyTests(unittest.TestCase):
                     AUTOREVIEW.parse_args()
 
 
+# Engine output shapes captured on 2026-10-13 from `claude -p --output-format json`
+# (Claude Code 2.1.296) and `codex exec --json` (codex-cli 0.162.1). Counts, costs,
+# ids and text are synthetic; the sentinels must never reach run metadata.
+SEAT_SESSION_SENTINEL = "5e551005-0000-4000-8000-5e551005e551"
+SEAT_TEXT_SENTINEL = "SEAT-TEXT-SENTINEL"
+SEAT_REPORT = {
+    "findings": [
+        {
+            "title": "Blocking bug",
+            "body": SEAT_TEXT_SENTINEL,
+            "priority": "P1",
+            "confidence": 0.8,
+            "category": "bug",
+            "code_location": {"file_path": "source.txt", "line": 1},
+        },
+        {
+            "title": "Optional polish",
+            "body": SEAT_TEXT_SENTINEL,
+            "priority": "P3",
+            "confidence": 0.4,
+            "category": "maintainability",
+            "code_location": {"file_path": "source.txt", "line": 1},
+        },
+    ],
+    "overall_correctness": "patch is incorrect",
+    "overall_explanation": SEAT_TEXT_SENTINEL,
+    "overall_confidence": 0.7,
+}
+CLAUDE_OPUS_ID = "anthropic.claude-opus-5-5[1m]"
+CLAUDE_HAIKU_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+def claude_result_fixture(**overrides: object) -> dict[str, object]:
+    event: dict[str, object] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 3,
+        "duration_ms": 61234,
+        "duration_api_ms": 58000,
+        "session_id": SEAT_SESSION_SENTINEL,
+        "total_cost_usd": 1.2345,
+        "usage": {
+            "input_tokens": 20,
+            "cache_creation_input_tokens": 65113,
+            "cache_read_input_tokens": 129646,
+            "output_tokens": 4278,
+            "output_tokens_details": {"thinking_tokens": 3108},
+            "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 0},
+            "service_tier": "standard",
+            "cache_creation": {
+                "ephemeral_1h_input_tokens": 65000,
+                "ephemeral_5m_input_tokens": 113,
+            },
+            "inference_geo": "",
+            "iterations": [],
+            "speed": "standard",
+        },
+        "modelUsage": {
+            CLAUDE_OPUS_ID: {
+                "inputTokens": 18, "outputTokens": 4200, "cacheReadInputTokens": 129646,
+                "cacheCreationInputTokens": 65000, "webSearchRequests": 2, "costUSD": 1.2,
+                "contextWindow": 1000000, "maxOutputTokens": 64000, "thinkingTokens": 3100,
+                "canonicalModel": "claude-opus-5-5", "provider": "bedrock", "costBasis": "list",
+            },
+            CLAUDE_HAIKU_ID: {
+                "inputTokens": 2, "outputTokens": 78, "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 113, "webSearchRequests": 0, "costUSD": 0.0345,
+                "contextWindow": 200000, "maxOutputTokens": 32000, "thinkingTokens": 8,
+                "canonicalModel": "claude-haiku-4-5", "provider": "bedrock", "costBasis": "list",
+            },
+        },
+        "permission_denials": [],
+        "terminal_reason": "completed",
+        "result": json.dumps(SEAT_REPORT),
+        "structured_output": {**SEAT_REPORT, "review_completion": "complete"},
+        "uuid": SEAT_SESSION_SENTINEL,
+    }
+    event.update(overrides)
+    return event
+
+
+CLAUDE_FIXTURE_METRICS = {
+    "model_actual": CLAUDE_OPUS_ID,
+    "model_actual_source": "engine_reported",
+    "effort": "xhigh",
+    "effort_source": "cli",
+    "service_tier": "standard",
+    "service_tier_source": "engine_reported",
+    "tokens": {
+        "source": "claude_result",
+        "complete": True,
+        "input_includes_cache": False,
+        "input_tokens": 20,
+        "cache_read_tokens": 129646,
+        "cache_write_tokens": 65113,
+        "cache_write_5m_tokens": 113,
+        "cache_write_1h_tokens": 65000,
+        "output_tokens": 4278,
+        "reasoning_tokens": 3108,
+        "input_total_tokens": 20 + 129646 + 65113,
+        "web_search_requests": 2,
+        "web_fetch_requests": 0,
+    },
+    "cost_usd": 1.2345,
+    "cost_source": "engine_reported",
+    "model_usage": {
+        CLAUDE_OPUS_ID: {
+            "input_tokens": 18, "output_tokens": 4200, "cache_read_tokens": 129646,
+            "cache_write_tokens": 65000, "reasoning_tokens": 3100, "web_search_requests": 2,
+            "cost_usd": 1.2, "canonical_model": "claude-opus-5-5", "provider": "bedrock",
+            "cost_basis": "list",
+        },
+        CLAUDE_HAIKU_ID: {
+            "input_tokens": 2, "output_tokens": 78, "cache_read_tokens": 0,
+            "cache_write_tokens": 113, "reasoning_tokens": 8, "web_search_requests": 0,
+            "cost_usd": 0.0345, "canonical_model": "claude-haiku-4-5", "provider": "bedrock",
+            "cost_basis": "list",
+        },
+    },
+}
+CODEX_FIXTURE_USAGE = {
+    "input_tokens": 112000,
+    "cached_input_tokens": 40000,
+    "cache_write_input_tokens": 71000,
+    "output_tokens": 13400,
+    "reasoning_output_tokens": 13100,
+}
+
+
+def codex_events_fixture(usage: dict[str, object], *extra: dict[str, object]) -> str:
+    events = [
+        {"type": "thread.started", "thread_id": SEAT_SESSION_SENTINEL},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": SEAT_TEXT_SENTINEL}},
+        {"type": "turn.completed", "usage": usage},
+        *extra,
+    ]
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+SEAT_TOKEN_COUNT_KEYS = (
+    "input_tokens", "cache_read_tokens", "cache_write_tokens", "cache_write_5m_tokens",
+    "cache_write_1h_tokens", "output_tokens", "reasoning_tokens", "input_total_tokens",
+    "web_search_requests", "web_fetch_requests",
+)
+
+
+class AutoreviewSeatMetricsTests(unittest.TestCase):
+    def assert_no_engine_text(self, value: object) -> None:
+        serialized = json.dumps(value)
+        self.assertNotIn(SEAT_SESSION_SENTINEL, serialized)
+        self.assertNotIn(SEAT_TEXT_SENTINEL, serialized)
+
+    def test_claude_result_records_actual_model_tokens_cost_and_tier(self) -> None:
+        metrics = AUTOREVIEW.claude_process_metrics(
+            argparse.Namespace(thinking="xhigh"), json.dumps(claude_result_fixture()),
+        )
+        self.assertEqual(metrics, CLAUDE_FIXTURE_METRICS)
+        self.assert_no_engine_text(metrics)
+
+    def test_claude_stream_json_and_event_arrays_yield_the_same_metrics(self) -> None:
+        args = argparse.Namespace(thinking="xhigh")
+        event = claude_result_fixture()
+        stream = "\n".join(json.dumps(item) for item in (
+            {"type": "system", "subtype": "init", "model": CLAUDE_OPUS_ID},
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": SEAT_TEXT_SENTINEL}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }},
+            event,
+        )) + "\n"
+        for stdout in (stream, json.dumps([{"type": "system"}, event]), "progress\n" + stream):
+            with self.subTest(stdout=stdout[:24]):
+                self.assertEqual(
+                    AUTOREVIEW.claude_process_metrics(args, stdout), CLAUDE_FIXTURE_METRICS,
+                )
+
+    def test_claude_dominant_model_is_the_model_that_ran(self) -> None:
+        # A smaller helper model in modelUsage must not be reported as the reviewer.
+        event = claude_result_fixture()
+        usage = event["modelUsage"]
+        assert isinstance(usage, dict)
+        event["modelUsage"] = dict(reversed(list(usage.items())))
+        metrics = AUTOREVIEW.claude_process_metrics(argparse.Namespace(thinking=None), json.dumps(event))
+        self.assertEqual(metrics["model_actual"], CLAUDE_OPUS_ID)
+        self.assertIsNone(metrics["effort"])
+        self.assertIsNone(metrics["effort_source"])
+
+    def test_claude_without_a_result_event_is_unknown_not_zero(self) -> None:
+        for stdout in (
+            "",
+            "not json",
+            json.dumps(FINAL_REPORT),
+            json.dumps({"terminal_reason": "model_refusal"}),
+            "[" * 2000 + "]" * 2000,
+            json.dumps(claude_result_fixture(usage="bad", modelUsage=[], total_cost_usd="1.0")),
+        ):
+            with self.subTest(stdout=stdout[:24]):
+                metrics = AUTOREVIEW.claude_process_metrics(argparse.Namespace(thinking="high"), stdout)
+                tokens = metrics["tokens"]
+                self.assertEqual(tokens["source"], "claude_result")
+                self.assertFalse(tokens["complete"])
+                for key in SEAT_TOKEN_COUNT_KEYS:
+                    self.assertIsNone(tokens[key], key)
+                for key in ("model_actual", "model_actual_source", "service_tier",
+                            "service_tier_source", "cost_usd", "cost_source", "model_usage"):
+                    self.assertIsNone(metrics[key], key)
+                self.assertEqual((metrics["effort"], metrics["effort_source"]), ("high", "cli"))
+
+    def test_claude_metrics_store_only_numbers_model_ids_and_enums(self) -> None:
+        event = claude_result_fixture(total_cost_usd=-1)
+        usage = event["usage"]
+        assert isinstance(usage, dict)
+        usage["service_tier"] = "Standard Tier\n"
+        event["modelUsage"] = {
+            CLAUDE_OPUS_ID: {
+                "inputTokens": 18, "outputTokens": 4200, "costUSD": 1.2,
+                "canonicalModel": "claude opus\n5", "provider": "Bedrock Runtime!",
+                "costBasis": "x" * 40,
+            },
+            "model id with spaces " + SEAT_TEXT_SENTINEL: {"inputTokens": 5, "outputTokens": 99999},
+            "anthropic.claude-sonnet-5-5": {"inputTokens": -1, "outputTokens": True, "costUSD": "0.1"},
+        }
+        metrics = AUTOREVIEW.claude_process_metrics(argparse.Namespace(thinking="xhigh"), json.dumps(event))
+        self.assertEqual(set(metrics["model_usage"]), {CLAUDE_OPUS_ID, "anthropic.claude-sonnet-5-5"})
+        opus = metrics["model_usage"][CLAUDE_OPUS_ID]
+        self.assertEqual((opus["input_tokens"], opus["output_tokens"], opus["cost_usd"]), (18, 4200, 1.2))
+        self.assertEqual((opus["canonical_model"], opus["provider"], opus["cost_basis"]), (None, None, None))
+        sonnet = metrics["model_usage"]["anthropic.claude-sonnet-5-5"]
+        self.assertEqual((sonnet["input_tokens"], sonnet["output_tokens"], sonnet["cost_usd"]), (None, None, None))
+        self.assertEqual(metrics["model_actual"], CLAUDE_OPUS_ID)
+        self.assertIsNone(metrics["service_tier"])
+        self.assertIsNone(metrics["cost_usd"])
+        self.assertIsNone(metrics["cost_source"])
+        self.assert_no_engine_text(metrics)
+
+    def test_codex_turn_completed_records_cache_write_and_reasoning_without_cost(self) -> None:
+        args = argparse.Namespace(thinking="max", codex_config=None, codex_speed="ultrafast")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = AUTOREVIEW.codex_effective_settings(args, "openai.gpt-6.1-sol", {})
+        metrics = AUTOREVIEW.codex_process_metrics(
+            codex_events_fixture(CODEX_FIXTURE_USAGE), completed=True, settings=settings,
+        )
+        self.assertEqual(metrics, {
+            "model_actual": "openai.gpt-6.1-sol",
+            "model_actual_source": "cli",
+            "effort": "max",
+            "effort_source": "cli",
+            "service_tier": "ultrafast",
+            "service_tier_source": "cli",
+            "tokens": {
+                "source": "codex_turn_completed",
+                "complete": True,
+                "input_includes_cache": True,
+                "input_tokens": 112000,
+                "cache_read_tokens": 40000,
+                "cache_write_tokens": 71000,
+                "cache_write_5m_tokens": None,
+                "cache_write_1h_tokens": None,
+                "output_tokens": 13400,
+                "reasoning_tokens": 13100,
+                "input_total_tokens": 112000,
+                "web_search_requests": None,
+                "web_fetch_requests": None,
+            },
+            "cost_usd": None,
+            "cost_source": None,
+            "model_usage": None,
+        })
+        self.assert_no_engine_text(metrics)
+
+    def test_codex_zero_default_failed_or_unfinished_turns_are_incomplete(self) -> None:
+        zero = dict.fromkeys(CODEX_FIXTURE_USAGE, 0)
+        no_cache_write = {key: value for key, value in CODEX_FIXTURE_USAGE.items()
+                          if key != "cache_write_input_tokens"}
+        for label, stdout, completed, complete, input_tokens, cache_write in (
+            ("zero-default", codex_events_fixture(zero), True, False, None, None),
+            ("turn-failed", codex_events_fixture(CODEX_FIXTURE_USAGE, {"type": "turn.failed"}), True, False, 112000, 71000),
+            ("process-failed", codex_events_fixture(CODEX_FIXTURE_USAGE), False, False, 112000, 71000),
+            ("no-output", "", False, False, None, None),
+            ("older-codex", codex_events_fixture(no_cache_write), True, True, 112000, None),
+            ("malformed", '{"type":"turn.completed","usage":{"input_tokens":true}}', True, False, None, None),
+        ):
+            with self.subTest(label=label):
+                tokens = AUTOREVIEW.codex_process_metrics(
+                    stdout, completed=completed, settings={},
+                )["tokens"]
+                self.assertEqual(tokens["complete"], complete)
+                self.assertEqual(tokens["input_tokens"], input_tokens)
+                self.assertEqual(tokens["input_total_tokens"], input_tokens)
+                self.assertEqual(tokens["cache_write_tokens"], cache_write)
+
+    def test_codex_effective_settings_follow_the_command_precedence(self) -> None:
+        profile = {"model": "openai.gpt-6.1-sol", "model_reasoning_effort": "max", "service_tier": "ultrafast"}
+
+        def namespace(**values: object) -> argparse.Namespace:
+            return argparse.Namespace(**{"thinking": None, "codex_config": None, "codex_speed": None, **values})
+
+        for label, args, model, settings, env, expected in (
+            ("profile-owned", namespace(), None, profile, {},
+             ("openai.gpt-6.1-sol", "codex_profile", "max", "codex_profile", "ultrafast", "codex_profile")),
+            ("cli-over-profile", namespace(thinking="high", codex_config=['service_tier="flex"', "model_reasoning_effort='low'"]),
+             "gpt-6-sol", profile, {},
+             ("gpt-6-sol", "cli", "high", "cli", "flex", "codex_config")),
+            ("speed-over-config", namespace(codex_config=['model_reasoning_effort="low"', 'service_tier="flex"'], codex_speed="fast"),
+             None, profile, {},
+             ("openai.gpt-6.1-sol", "codex_profile", "low", "codex_config", "fast", "cli")),
+            ("env-speed", namespace(), "gpt-6.1-sol", {}, {"AUTOREVIEW_CODEX_SPEED": "default"},
+             ("gpt-6.1-sol", "cli", None, None, "default", "cli")),
+            ("engine-defaults", namespace(), "gpt-6.1-sol", {}, {},
+             ("gpt-6.1-sol", "cli", None, None, None, None)),
+        ):
+            with self.subTest(label=label), mock.patch.dict(os.environ, env, clear=True):
+                result = AUTOREVIEW.codex_effective_settings(args, model, settings)
+                self.assertEqual(
+                    tuple(result[key] for key in (
+                        "model_actual", "model_actual_source", "effort", "effort_source",
+                        "service_tier", "service_tier_source",
+                    )),
+                    expected,
+                )
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
+    def test_codex_profile_settings_come_from_the_staged_runtime_profile(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-seat-profile-test.") as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            codex_home = root / "codex-home"
+            runtime_home = root / "runtime-codex-home"
+            repo.mkdir()
+            codex_home.mkdir()
+            (codex_home / "autoreview-bedrock.config.toml").write_text(
+                'model = "openai.gpt-6.1-sol"\nmodel_provider = "amazon-bedrock"\n'
+                'model_reasoning_effort = "max"\nservice_tier = "ultrafast"\n'
+                'approval_policy = "never"\n',
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(codex_profile="autoreview-bedrock")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                self.assertTrue(AUTOREVIEW.prepare_codex_runtime_profile(args, repo, runtime_home))
+            self.assertEqual(
+                AUTOREVIEW.codex_staged_profile_settings(args, runtime_home),
+                {"model": "openai.gpt-6.1-sol", "model_reasoning_effort": "max", "service_tier": "ultrafast"},
+            )
+            self.assertEqual(
+                AUTOREVIEW.codex_staged_profile_settings(argparse.Namespace(codex_profile=None), runtime_home),
+                {},
+            )
+
+    def test_report_usage_keeps_its_four_token_fields_when_codex_reports_cache_writes(self) -> None:
+        args = argparse.Namespace()
+        AUTOREVIEW.record_codex_usage(args, codex_events_fixture(CODEX_FIXTURE_USAGE))
+        self.assertEqual(AUTOREVIEW.review_usage_summary(args)["tokens"], {
+            "input_tokens": 112000, "cached_input_tokens": 40000,
+            "output_tokens": 13400, "reasoning_output_tokens": 13100,
+        })
+
+    def test_seat_verdict_counts_accepted_provider_and_rejected_findings(self) -> None:
+        provider = copy.deepcopy(SEAT_REPORT)
+        report = copy.deepcopy(provider)
+        AUTOREVIEW.filter_findings_by_priority(report, "P2")
+        # The published report status stays computed once (#257); seats store its inputs.
+        with mock.patch.object(AUTOREVIEW, "review_status") as status:
+            verdict = AUTOREVIEW.seat_verdict_metadata(report, provider, "complete")
+        status.assert_not_called()
+        self.assertEqual(verdict, {
+            "verdict": "patch is incorrect",
+            "review_completion": "complete",
+            "overall_confidence": 0.7,
+            "findings_by_priority": {"P0": 0, "P1": 1, "P2": 0, "P3": 0},
+            "provider_findings_by_priority": {"P0": 0, "P1": 1, "P2": 0, "P3": 1},
+            "findings_rejected": {"out_of_scope": 0, "attribution": 0, "below_max_priority": 1},
+        })
+        clean = copy.deepcopy(FINAL_REPORT)
+        clean["scope_rejected_findings"] = [copy.deepcopy(SEAT_REPORT["findings"][0])]
+        clean["attribution_rejected_findings"] = copy.deepcopy(SEAT_REPORT["findings"])
+        verdict = AUTOREVIEW.seat_verdict_metadata(clean, copy.deepcopy(SEAT_REPORT), "incomplete")
+        self.assertEqual(
+            (verdict["verdict"], verdict["review_completion"], verdict["findings_rejected"]),
+            ("patch is correct", "incomplete", {"out_of_scope": 1, "attribution": 2, "below_max_priority": 0}),
+        )
+        self.assertEqual(verdict["findings_by_priority"], dict.fromkeys(("P0", "P1", "P2", "P3"), 0))
+        self.assert_no_engine_text(verdict)
+
+    def run_evidence(self, root: Path, **overrides: object) -> tuple[argparse.Namespace, object]:
+        repo = root / "repo"
+        repo.mkdir()
+        args = AutoreviewRunHistoryTests.args(**overrides)
+        with mock.patch.object(AUTOREVIEW, "current_branch", return_value="main"), \
+                mock.patch.object(AUTOREVIEW, "git", return_value="abc123"):
+            evidence = AUTOREVIEW.RunEvidence(args, repo, "local", None, [args], root=root / "history")
+        args.run_evidence = evidence
+        return args, evidence
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
+    def test_run_metadata_sums_every_process_of_a_seat_and_keeps_attempt_detail(self) -> None:
+        refusal = claude_result_fixture(
+            terminal_reason="model_refusal",
+            total_cost_usd=0.5,
+            usage={"input_tokens": 3, "cache_creation_input_tokens": 60000,
+                   "cache_read_input_tokens": 0, "output_tokens": 12, "service_tier": "standard"},
+            modelUsage={"claude-fable-5-1": {"inputTokens": 3, "outputTokens": 12,
+                                             "cacheCreationInputTokens": 60000, "costUSD": 0.5}},
+        )
+        with tempfile.TemporaryDirectory(prefix="autoreview-seat-history-test.") as tmpdir:
+            args, evidence = self.run_evidence(
+                Path(tmpdir), engine="claude", model="claude-fable-5", thinking="high",
+            )
+            index = evidence.start_reviewer(args, 1)
+            AUTOREVIEW.record_seat_process_metrics(
+                args, lambda: AUTOREVIEW.claude_process_metrics(args, json.dumps(refusal)),
+            )
+            evidence.transition_claude_attempt(
+                index, args, model="claude-fable-5", thinking="high",
+                reason="refusal_retry", returncode=0,
+            )
+            AUTOREVIEW.record_seat_process_metrics(
+                args, lambda: AUTOREVIEW.claude_process_metrics(args, json.dumps(claude_result_fixture())),
+            )
+            provider = copy.deepcopy(SEAT_REPORT)
+            report = copy.deepcopy(provider)
+            AUTOREVIEW.filter_findings_by_priority(report, "P2")
+            evidence.finish_reviewer(
+                index, status="completed", findings=len(report["findings"]),
+                verdict=AUTOREVIEW.seat_verdict_metadata(report, provider, "complete"),
+            )
+            evidence.finish(1)
+            metadata = json.loads(evidence.metadata_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(metadata["schema_version"], 1)
+        self.assertEqual(metadata["seat_metrics_version"], 1)
+        attempts = metadata["attempts"]
+        self.assertEqual([attempt["reviewer_run_id"] for attempt in attempts], [1, 1])
+        self.assertEqual([attempt["cost_usd"] for attempt in attempts], [0.5, 1.2345])
+        self.assertEqual([attempt["model_actual"] for attempt in attempts], ["claude-fable-5-1", CLAUDE_OPUS_ID])
+        self.assertEqual(attempts[1]["tokens"], CLAUDE_FIXTURE_METRICS["tokens"])
+        seat = metadata["reviewer_runs"][0]
+        self.assertEqual(seat["model"], "claude-fable-5")
+        self.assertEqual(seat["model_requested"], "claude-fable-5")
+        self.assertEqual((seat["model_actual"], seat["model_actual_source"]), (CLAUDE_OPUS_ID, "engine_reported"))
+        self.assertEqual((seat["effort"], seat["effort_source"]), ("high", "cli"))
+        self.assertEqual((seat["service_tier"], seat["service_tier_source"]), ("standard", "engine_reported"))
+        self.assertAlmostEqual(seat["cost_usd"], 1.7345)
+        self.assertEqual(seat["cost_source"], "engine_reported")
+        self.assertEqual(seat["tokens"]["output_tokens"], 12 + 4278)
+        self.assertEqual(seat["tokens"]["cache_write_tokens"], 60000 + 65113)
+        self.assertEqual(seat["tokens"]["input_total_tokens"], 3 + 60000 + 20 + 129646 + 65113)
+        self.assertEqual(seat["tokens"]["cache_write_5m_tokens"], 113)
+        self.assertTrue(seat["tokens"]["complete"])
+        self.assertEqual(set(seat["model_usage"]), {"claude-fable-5-1", CLAUDE_OPUS_ID, CLAUDE_HAIKU_ID})
+        self.assertEqual(seat["verdict"], "patch is incorrect")
+        self.assertEqual(seat["findings_rejected"], {"out_of_scope": 0, "attribution": 0, "below_max_priority": 1})
+        self.assertEqual(seat["findings_by_priority"], {"P0": 0, "P1": 1, "P2": 0, "P3": 0})
+        self.assertEqual(seat["provider_findings_by_priority"], {"P0": 0, "P1": 1, "P2": 0, "P3": 1})
+        self.assertEqual(seat["findings"], 1)
+        self.assertEqual(seat["finding_disposition"]["pending"], 1)
+        self.assert_no_engine_text(metadata)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
+    def test_failed_seat_keeps_observed_usage_and_records_no_verdict(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-seat-failed-test.") as tmpdir:
+            args, evidence = self.run_evidence(Path(tmpdir), codex_speed=None)
+            index = evidence.start_reviewer(args, 1)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                AUTOREVIEW.record_seat_process_metrics(args, lambda: AUTOREVIEW.codex_process_metrics(
+                    codex_events_fixture(CODEX_FIXTURE_USAGE), completed=False,
+                    settings=AUTOREVIEW.codex_effective_settings(args, args.model, {}),
+                ))
+            evidence.finish_reviewer(index, status="failed", error="codex engine failed (17)")
+            # A seat whose process never launched has no usage at all.
+            unlaunched = evidence.start_reviewer(args, 2)
+            evidence.finish_reviewer(unlaunched, status="failed", error="refused before launch")
+            evidence.finish(1, error_type="SystemExit")
+            metadata = json.loads(evidence.metadata_path.read_text(encoding="utf-8"))
+
+        failed, never_ran = metadata["reviewer_runs"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["tokens"]["complete"])
+        self.assertEqual(failed["tokens"]["output_tokens"], 13400)
+        self.assertEqual((failed["model_requested"], failed["model_actual"]), ("gpt-6-astra", "gpt-6-astra"))
+        self.assertEqual((failed["effort"], failed["effort_source"]), ("max", "cli"))
+        self.assertIsNone(failed["cost_usd"])
+        for key in ("verdict", "review_completion", "overall_confidence",
+                    "findings_by_priority", "provider_findings_by_priority", "findings_rejected"):
+            self.assertIsNone(failed[key], key)
+            self.assertIsNone(never_ran[key], key)
+        for key in ("tokens", "model_actual", "effort", "service_tier", "cost_usd", "model_usage"):
+            self.assertIsNone(never_ran[key], key)
+        self.assertEqual(never_ran["model_requested"], "gpt-6-astra")
+
+    def test_metric_recording_failures_never_fail_the_review(self) -> None:
+        evidence = mock.Mock(spec=AUTOREVIEW.RunEvidence)
+        evidence.record_process_metrics.side_effect = OSError("disk full")
+        args = argparse.Namespace(run_evidence=evidence, run_evidence_reviewer_index=0)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            AUTOREVIEW.record_seat_process_metrics(args, lambda: {"tokens": None})
+            AUTOREVIEW.record_seat_process_metrics(args, lambda: 1 / 0)
+        self.assertEqual(stderr.getvalue().count("seat metrics not recorded"), 2)
+        self.assertNotIn("disk full", stderr.getvalue())
+        # Without run evidence nothing is parsed or recorded.
+        AUTOREVIEW.record_seat_process_metrics(argparse.Namespace(), lambda: 1 / 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
+    def test_history_reader_summarizes_runs_that_carry_seat_metrics(self) -> None:
+        loader = SourceFileLoader("autoreview_history_module", str(SCRIPT_PATH.with_name("autoreview-history")))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None
+        history = importlib.util.module_from_spec(spec)
+        loader.exec_module(history)
+        with tempfile.TemporaryDirectory(prefix="autoreview-seat-reader-test.") as tmpdir:
+            args, evidence = self.run_evidence(Path(tmpdir), engine="claude", model="claude-opus-5-5", thinking="xhigh")
+            index = evidence.start_reviewer(args, 1)
+            AUTOREVIEW.record_seat_process_metrics(
+                args, lambda: AUTOREVIEW.claude_process_metrics(args, json.dumps(claude_result_fixture())),
+            )
+            evidence.finish_reviewer(
+                index, status="completed", findings=2,
+                verdict=AUTOREVIEW.seat_verdict_metadata(SEAT_REPORT, SEAT_REPORT, "complete"),
+            )
+            evidence.finish(1)
+            summary = history.summarize(history.load_runs(evidence.root), None)
+        (configuration,) = summary["configurations"]
+        self.assertEqual(configuration["model"], "claude-opus-5-5")
+        self.assertEqual(configuration["findings_reported"], 2)
+        self.assertEqual(configuration["completed"], 1)
+
+
 class AutoreviewKimiRefusalTests(unittest.TestCase):
     @contextlib.contextmanager
     def no_engine_activity(self):

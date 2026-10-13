@@ -88,7 +88,9 @@ billing estimate or a cache-hit promise. Missing telemetry, including Codex's
 all-zero defaults when no sample exists, is unknown, never measured zero;
 `tokens: null` means no attempt supplied usable totals. When `complete` is false,
 available totals are a lower bound. Interrupted runs print retained usage but
-still publish no status or review report. Other engines do not yet aggregate usage.
+still publish no status or review report. Other engines do not aggregate report
+usage; private run history records per-seat Claude and Codex usage (see
+[Seat metrics in run history](#seat-metrics-in-run-history)).
 
 ```json
 {
@@ -130,3 +132,47 @@ outcome was published, never a clean review. No retry policy is added.
 
 Report material findings and status plainly. Do not add transcripts, proof
 ledgers, commits, pushes, or a new workstream unless requested.
+
+## Seat metrics in run history
+
+Run metadata with `seat_metrics_version: 1` adds these fields to every
+`reviewer_runs` entry (a seat: one reviewer on one review pass) and every
+`attempts` entry (one engine process, linked by `reviewer_run_id`). `null`
+means not reported or not applicable, never zero. `schema_version` stays 1 and
+existing fields keep their meaning, so older readers are unaffected.
+
+- `model_requested`: the model the seat asked for; null when a Codex profile
+  chose it. `model` keeps its existing meaning and follows fallbacks.
+- `model_actual`, `model_actual_source`: Claude reports it (`engine_reported`,
+  the `modelUsage` model with the most output). Codex reports no model, so this
+  is the `--model` it received (`cli`) or the staged profile's model
+  (`codex_profile`).
+- `effort`, `effort_source`, `service_tier`, `service_tier_source`: Codex values
+  follow its command precedence (`cli`, then `codex_config`, then
+  `codex_profile`; null is the engine default). The Codex tier is the requested
+  tier because Codex does not echo the applied one. Claude reports
+  `usage.service_tier` (`engine_reported`); its effort is the `--effort` passed.
+- `tokens`: `input_tokens`, `cache_read_tokens`, `cache_write_tokens` (Claude
+  adds `cache_write_5m_tokens` and `cache_write_1h_tokens`), `output_tokens`,
+  `reasoning_tokens` (a subset of output), `input_total_tokens`, and Claude's
+  `web_search_requests` and `web_fetch_requests`. `input_includes_cache` is true
+  for Codex, whose `input_tokens` already contains cached and cache-written
+  prompt tokens, and false for Claude, so compare `input_total_tokens` across
+  engines. `complete` is false when a process lacked terminal usage; totals are
+  then a lower bound.
+- `cost_usd`, `cost_source`: Claude Code's `total_cost_usd` (`engine_reported`;
+  `model_usage` keeps each model's `cost_basis`, for example `list`). Codex
+  reports no cost, so it stays null. Cost is never estimated.
+- `model_usage`: Claude's per-model tokens and cost.
+- Seats only: `verdict` (the provider's `overall_correctness`),
+  `review_completion`, `overall_confidence`, `findings_by_priority` (accepted
+  findings, matching `findings`), `provider_findings_by_priority` (every finding
+  the model returned), and `findings_rejected` (`out_of_scope`, `attribution`,
+  `below_max_priority`). These are the inputs of the published `review_status`,
+  which is still computed once per run. Failed seats keep observed usage and
+  leave them null.
+
+A seat sums its processes, including refusal retries and access or route
+fallbacks; its model, effort, and tier come from its last process. Only counts,
+costs, model ids, and short enums are stored, never prompts, report text,
+session ids, or environment values. Amp and Pi seats carry the fields as null.

@@ -449,7 +449,10 @@ for local stage observation, output paths, exit codes, status, and usage.
 ## Private run history
 
 Owner-only metadata records model, effort, route, duration, retries, refusals,
-service tier, and outcome. `--no-run-log` disables it. Set
+service tier, and outcome, plus per-seat tokens, engine-reported cost, the model
+that actually ran, and each seat's verdict and finding counts (see
+[seat metrics](references/diagnostics-and-results.md#seat-metrics-in-run-history)).
+`--no-run-log` disables it. Set
 `AUTOREVIEW_RUN_LOG_DIR` to an external private history root; set
 `AUTOREVIEW_RUN_LOG_BUNDLE=1` to retain scanner-approved bundles, prompts, and
 final reports. Do not store history inside the reviewed repository or commit it.
