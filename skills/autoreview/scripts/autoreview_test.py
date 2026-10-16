@@ -259,6 +259,112 @@ class AutoreviewImageEvidenceTests(unittest.TestCase):
             AUTOREVIEW.stage_review_images(Path(tmpdir), (image,))
 
 
+class AutoreviewCodexTelemetryTests(unittest.TestCase):
+    """The operator's [otel] table reaches Codex reviewers only as a local-relay export."""
+
+    RELAY = """
+[otel]
+environment = "macbook"
+log_user_prompt = true
+log_agent_responses = true
+
+[otel.tool_result]
+max_bytes = 65536
+
+[otel.exporter.otlp-http]
+endpoint = "http://127.0.0.1:4319/v1/logs"
+protocol = "binary"
+
+[otel.trace_exporter.otlp-http]
+endpoint = "http://127.0.0.1:4319/v1/traces"
+protocol = "binary"
+
+[otel.metrics_exporter.otlp-http]
+endpoint = "http://127.0.0.1:4319/v1/metrics"
+protocol = "binary"
+"""
+
+    def flags_for(self, config_text: str) -> list[str]:
+        with tempfile.TemporaryDirectory(prefix="autoreview-otel.") as tmpdir:
+            root = Path(tmpdir)
+            repo, codex_home = root / "repo", root / "codex-home"
+            repo.mkdir()
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text('model = "x"\n' + config_text, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                return AUTOREVIEW.codex_telemetry_flags(repo)
+
+    def test_relay_export_is_projected(self) -> None:
+        flags = self.flags_for(self.RELAY)
+        values = flags[1::2]
+        self.assertEqual(flags[0::2], ["-c"] * len(values))
+        self.assertIn('otel.environment="macbook"', values)
+        self.assertIn("otel.log_user_prompt=true", values)
+        self.assertIn("otel.log_agent_responses=true", values)
+        self.assertIn("otel.tool_result.max_bytes=65536", values)
+        self.assertIn('otel.exporter={otlp-http={endpoint="http://127.0.0.1:4319/v1/logs",protocol="binary"}}', values)
+        self.assertIn('otel.trace_exporter={otlp-http={endpoint="http://127.0.0.1:4319/v1/traces",protocol="binary"}}', values)
+        self.assertIn('otel.metrics_exporter={otlp-http={endpoint="http://127.0.0.1:4319/v1/metrics",protocol="binary"}}', values)
+
+    def test_anything_but_a_plain_local_export_disables_telemetry(self) -> None:
+        cases = {
+            "header": self.RELAY + '\n[otel.exporter.otlp-http.headers]\nauthorization = "Bearer x"\n',
+            "tls": self.RELAY + '\n[otel.trace_exporter.otlp-http.tls]\nca-certificate = "/tmp/ca.pem"\n',
+            "remote endpoint": self.RELAY.replace("http://127.0.0.1:4319/v1/logs", "http://10.100.75.61:4318/v1/logs"),
+            "lookalike host": self.RELAY.replace("127.0.0.1:4319/v1/logs", "127.0.0.1.evil.test:4319/v1/logs"),
+            "wrong signal path": self.RELAY.replace("4319/v1/traces", "4319/v1/logs"),
+            "unknown key": self.RELAY.replace("[otel]\n", "[otel]\nmetrics_extra = true\n"),
+            "grpc exporter": '[otel]\nexporter = { otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }\n',
+            "unsafe environment": self.RELAY.replace('environment = "macbook"', 'environment = "a\\"b"'),
+            "scalar exporter spec": '[otel]\nexporter = { otlp-http = 1 }\n',
+            "list exporter spec": '[otel]\ntrace_exporter = { otlp-http = ["http://127.0.0.1:4319/v1/traces"] }\n',
+            "scalar tool_result": self.RELAY.replace("[otel.tool_result]\nmax_bytes = 65536", "[otel.x]\n").replace("[otel]\n", "[otel]\ntool_result = 5\n"),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.flags_for(text), [])
+
+    def test_no_otel_table_means_no_flags(self) -> None:
+        self.assertEqual(self.flags_for(""), [])
+
+    def test_exporter_none_is_kept(self) -> None:
+        text = '[otel]\nexporter = "none"\n\n[otel.trace_exporter.otlp-http]\nendpoint = "http://localhost:4319/v1/traces"\nprotocol = "json"\n'
+        values = self.flags_for(text)[1::2]
+        self.assertIn('otel.exporter="none"', values)
+        self.assertIn('otel.trace_exporter={otlp-http={endpoint="http://localhost:4319/v1/traces",protocol="json"}}', values)
+
+    def test_resource_attributes_are_marked_and_validated(self) -> None:
+        with mock.patch.dict(os.environ, {"OTEL_RESOURCE_ATTRIBUTES": "host.name=macbook,enduser.id=ctebou,agent.harness=x"}):
+            self.assertEqual(AUTOREVIEW.codex_telemetry_resource_attributes(),
+                             "host.name=macbook,enduser.id=ctebou,agent.harness=autoreview")
+        with mock.patch.dict(os.environ, {"OTEL_RESOURCE_ATTRIBUTES": "host.name=a b,x=$(id)"}):
+            self.assertIsNone(AUTOREVIEW.codex_telemetry_resource_attributes())
+        # Only the identity attributes travel: a credential-shaped pair never reaches the reviewer.
+        with mock.patch.dict(os.environ, {"OTEL_RESOURCE_ATTRIBUTES": "host.name=macbook,api.token=example-secret,enduser.id=ctebou"}):
+            self.assertEqual(AUTOREVIEW.codex_telemetry_resource_attributes(),
+                             "host.name=macbook,enduser.id=ctebou,agent.harness=autoreview")
+        env = {k: v for k, v in os.environ.items() if k != "OTEL_RESOURCE_ATTRIBUTES"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(AUTOREVIEW.codex_telemetry_resource_attributes(), "agent.harness=autoreview")
+
+    def test_codex_command_carries_the_telemetry_flags(self) -> None:
+        args = argparse.Namespace(codex_bin="codex", web_search=False, thinking="high",
+            stream_engine_output=False, codex_config=None, codex_speed=None)
+        with tempfile.TemporaryDirectory(prefix="autoreview-otel-cmd.") as tmpdir:
+            root = Path(tmpdir)
+            repo, codex_home = root / "repo", root / "codex-home"
+            repo.mkdir()
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(self.RELAY, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                    mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"):
+                command = AUTOREVIEW.codex_command(args, repo, root, root, root / "schema.json",
+                    root / "output.json", "gpt-6-sol", auth_config=[])
+        self.assertIn('otel.environment="macbook"', command)
+        self.assertLess(command.index('otel.environment="macbook"'), command.index("exec"))
+        self.assertIn("--ignore-user-config", command)
+
+
 class AutoreviewImageGitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

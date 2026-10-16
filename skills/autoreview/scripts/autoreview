@@ -5009,6 +5009,92 @@ def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
     ]
 
 
+# Codex telemetry. The operator's [otel] table reaches the reviewer only when it is a plain
+# export to a local relay: known keys, a loopback http endpoint at each signal's own path,
+# no headers and no TLS settings. The relay on the operator's machine holds any collector
+# credential (dotfiles scripts/otlp-spool), so nothing secret enters the run and the
+# reviewer cannot be pointed at anything but the operator's machine. Any other [otel] table
+# and the run exports nothing; the review itself is unaffected either way.
+CODEX_TELEMETRY_SIGNALS = {"exporter": "logs", "trace_exporter": "traces", "metrics_exporter": "metrics"}
+CODEX_TELEMETRY_KEYS = {"environment", "log_user_prompt", "log_agent_responses", "tool_result", *CODEX_TELEMETRY_SIGNALS}
+CODEX_TELEMETRY_ENDPOINT = re.compile(r"http://(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})/v1/(logs|traces|metrics)")
+CODEX_TELEMETRY_ENVIRONMENT = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# OTEL_RESOURCE_ATTRIBUTES as the fleet sets it (host.name=...,enduser.id=...): plain
+# key=value pairs. Only the identity attributes are forwarded, so a credential-shaped
+# pair in the operator's value never reaches the reviewer or its telemetry.
+RESOURCE_ATTRIBUTES = re.compile(r"[A-Za-z0-9._-]{1,64}=[A-Za-z0-9._@-]{0,128}(?:,[A-Za-z0-9._-]{1,64}=[A-Za-z0-9._@-]{0,128}){0,15}")
+RESOURCE_ATTRIBUTE_KEYS = ("host.name", "enduser.id")
+
+
+def codex_telemetry_flags(repo: Path) -> list[str]:
+    source_home = codex_source_home(repo)
+    if source_home is None:
+        return []
+    config_path = source_home / "config.toml"
+    if not external_env_path(repo, str(config_path)):
+        return []
+    otel = load_codex_auth_config(config_path).get("otel")
+    if not isinstance(otel, dict) or set(otel) - CODEX_TELEMETRY_KEYS:
+        return []
+    flags: list[str] = []
+    environment = otel.get("environment")
+    if environment is not None:
+        if not isinstance(environment, str) or not CODEX_TELEMETRY_ENVIRONMENT.fullmatch(environment):
+            return []
+        flags += ["-c", f"otel.environment={toml_string(environment)}"]
+    for key in ("log_user_prompt", "log_agent_responses"):
+        if key in otel:
+            if type(otel[key]) is not bool:
+                return []
+            flags += ["-c", f"otel.{key}={'true' if otel[key] else 'false'}"]
+    if "tool_result" in otel:
+        tool_result = otel["tool_result"]
+        if (
+            not isinstance(tool_result, dict)
+            or set(tool_result) != {"max_bytes"}
+            or type(tool_result["max_bytes"]) is not int
+            or not 0 <= tool_result["max_bytes"] <= 1 << 20
+        ):
+            return []
+        flags += ["-c", f"otel.tool_result.max_bytes={tool_result['max_bytes']}"]
+    exporters = 0
+    for kind, signal in CODEX_TELEMETRY_SIGNALS.items():
+        if kind not in otel:
+            continue
+        spec = otel[kind]
+        if spec == "none":
+            flags += ["-c", f'otel.{kind}="none"']
+            continue
+        if not isinstance(spec, dict) or set(spec) != {"otlp-http"}:
+            return []
+        http = spec["otlp-http"]
+        if not isinstance(http, dict):
+            return []
+        endpoint = http.get("endpoint")
+        protocol = http.get("protocol", "binary")
+        match = CODEX_TELEMETRY_ENDPOINT.fullmatch(endpoint) if isinstance(endpoint, str) else None
+        if (
+            set(http) - {"endpoint", "protocol"}
+            or match is None
+            or match.group(2) != signal
+            or not 0 < int(match.group(1)) < 65536
+            or protocol not in ("binary", "json")
+        ):
+            return []
+        flags += ["-c", f"otel.{kind}={{otlp-http={{endpoint={toml_string(endpoint)},protocol={toml_string(protocol)}}}}}"]
+        exporters += 1
+    return flags if exporters else []
+
+
+def codex_telemetry_resource_attributes() -> str | None:
+    """The operator's OTEL_RESOURCE_ATTRIBUTES, marked as an autoreview run."""
+    raw = os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "").strip()
+    if raw and not RESOURCE_ATTRIBUTES.fullmatch(raw):
+        return None
+    pairs = [pair for pair in raw.split(",") if pair.partition("=")[0] in RESOURCE_ATTRIBUTE_KEYS]
+    return ",".join([*pairs, "agent.harness=autoreview"])
+
+
 def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
     config: dict[str, Any] = {}
     pending_key: str | None = None
@@ -5133,6 +5219,9 @@ def codex_engine_env(
             value = os.environ.get(key)
             if value is not None:
                 env[key] = value
+    resource = codex_telemetry_resource_attributes()
+    if resource is not None:
+        env["OTEL_RESOURCE_ATTRIBUTES"] = resource
     return env
 
 
@@ -6097,6 +6186,7 @@ def codex_command(
     if speed_override is not None:
         cmd.extend(["-c", speed_override])
     cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
+    cmd.extend(codex_telemetry_flags(source_repo))
     if auth_config is None:
         auth_config = prepare_codex_inference_config(
             load_codex_inference_route(
