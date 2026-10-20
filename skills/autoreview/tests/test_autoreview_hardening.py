@@ -1579,19 +1579,19 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
                 self.assertNotIn(".env", captured.text)
                 self.assertNotIn("FORMER_BINARY_BYTES", captured.text)
 
-    def test_gitlink_deletions_remain_refused(self):
+    def test_gitlink_deletions_include_metadata(self):
         with self.asset_repo() as (repo, _asset, base):
             git(repo, "update-index", "--add", "--cacheinfo", f"160000,{base},dependency")
             git(repo, "commit", "-qm", "gitlink base")
             base = git(repo, "rev-parse", "HEAD").strip()
             git(repo, "update-index", "--force-remove", "dependency")
             for ref in (None, base):
-                with self.assertRaisesRegex(SystemExit, "gitlink/submodule changes"):
-                    self.helper["local_bundle"](repo, ref)
+                self.assertIn('"new": {"mode": "000000", "sha": null',
+                              self.helper["local_bundle"](repo, ref).text)
             git(repo, "commit", "-qm", "remove gitlink")
             for target in ("branch", "commit"):
-                with self.assertRaisesRegex(SystemExit, "gitlink/submodule changes"):
-                    self.helper["build_bundle"](repo, target, base, "HEAD")
+                self.assertIn('"new": {"mode": "000000", "sha": null',
+                              self.helper["build_bundle"](repo, target, base, "HEAD").text)
 
     def test_readdition_during_bundle_capture_prevents_reviewer_start(self):
         with self.asset_repo() as (repo, asset, _base):
@@ -2671,7 +2671,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.write_text("TOKEN=changed-placeholder\n", encoding="utf-8")
             git(repo, "add", path.name)
 
-            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
 
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
 
@@ -2689,7 +2689,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 path.write_text("placeholder=true\n", encoding="utf-8")
                 (repo / "review.py").write_text("print('review me')\n", encoding="utf-8")
 
-                bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+                bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
 
                 self.assertIn("# Review Input Omissions", bundle)
                 self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
@@ -2736,7 +2736,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["local_bundle"].__globals__,
                 {"read_file_bytes": read_once},
             ):
-                bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+                bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
 
             expected_record = json.dumps("review me" + os.linesep)
             self.assertIn(
@@ -3028,7 +3028,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             snapshot = self.helper["source_tree_snapshot"](repo)
             git(repo, "update-ref", "refs/heads/review-base", "HEAD")
             self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
-            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo, pinned)
+            bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo, pinned)
             self.assertIn("+committed task change", bundle)
             self.assertEqual(
                 self.helper["build_bundle"](repo, target, pinned, "HEAD").paths,
@@ -3050,7 +3050,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 if staged:
                     git(repo, "add", safe)
                 with self.subTest(staged=staged):
-                    bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+                    bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
                     self.assertIn("struct CredentialFile", bundle)
                     self.assertIn(safe, self.helper["local_bundle"](repo).paths)
                     for label in ("--dataset", "--prompt-file"):
@@ -3632,7 +3632,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
                 self.helper["branch_bundle"](repo, base)
 
-    def test_gitlink_changes_are_blocked_in_all_modes(self) -> None:
+    def test_gitlink_additions_include_metadata_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             tracked = repo / "tracked.txt"
@@ -3648,15 +3648,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 "--cacheinfo",
                 f"160000,{base},vendor/dependency",
             )
+            (repo / "vendor" / "dependency").mkdir(parents=True)
             for local_base in (None, base):
-                with self.subTest(base=local_base), self.assertRaisesRegex(SystemExit, "gitlink/submodule changes"):
-                    self.helper["local_bundle"](repo, local_base)
+                with self.subTest(base=local_base):
+                    self.assertIn('"sha": "' + base + '"',
+                                  self.helper["local_bundle"](repo, local_base).text)
 
             git(repo, "commit", "-q", "-m", "add gitlink")
-            with self.assertRaisesRegex(SystemExit, "gitlink/submodule changes"):
-                self.helper["commit_bundle"](repo, "HEAD")
-            with self.assertRaisesRegex(SystemExit, "gitlink/submodule changes"):
-                self.helper["branch_bundle"](repo, base)
+            self.assertIn("# Gitlink Pin Changes", self.helper["commit_bundle"](repo, "HEAD").text)
+            self.assertIn("# Gitlink Pin Changes", self.helper["branch_bundle"](repo, base).text)
 
     def test_gitlink_guard_parses_combined_raw_modes(self) -> None:
         raw_diff = (
@@ -3669,8 +3669,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + " MM\0vendor/dependency\0"
         )
 
-        with self.assertRaisesRegex(SystemExit, "gitlink/submodule changes"):
-            self.helper["require_no_gitlink_diff"]("merge diff", raw_diff)
+        with self.assertRaisesRegex(SystemExit, "unsupported gitlink diff metadata"):
+            self.helper["gitlink_records"](raw_diff)
 
     def test_codex_config_rejects_capability_bearing_overrides(self) -> None:
         for override in (
@@ -4714,14 +4714,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             (repo / ".env").write_text("placeholder=true\n", encoding="utf-8")
             (repo / "base.txt").write_text("base\nreview me\n", encoding="utf-8")
             git(repo, "add", ".env", "base.txt")
-            local, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+            local, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], local)
             self.assertNotIn(".env", local)
             self.assertNotIn("placeholder=true", local)
             self.assertIn("+review me", local)
 
             git(repo, "commit", "-q", "-m", "sensitive path")
-            for bundle, paths, _mixed, _spans, _commit, _images in (
+            for bundle, paths, _mixed, _spans, _commit, _images, _base in (
                 self.helper["branch_bundle"](repo, base),
                 self.helper["commit_bundle"](repo, "HEAD"),
             ):
@@ -4741,16 +4741,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             workflow = repo / ".github" / "workflows" / "secret-scan.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text("name: Secret scan\n", encoding="utf-8")
-            untracked_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+            untracked_bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
             self.assertIn("secret-scan.yml", untracked_bundle)
 
             git(repo, "add", str(workflow.relative_to(repo)))
-            tracked_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+            tracked_bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
             self.assertIn("secret-scan.yml", tracked_bundle)
 
             git(repo, "commit", "-q", "-m", "add secret scanner")
-            branch_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["branch_bundle"](repo, base)
-            commit_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["commit_bundle"](repo, "HEAD")
+            branch_bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["branch_bundle"](repo, base)
+            commit_bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["commit_bundle"](repo, "HEAD")
             self.assertIn("secret-scan.yml", branch_bundle)
             self.assertIn("secret-scan.yml", commit_bundle)
 
@@ -4818,7 +4818,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_text(source, encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
 
             self.assertIn("ordinary-hardcoded-value-12345", bundle)
 
@@ -5090,7 +5090,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             git(repo, "add", "-u")
             git(repo, "commit", "-q", "-m", "delete template")
 
-            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["branch_bundle"](repo, base)
+            bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["branch_bundle"](repo, base)
 
             self.assertIn("deleted file mode 100644", bundle)
             self.assertIn("------BEGIN [A-Z ]+-----", bundle)
@@ -5250,7 +5250,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             path.write_text('const request = { token: String() };\n', encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit, _images, _base = self.helper["local_bundle"](repo)
 
             self.assertIn('-const request = { token: "test-token" };', bundle)
 
@@ -5594,6 +5594,56 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(PureWindowsPath(argv[0]).is_absolute())
         self.assertNotEqual(argv[0], "taskkill")
         proc.kill.assert_not_called()
+
+    def test_successful_windows_taskkill_still_waits_for_owned_processes(self) -> None:
+        for batched in (False, True):
+            for force_required in (False, True):
+                with self.subTest(batched=batched, force_required=force_required):
+                    events = []
+                    processes = []
+                    for pid in ((1234, 5678) if batched else (1234,)):
+                        proc = mock.Mock(pid=pid, returncode=None)
+                        proc.poll.side_effect = lambda proc=proc: proc.returncode
+
+                        def wait(*, timeout, proc=proc):
+                            events.append(("wait", proc.pid))
+                            self.assertGreater(timeout, 0)
+                            if force_required and not proc.kill.called:
+                                raise subprocess.TimeoutExpired("reviewer", timeout)
+                            proc.returncode = 1
+                            return proc.returncode
+
+                        proc.wait.side_effect = wait
+                        processes.append(proc)
+
+                    def taskkill(argv, **kwargs):
+                        events.append(("signal", int(argv[2])))
+                        # Success can precede the owned handle becoming signaled.
+                        self.assertTrue(all(proc.returncode is None for proc in processes))
+                        return subprocess.CompletedProcess(argv, 0)
+
+                    with mock.patch.object(os, "name", "nt"), mock.patch.dict(
+                        self.helper["terminate_process_group"].__globals__,
+                        {"_resolve_windows_taskkill": lambda: r"C:\Windows\System32\taskkill.exe"},
+                    ), mock.patch("subprocess.run", side_effect=taskkill):
+                        if batched:
+                            for proc in processes:
+                                self.helper["register_owned_process"](proc)
+                            try:
+                                self.helper["terminate_owned_processes"]()
+                            finally:
+                                for proc in processes:
+                                    self.helper["unregister_owned_process"](proc)
+                        else:
+                            self.helper["terminate_process_group"](processes[0])
+
+                    self.assertEqual(events[:len(processes)], [
+                        ("signal", proc.pid) for proc in processes
+                    ])
+                    for proc in processes:
+                        self.assertIsNotNone(proc.returncode)
+                        self.assertEqual(proc.wait.call_count, 2 if force_required else 1)
+                        self.assertEqual(proc.kill.call_count, int(force_required))
 
     def test_terminate_process_group_skips_taskkill_when_unresolved(self) -> None:
         proc = mock.Mock(pid=1234)

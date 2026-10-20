@@ -3,14 +3,57 @@
 ## Unreleased
 
 - Record per-seat efficiency metrics in Autoreview's private run history (`seat_metrics_version: 1`): tokens by type, engine-reported cost (Claude; Codex reports none), requested and actually-run model, effort, service tier, and each seat's verdict and finding counts by priority, summed across refusal retries and fallbacks. Additive only; review behavior is unchanged.
+- Check report output readiness before starting Autoreview, preserving existing reports and refusing unusable destinations early. Thanks @JeanFrancoisGagne.
+- Run native macOS sandbox and Git-boundary CI checks on the `xcode-27` Apple Silicon image.
+
+## 0.6.0 - 2026-10-18
+
+- Allow release tags signed by @vincentkoc's registered SSH signing key alongside the existing release signer.
+
+- Wait for owned Windows reviewer processes after successful tree termination, preserving deadline cleanup and exit-status collection.
+
+- Review submodule gitlink additions, bumps and removals as exact pin metadata with selected `.gitmodules` URLs, preserving isolated Git/authentication and explicit upstream-code scope.
+
+- Run OpenClaw reviews through restricted agent execution, preserving canonical capture and validation with a bounded sandbox handoff; clarify yielding and process ownership. Thanks @shakkernerd. (#323, #325, #326)
+- Document independent Copilot subagent reviews when the Codex CLI is unavailable, keeping model access separate from local CLI availability. Thanks @shanselman. (#324)
+
+- Prevent both PowerShell review launchers from importing unrelated modules while searching for Python. Qualify copied source archives on Python 3.10/3.11 and native Windows PowerShell, including real optional Pillow/tomli branches without model calls.
+
+- Document pinned source installation and explicit upgrades/rollback; cover copy/symlink replacement, external state preservation, and installed Autoreview help without changing installer behavior.
+
+- Add optional Autoreview preflight summaries for clean committed branch reviews, preserving native reports, status, and exit codes without another model call or GitHub write.
+- Add `autoreview --version` to identify the executing helper's source bytes without review preparation, configuration reads or output changes.
+
+- Preserve existing output files during Autoreview dry runs, including when target selection or preflight fails; real reviews still clear stale status before starting.
+
+- Make this repository's ClawSweeper reviews opt-in for maintainer PRs and issues, with a one-time reminder; clarify when agents should request hosted reviews in the shared Autoreview skill.
+
+- Isolate Autoreview's configured command-auth provider from subscription credentials so an expired subscription cannot break a working direct-provider retry.
+
+- Accept and project `supports_websockets` on Autoreview's named command-auth OpenAI route, so reviews use the Responses WebSocket transport instead of re-uploading the full prompt on every step.
+
+- Skip Autoreview's first Codex subscription attempt when a local login-status probe confirms no login and a validated configured provider is available; keep subscription-first behavior on probe errors or timeouts.
+
+- Keep Autoreview's Codex subscription route first, allow 401 recovery before stopping repeated or definite authentication failures, and retry once on the operator's validated configured command-auth provider.
+
+- Tighten Crabbox instructions and shared review references into terse wording while preserving rules, examples, commands, and anchors.
+
+- Shorten Autoreview and Crabbox's core instructions, move specialized guidance to on-demand references, and make CI/local-first proof with immediately available boxes explicit.
+
+- Default Autoreview's Codex reviewer to medium reasoning on the Ultrafast tier; `--thinking`, `--codex-speed`, their environment variables, and a raw `service_tier` override still take precedence.
+
+## 0.5.0 - 2026-10-11
+
+**Highlights:** Start shared Gateway worktree sessions with the new team-handoff skill, use Ultrafast Autoreview, and share one review installation across repositories.
+
+- Add `team-handoff`: start a worktree session on a shared OpenClaw Gateway behind Cloudflare Access as the operator's own identity in one `sessions.create` request, with status/archive helpers and an opt-in SSH operator fallback.
+- Accept `ultrafast` for Autoreview's `--codex-speed` and `AUTOREVIEW_CODEX_SPEED`, sending Codex the Ultrafast service tier when the active model catalog lists it.
+- Use one shared autoreview installation across repositories through thin Markdown entrypoints instead of vendored implementations and tests.
 - Weigh Autoreview findings by likelihood, impact, and fix complexity: the reviewer skips theoretical races and rare recoverable edge cases, and callers may decline unlikely findings with a stated tradeoff.
+- Skip inaccessible executable search candidates during Autoreview preflight while preserving explicit executable selection and repository-path rejection. Thanks @vincentkoc.
+- Preserve Crabline's Windows review launcher, Python 3.10 interpreter probing, complete malicious-fixture expectations, and harness cleanup failure reporting in the canonical skill. Thanks @vincentkoc.
 - Update development Node.js types to 26.6.5 and the native macOS sandbox-test Codex CLI to 0.162.1.
 - Update development Node.js types to 26.6.4 and the native macOS sandbox-test Codex CLI to 0.160.1.
-- Skip inaccessible executable search candidates during Autoreview preflight while preserving explicit executable selection and repository-path rejection. Thanks @vincentkoc.
-- Use one shared autoreview installation across repositories through thin Markdown entrypoints instead of vendored implementations and tests.
-- Preserve Crabline's Windows review launcher, Python 3.10 interpreter probing, complete malicious-fixture expectations, and harness cleanup failure reporting in the canonical skill. Thanks @vincentkoc.
-- Accept `ultrafast` for Autoreview's `--codex-speed` and `AUTOREVIEW_CODEX_SPEED`, sending Codex the Ultrafast service tier when the active model catalog lists it.
-- Add `team-handoff`: start a worktree session on a shared OpenClaw Gateway behind Cloudflare Access as the operator's own identity in one `sessions.create` request, with status/archive helpers and an opt-in SSH operator fallback.
 
 ## 0.4.0 - 2026-09-30
 

@@ -19,14 +19,18 @@ MAIN = HELPER["main"]
 MODULES = [
     "skills/autoreview/scripts/autoreview_test.py",
     "skills.autoreview.tests.test_autoreview_hardening",
+    "skills.autoreview.tests.test_native_handoff",
+    "skills.autoreview.tests.test_openclaw_exec",
     "skills.autoreview.tests.test_codex_sandbox",
     "skills.autoreview.tests.test_codex_inference_route",
     "skills.autoreview.tests.test_git_line_endings",
     "skills.autoreview.tests.test_git_boundary",
+    "skills.autoreview.tests.test_gitlinks",
     "skills.autoreview.tests.test_git_filter_collection",
     "skills.autoreview.tests.test_engine_stage",
     "skills.autoreview.tests.test_terminal_report_authority",
     "skills.autoreview.tests.test_output_path_interpretation",
+    "skills.autoreview.tests.test_output_readiness",
     "skills.autoreview.tests.test_review_harness",
 ]
 

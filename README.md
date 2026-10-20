@@ -138,6 +138,15 @@ this checkout once to update every symlinked consumer. Copy-mode installations
 need `python3 scripts/install-skills --mode copy --force autoreview` after the
 source update. Review runs do not download or update code automatically.
 
+For pinned source archives, upgrade/rollback steps, and copy-versus-symlink
+identity limits, see [source installation](docs/RELEASING.md#installing-a-pinned-source).
+
+To compare installed helper content, run
+`python3 ~/.agents/skills/autoreview/scripts/autoreview --version` (use your
+custom install path when applicable). The output is `autoreview source-sha256:`
+followed by the helper's SHA-256. It does not identify a release or the full skill
+and does not read configuration, invoke Git or a reviewer, or write reports.
+
 ## Zero-Setup Repos
 
 Some important repos should work for contributors who only cloned that repo and
@@ -204,7 +213,7 @@ python scripts/check-skills
 The check command runs frontmatter validation, syntax checks, all Python and
 Node tests, and `npm run typecheck` for the session viewer. The Node packages
 are development-only; installed skills do not need `npm install`. The separate
-macOS CI job installs a pinned Codex CLI to exercise native sandbox access
+macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Codex CLI to exercise native sandbox access
 controls without a reviewer account or provider request.
 
 For a quick frontmatter-only check, run `scripts/validate-skills`. It checks
