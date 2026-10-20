@@ -245,7 +245,10 @@ The selector must match `model_provider` in the operator's external
 `CODEX_HOME/config.toml`. It accepts one bare or simply quoted identifier;
 provider definitions and other capabilities cannot be supplied through overrides.
 Projection requires Python 3.11 or `tomli`; default auth-only operation retains
-its existing fallback parser.
+its existing fallback parser. When a Codex profile or provider route is requested
+on an older interpreter, the helper reruns itself once under a trusted
+`python3.11`+ found the same way as its other executables (never one inside the
+reviewed checkout); without one, the refusal stands.
 
 The selected route must use `https://api.openai.com/v1` and command authentication
 with an absolute external executable. Fixed arguments belong in that executable's

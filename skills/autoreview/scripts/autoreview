@@ -30,7 +30,7 @@ import time
 import unicodedata
 import urllib.parse
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
 
@@ -10218,6 +10218,86 @@ def main_with_args(args: argparse.Namespace) -> int:
     return exit_code
 
 
+PYTHON_REEXEC_ENV = "AUTOREVIEW_PYTHON_REEXEC"
+TOML_CAPABLE_PYTHONS = ("python3.14", "python3.13", "python3.12", "python3.11")
+
+
+def codex_operator_route_requested(argv: Sequence[str], env: Mapping[str, str]) -> bool:
+    """Whether this invocation reads operator TOML strictly: a Codex profile or provider route.
+
+    Mirrors the parser's own defaults (--engine from AUTOREVIEW_ENGINE, the
+    profile options from their AUTOREVIEW_ variables) so every other run keeps
+    its interpreter and its exact output.
+    """
+    def values(option: str) -> list[str]:
+        found = []
+        for index, argument in enumerate(argv):
+            if argument == option and index + 1 < len(argv):
+                found.append(argv[index + 1])
+            elif argument.startswith(f"{option}="):
+                found.append(argument.split("=", 1)[1])
+        return found
+
+    engines = values("--engine")
+    if (engines[-1] if engines else env.get("AUTOREVIEW_ENGINE", "codex")) != "codex":
+        return False
+    def chosen(option: str, variable: str) -> str:
+        # An explicit option, even an empty one, overrides its environment default.
+        given = values(option)
+        return (given[-1] if given else env.get(variable, "")).strip()
+
+    if chosen("--codex-profile", "AUTOREVIEW_CODEX_PROFILE") or chosen(
+        "--codex-fallback-profile", "AUTOREVIEW_CODEX_FALLBACK_PROFILE"
+    ):
+        return True
+    return any("model_provider" in value for value in values("--codex-config"))
+
+
+def toml_capable_python(repo: Path) -> str | None:
+    """Return a trusted Python 3.11+ to rerun under when this one cannot read TOML.
+
+    Codex operator routes (profiles, provider projection) need tomllib or
+    tomli, and without them the review is refused late in preparation, after
+    the bundle is built. macOS ships /usr/bin/python3 as 3.9. Candidates
+    resolve like every other helper executable, so an interpreter inside the
+    reviewed checkout is never chosen.
+    """
+    if sys.version_info >= (3, 11) or os.environ.get(PYTHON_REEXEC_ENV):
+        return None
+    try:
+        import tomli  # noqa: F401
+    except ModuleNotFoundError:
+        pass
+    else:
+        return None
+    for name in TOML_CAPABLE_PYTHONS:
+        found = find_command(name, repo)
+        if found:
+            return found
+    return None
+
+
+def reexec_with_toml_capable_python() -> None:
+    if not codex_operator_route_requested(sys.argv[1:], os.environ):
+        return
+    start = Path.cwd().resolve()
+    target = toml_capable_python(discover_repo_root(start) or start)
+    if target is None:
+        return
+    flags = ["-I"] if sys.flags.isolated else [
+        *(["-E"] if sys.flags.ignore_environment else []),
+        *(["-s"] if sys.flags.no_user_site else []),
+    ]
+    print(
+        f"autoreview: Python {sys.version_info.major}.{sys.version_info.minor} "
+        f"cannot read TOML operator routes; rerunning under {display_escape(target, 1000)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    os.environ[PYTHON_REEXEC_ENV] = "1"
+    os.execv(target, [target, *flags, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+
+
 def sanitized_main() -> int:
     stdout = ProxyRedactedOutput(sys.stdout)
     stderr = ProxyRedactedOutput(sys.stderr)
@@ -10248,4 +10328,5 @@ def sanitized_main() -> int:
 
 
 if __name__ == "__main__":
+    reexec_with_toml_capable_python()
     raise SystemExit(sanitized_main())

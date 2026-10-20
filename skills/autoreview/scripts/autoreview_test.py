@@ -3942,6 +3942,80 @@ class AutoreviewExecutableDiscoveryTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"AUTOREVIEW_GIT": str(denied / "git")}):
                     self.assertFalse(AUTOREVIEW.preflight_git())
 
+    def test_old_python_picks_a_trusted_newer_python_outside_the_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            inside = repo / "bin"
+            trusted = root / "trusted"
+            for directory in (inside, trusted):
+                directory.mkdir(parents=True)
+                candidate = directory / "python3.11"
+                candidate.write_text("#!/bin/sh\nexit 0\n")
+                candidate.chmod(0o755)
+            search = os.pathsep.join((str(inside), str(trusted)))
+            with mock.patch.object(AUTOREVIEW, "DEFAULT_ENGINE_PATHS", []), \
+                    mock.patch.dict(os.environ, {"PATH": search}), \
+                    mock.patch.dict(sys.modules, {"tomli": None}):
+                os.environ.pop(AUTOREVIEW.PYTHON_REEXEC_ENV, None)
+                with mock.patch.object(AUTOREVIEW.sys, "version_info", (3, 9, 6)):
+                    # The checkout's own python3.11 comes first on PATH and is skipped.
+                    self.assertEqual(AUTOREVIEW.toml_capable_python(repo), str(trusted / "python3.11"))
+                    with mock.patch.dict(os.environ, {"PATH": str(inside)}):
+                        self.assertIsNone(AUTOREVIEW.toml_capable_python(repo))
+                    with mock.patch.dict(os.environ, {AUTOREVIEW.PYTHON_REEXEC_ENV: "1"}):
+                        self.assertIsNone(AUTOREVIEW.toml_capable_python(repo))
+                    with mock.patch.dict(sys.modules, {"tomli": type(sys)("tomli")}):
+                        self.assertIsNone(AUTOREVIEW.toml_capable_python(repo))
+                with mock.patch.object(AUTOREVIEW.sys, "version_info", (3, 11, 0)):
+                    self.assertIsNone(AUTOREVIEW.toml_capable_python(repo))
+
+    def test_only_codex_operator_routes_trigger_a_rerun(self) -> None:
+        requested = AUTOREVIEW.codex_operator_route_requested
+        self.assertFalse(requested(["--mode", "local"], {}))
+        self.assertTrue(requested(["--codex-profile", "bedrock"], {}))
+        self.assertTrue(requested(["--codex-profile=bedrock"], {}))
+        self.assertTrue(requested(["--codex-fallback-profile", "runtime"], {}))
+        self.assertTrue(requested([], {"AUTOREVIEW_CODEX_PROFILE": "bedrock"}))
+        self.assertTrue(requested([], {"AUTOREVIEW_CODEX_FALLBACK_PROFILE": "runtime"}))
+        self.assertTrue(requested(["--codex-config", 'model_provider="review_api"'], {}))
+        self.assertFalse(requested(["--codex-config", 'model_reasoning_summary="auto"'], {}))
+        self.assertFalse(requested(["--codex-profile", " "], {}))
+        # An explicit empty option clears its environment default, as the parser does.
+        self.assertFalse(requested(["--codex-profile", ""], {"AUTOREVIEW_CODEX_PROFILE": "bedrock"}))
+        self.assertFalse(requested(["--codex-fallback-profile="], {"AUTOREVIEW_CODEX_FALLBACK_PROFILE": "runtime"}))
+        self.assertTrue(requested(["--codex-profile", ""], {"AUTOREVIEW_CODEX_FALLBACK_PROFILE": "runtime"}))
+        self.assertFalse(requested(["--engine", "claude"], {"AUTOREVIEW_CODEX_PROFILE": "bedrock"}))
+        self.assertFalse(requested([], {"AUTOREVIEW_ENGINE": "claude", "AUTOREVIEW_CODEX_PROFILE": "bedrock"}))
+        self.assertTrue(requested(["--engine=codex"], {"AUTOREVIEW_ENGINE": "claude", "AUTOREVIEW_CODEX_PROFILE": "bedrock"}))
+
+    def test_rerun_execs_the_same_script_and_arguments_once(self) -> None:
+        execs = []
+
+        def fake_execv(path, argv):
+            execs.append((path, list(argv), os.environ.get(AUTOREVIEW.PYTHON_REEXEC_ENV)))
+            raise SystemExit(0)
+
+        stderr = io.StringIO()
+        with mock.patch.object(AUTOREVIEW, "toml_capable_python", return_value="/opt/py/bin/python3.11"), \
+                mock.patch.object(AUTOREVIEW.os, "execv", fake_execv), \
+                mock.patch.object(AUTOREVIEW.sys, "argv",
+                                  ["autoreview", "--codex-profile", "bedrock", "--mode", "local"]), \
+                mock.patch.object(AUTOREVIEW.sys, "stderr", stderr), \
+                mock.patch.dict(os.environ, {}):
+            with self.assertRaises(SystemExit):
+                AUTOREVIEW.reexec_with_toml_capable_python()
+        path, argv, guard = execs[0]
+        self.assertEqual(path, "/opt/py/bin/python3.11")
+        self.assertEqual(argv[0], "/opt/py/bin/python3.11")
+        self.assertEqual(argv[-5:], [os.path.abspath("autoreview"), "--codex-profile", "bedrock", "--mode", "local"])
+        self.assertEqual(guard, "1")
+        self.assertIn("rerunning under /opt/py/bin/python3.11", stderr.getvalue())
+        with mock.patch.object(AUTOREVIEW, "toml_capable_python", return_value=None), \
+                mock.patch.object(AUTOREVIEW.os, "execv", fake_execv):
+            AUTOREVIEW.reexec_with_toml_capable_python()
+        self.assertEqual(len(execs), 1)
+
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
     def test_default_reviewer_uses_sol_61_high_with_sol_6_access_retry(self) -> None:
