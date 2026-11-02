@@ -984,7 +984,7 @@ class AutoreviewSingleEngineRoutingTests(unittest.TestCase):
     def test_explicit_aws_routes_keep_verified_model_defaults(self) -> None:
         for auth, model, effort in (
             ("bedrock", "global.anthropic.claude-fable-5-1[1m]", "high"),
-            ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
+            ("mantle", "anthropic.claude-opus-5-5[1m]", "high"),
         ):
             with self.subTest(auth=auth), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
                 sys, "argv", ["autoreview", "--engine", "claude", "--claude-auth", auth,
@@ -1193,11 +1193,11 @@ class AutoreviewSingleEngineRoutingTests(unittest.TestCase):
             [
                 ("global.anthropic.claude-fable-5-1[1m]", "high", "bedrock"),
                 ("global.anthropic.claude-fable-5-1[1m]", "high", "bedrock"),
-                ("anthropic.claude-opus-5-5[1m]", "max", "mantle"),
+                ("anthropic.claude-opus-5-5[1m]", "high", "mantle"),
             ],
         )
         self.assertEqual(args.actual_model, "anthropic.claude-opus-5-5[1m]")
-        self.assertEqual(args.actual_thinking, "max")
+        self.assertEqual(args.actual_thinking, "high")
         self.assertEqual(args.actual_claude_auth, "mantle")
 
     @unittest.skipIf(os.name == "nt", "POSIX mode assertions")
@@ -1687,11 +1687,11 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
 
         return mock.Mock(side_effect=fake_run_engine), observed
 
-    def test_default_mantle_route_is_opus_5_5_xhigh(self) -> None:
+    def test_default_mantle_route_is_opus_5_5_high(self) -> None:
         reviewer = route_reviewer(CLAUDE_MANTLE_ARGV, MANTLE_ENV)
         self.assertEqual(
             (reviewer.claude_auth, reviewer.model, reviewer.thinking),
-            ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
+            ("mantle", "anthropic.claude-opus-5-5[1m]", "high"),
         )
         bare = route_reviewer(
             [*CLAUDE_MANTLE_ARGV, "--model", "claude-opus-5-5"], MANTLE_ENV,
@@ -1712,8 +1712,8 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
 
         self.assertTrue(result.complete)
         self.assertEqual(observed, [
-            ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
-            ("subscription", "claude-opus-5-5", "xhigh"),
+            ("mantle", "anthropic.claude-opus-5-5[1m]", "high"),
+            ("subscription", "claude-opus-5-5", "high"),
         ])
         self.assertIn(
             "claude route mantle failed (engine_failed: claude engine failed (1)); "
@@ -2035,18 +2035,18 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
                 "anthropic.claude-fable-5-1[1m]",
                 [refusal, refusal, failure, success],
                 [
-                    ("mantle", "anthropic.claude-fable-5-1[1m]", "xhigh"),
-                    ("mantle", "anthropic.claude-fable-5-1[1m]", "xhigh"),
-                    ("mantle", "anthropic.claude-opus-5-5[1m]", "max"),
-                    ("subscription", "claude-fable-5-1", "xhigh"),
+                    ("mantle", "anthropic.claude-fable-5-1[1m]", "high"),
+                    ("mantle", "anthropic.claude-fable-5-1[1m]", "high"),
+                    ("mantle", "anthropic.claude-opus-5-5[1m]", "high"),
+                    ("subscription", "claude-fable-5-1", "high"),
                 ],
             ),
             (
                 "anthropic.claude-opus-5-5[1m]",
                 [refusal, success],
                 [
-                    ("mantle", "anthropic.claude-opus-5-5[1m]", "xhigh"),
-                    ("subscription", "claude-opus-5-5", "xhigh"),
+                    ("mantle", "anthropic.claude-opus-5-5[1m]", "high"),
+                    ("subscription", "claude-opus-5-5", "high"),
                 ],
             ),
         ):
@@ -2227,7 +2227,7 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
 
         self.assertEqual(metadata["reviewers"][0]["route_fallback"], {
             "auth": "subscription", "profile": None,
-            "model": "claude-opus-5-5", "thinking": "xhigh",
+            "model": "claude-opus-5-5", "thinking": "high",
         })
         attempts = [
             (attempt["reason"], attempt["status"], attempt["auth"], attempt["model"],
@@ -2235,19 +2235,19 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
             for attempt in metadata["attempts"]
         ]
         self.assertEqual(attempts, [
-            ("primary", "failed", "mantle", "anthropic.claude-opus-5-5[1m]", "xhigh", 7),
-            ("route_fallback", "completed", "subscription", "claude-opus-5-5", "xhigh", 0),
+            ("primary", "failed", "mantle", "anthropic.claude-opus-5-5[1m]", "high", 7),
+            ("route_fallback", "completed", "subscription", "claude-opus-5-5", "high", 0),
         ])
         self.assertNotIn("region", metadata["attempts"][1])
         self.assertFalse(metadata["attempts"][0]["refusal"])
         run = metadata["reviewer_runs"][0]
         self.assertEqual(
             (run["status"], run["auth"], run["model"], run["thinking"]),
-            ("completed", "subscription", "claude-opus-5-5", "xhigh"),
+            ("completed", "subscription", "claude-opus-5-5", "high"),
         )
         self.assertNotIn("region", run)
         self.assertEqual(run["route_fallback_from"], {
-            "route": "mantle", "model": "anthropic.claude-opus-5-5[1m]", "thinking": "xhigh",
+            "route": "mantle", "model": "anthropic.claude-opus-5-5[1m]", "thinking": "high",
         })
 
     def test_run_evidence_marks_primary_refusal_before_route_fallback(self) -> None:
@@ -2364,10 +2364,10 @@ class AutoreviewRouteFallbackTests(unittest.TestCase):
         ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
             status = AUTOREVIEW.dry_run_preflight(reviewer, [reviewer], Path.cwd(), "local", None)
         self.assertEqual(status, 1)
-        self.assertIn("engine check: claude model=anthropic.claude-opus-5-5[1m] thinking=xhigh OK",
+        self.assertIn("engine check: claude model=anthropic.claude-opus-5-5[1m] thinking=high OK",
                       stdout.getvalue())
         self.assertIn(
-            "route fallback check: claude auth=subscription model=claude-opus-5-5 thinking=xhigh "
+            "route fallback check: claude auth=subscription model=claude-opus-5-5 thinking=high "
             "UNAVAILABLE (claude subscription login missing)",
             stdout.getvalue(),
         )

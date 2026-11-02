@@ -425,7 +425,7 @@ CODEX_ACCESS_FALLBACK_MODELS = {
 DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-fable-5-1[1m]"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "high"
 DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-5-5[1m]"
-DEFAULT_CLAUDE_MANTLE_THINKING = "xhigh"
+DEFAULT_CLAUDE_MANTLE_THINKING = "high"
 # Canonical Claude ids that AWS routes address with a provider prefix.
 CLAUDE_AWS_PREFIXED_MODELS = frozenset(
     {"claude-fable-5", "claude-fable-5-1", "claude-opus-5", "claude-opus-5-5"}
@@ -6737,7 +6737,7 @@ def run_claude_once(
 
 def claude_refusal_fallback_args(args: argparse.Namespace) -> argparse.Namespace:
     fallback = copy.copy(args)
-    fallback.thinking = "max"
+    fallback.thinking = "high"
     fallback.fallback_model = None
     if claude_auth_mode(args) in {"bedrock", "mantle"}:
         fallback.claude_auth = "mantle"

@@ -190,13 +190,13 @@ settings do not.
 Claude accepts `--claude-auth default`, `subscription`, `bedrock`, or `mantle`
 and `--claude-bedrock-region`. Bedrock Runtime and Mantle have different model
 availability; select the model ID and region that work on the chosen route.
-Mantle defaults to `anthropic.claude-opus-5-5[1m]` at `xhigh`; Bedrock Runtime
+Mantle defaults to `anthropic.claude-opus-5-5[1m]` at `high`; Bedrock Runtime
 to `global.anthropic.claude-fable-5-1[1m]` at `high`.
 Explicit auth routes require Claude CLI 2.1.237 or newer.
 
 The retained Fable refusal policy retries a model-refusal result once in a
 fresh Claude session. Only after a second refusal, the same engine may retry
-Opus 5.5 at max effort (through Mantle for Bedrock or Mantle callers). Other
+Opus 5.5 at high effort (through Mantle for Bedrock or Mantle callers). Other
 failures and non-Fable refusals do not trigger this model switch. Each attempt
 and route change is recorded in private run history.
 
