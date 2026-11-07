@@ -136,25 +136,27 @@ verified parent-relative patch; otherwise attribution stays unknown.
 Never switch review hosts after launch or to bypass missing context, isolation failures,
 slowness or rate limits. If no route is eligible, report unavailable.
 
-The helper's Codex engine defaults to **GPT-6.1 Sol (`gpt-6.1-sol`), medium reasoning, Ultrafast**.
+The helper's Codex engine defaults to **GPT-6.1 Sol (`gpt-6.1-sol`), max reasoning, the standard tier**;
+its Claude engine to **Opus 5.5 (`claude-opus-5-5`), high effort** on every route.
 It retries GPT-6 Sol once only for account-access failure, without chaining to Luna.
 Network, rate-limit, capacity, and unsupported-effort errors do not trigger fallback.
 An effort-only override keeps the model. `--engine`, `--model`, and `--thinking`
 override defaults; per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
-Ultrafast requires model-catalog support, otherwise Codex sends the standard tier.
-`--codex-speed fast` selects priority; `default` selects standard. A raw
+Ultrafast is opt-in (`--codex-speed ultrafast`) and requires model-catalog support,
+otherwise Codex sends the standard tier.
+`--codex-speed fast` selects priority; `default` (the default) selects standard. A raw
 `--codex-config service_tier=...` retains its value.
 
 With this fork's `--codex-profile`, the selected profile owns its model, effort,
-and tier: the medium and Ultrafast defaults apply only without a profile, and
+and tier: the max and standard-tier defaults apply only without a profile, and
 explicit `--model`, `--thinking`, `--codex-speed`, or their environment variables
 still override the profile. Codex 0.162.1's bundled Bedrock catalog lists Ultrafast
 for GPT-6 Astra only; a Bedrock profile may name a `model_catalog_json` that adds it
 (the fleet's `autoreview-bedrock` profile does this for GPT-6.1 Sol until Codex
 0.163 ships openai/codex#51794) and the helper stages that catalogue with the
-route. The fleet's `~/.zshenv` selects that profile and `AUTOREVIEW_CODEX_SPEED=ultrafast`
-(GPT-6.1 Sol on Mantle us-east-1 at the Ultrafast tier, xhigh); pass
-`--codex-speed default` for the Standard tier.
+route. The fleet's `~/.zshenv` selects that profile and `AUTOREVIEW_CODEX_SPEED=default`
+(GPT-6.1 Sol on Mantle us-east-1 at max, the Standard tier); pass
+`--codex-speed ultrafast` for the Ultrafast tier.
 
 Read [engine options](references/engines.md) before selecting another model/effort,
 projecting a provider route, or using Claude, Amp, or Pi. Kimi is refused even in
@@ -192,7 +194,7 @@ Claude accepts `--claude-auth default`, `subscription`, `bedrock`, or `mantle`
 and `--claude-bedrock-region`. Bedrock Runtime and Mantle have different model
 availability; select the model ID and region that work on the chosen route.
 Mantle defaults to `anthropic.claude-opus-5-5[1m]` at `high`; Bedrock Runtime
-to `global.anthropic.claude-fable-5-1[1m]` at `high`.
+to `global.anthropic.claude-opus-5-5[1m]` at `high`. Fable is opt-in (`--model`).
 Explicit auth routes require Claude CLI 2.1.237 or newer.
 
 The retained Fable refusal policy retries a model-refusal result once in a

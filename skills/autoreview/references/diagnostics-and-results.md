@@ -149,8 +149,8 @@ existing fields keep their meaning, so older readers are unaffected.
   (`codex_profile`).
 - `effort`, `effort_source`, `service_tier`, `service_tier_source`: Codex values
   follow its command precedence (`cli`, then `codex_config`, then
-  `codex_profile`; null is the engine default). The helper passes its own medium
-  effort and Ultrafast tier defaults as flags when no profile is selected, so
+  `codex_profile`; null is the engine default). The helper passes its own max
+  effort and standard tier defaults as flags when no profile is selected, so
   they are recorded as `cli`. The Codex tier is the requested
   tier because Codex does not echo the applied one. Claude reports
   `usage.service_tier` (`engine_reported`); its effort is the `--effort` passed.

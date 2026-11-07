@@ -413,7 +413,7 @@ PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
 DEFAULT_MODEL_BY_ENGINE = {
     "amp": "openai/gpt-5.6-sol",
     "codex": "gpt-6.1-sol",
-    "claude": "claude-fable-5",
+    "claude": "claude-opus-5-5",
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-6-sol"
 # Access-only Codex retries: the default plus the shipped explicit-selection contracts.
@@ -422,7 +422,7 @@ CODEX_ACCESS_FALLBACK_MODELS = {
     "gpt-6-sol": "gpt-6-luna",
     "gpt-5.6-sol": "gpt-5.6-terra",
 }
-DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-fable-5-1[1m]"
+DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-5-5[1m]"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "high"
 DEFAULT_CLAUDE_MANTLE_MODEL = "anthropic.claude-opus-5-5[1m]"
 DEFAULT_CLAUDE_MANTLE_THINKING = "high"
@@ -441,7 +441,8 @@ CODEX_FALLBACK_AUTH_MODES = ("chatgpt",)
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
-    "codex": "medium",
+    "claude": "high",
+    "codex": "max",
 }
 THINKING_LEVELS_BY_ENGINE = {
     "openclaw": {"off", "minimal", "low", "medium", "high", "xhigh", "max"},
@@ -6199,14 +6200,14 @@ def codex_config_keys(args: argparse.Namespace) -> list[str]:
 
 
 CODEX_SPEEDS = ("fast", "ultrafast", "flex", "default")
-DEFAULT_CODEX_SPEED = "ultrafast"
+DEFAULT_CODEX_SPEED = "default"
 
 
 def codex_speed_override(args: argparse.Namespace) -> str | None:
     speed = getattr(args, "codex_speed", None) or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip() or None
     if speed is None:
         # A raw --codex-config service_tier keeps working, and a Codex profile owns
-        # its tier as it owns its model and effort; otherwise default to Ultrafast.
+        # its tier as it owns its model and effort; otherwise default to the Standard tier.
         if "service_tier" in codex_config_keys(args) or codex_profile_name(args) is not None:
             return None
         speed = DEFAULT_CODEX_SPEED
@@ -8673,7 +8674,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-6.1-sol with an access-only gpt-6-sol retry, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
+        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-6.1-sol with an access-only gpt-6-sol retry, claude=claude-opus-5-5, amp=openai/gpt-5.6-sol.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort override or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max; gpt-6-sol and gpt-6-luna exclude minimal; gpt-6.1-sol and gpt-6-astra require low through max. Claude: low, medium, high, xhigh, max. Amp: none, low, medium, high, xhigh, max. Pi: off, minimal, low, medium, high, xhigh.")
     parser.add_argument(

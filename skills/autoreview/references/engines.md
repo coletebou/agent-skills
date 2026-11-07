@@ -19,8 +19,8 @@ produces no helper-validated machine status or helper isolation guarantees.
 - Honor explicit user engine/model choices. No automatic fallback between engines.
 
 - Override defaults: `--engine`, `--model`, `--thinking`.
-- Codex tier: Ultrafast when active model catalog lists it; otherwise Codex silently
-  sends standard tier. Raw `--codex-config service_tier=...` keeps its value, and
+- Codex tier: standard by default. Ultrafast only when asked (`--codex-speed ultrafast`)
+  and the active model catalog lists it; otherwise Codex silently sends standard tier. Raw `--codex-config service_tier=...` keeps its value, and
   this fork's `--codex-profile` keeps the profile's own tier.
 - `--codex-speed fast`: priority service. `--codex-speed default`: standard tier.
 - Only Claude accepts `--fallback-model`.
