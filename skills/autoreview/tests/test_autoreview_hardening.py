@@ -35,6 +35,38 @@ FIXTURES = Path(__file__).with_name("fixtures")
 PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
 RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
 
+# Many tests here run the helper's main path (in process or as a child process
+# that inherits os.environ). Without this, every such fixture run is recorded
+# in the operator's real private run history (~/.local/state/autoreview/runs),
+# where it was indistinguishable from real reviews in autoreview-history.
+_HISTORY_ISOLATION: tempfile.TemporaryDirectory[str] | None = None
+_HISTORY_ENV_KEYS = ("AUTOREVIEW_RUN_LOG_DIR", "XDG_STATE_HOME")
+_SAVED_HISTORY_ENV: dict[str, str | None] = {}
+
+
+def setUpModule() -> None:
+    global _HISTORY_ISOLATION
+    _HISTORY_ISOLATION = tempfile.TemporaryDirectory(prefix="autoreview-test-history.")
+    root = Path(_HISTORY_ISOLATION.name)
+    for key in _HISTORY_ENV_KEYS:
+        _SAVED_HISTORY_ENV[key] = os.environ.get(key)
+    os.environ["AUTOREVIEW_RUN_LOG_DIR"] = str(root / "runs")
+    os.environ["XDG_STATE_HOME"] = str(root / "state")
+
+
+def tearDownModule() -> None:
+    global _HISTORY_ISOLATION
+    for key, value in _SAVED_HISTORY_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    if _HISTORY_ISOLATION is not None:
+        _HISTORY_ISOLATION.cleanup()
+        _HISTORY_ISOLATION = None
+
+
+
 
 def write_executable(path: Path, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
@@ -269,6 +301,18 @@ def installed_java() -> str | None:
     except OSError:
         return None
     return java if probe.returncode == 0 else None
+
+
+class AutoreviewTestHistoryIsolationTests(unittest.TestCase):
+    def test_default_run_history_resolves_inside_the_module_temp_dir(self) -> None:
+        assert _HISTORY_ISOLATION is not None
+        isolation = Path(_HISTORY_ISOLATION.name).resolve()
+        helper = load_helper()
+        root = Path(helper["default_run_log_root"]()).resolve()
+        self.assertTrue(root.is_relative_to(isolation), root)
+        with mock.patch.dict(os.environ, {"AUTOREVIEW_RUN_LOG_DIR": ""}):
+            fallback = Path(helper["default_run_log_root"]()).resolve()
+        self.assertTrue(fallback.is_relative_to(isolation), fallback)
 
 
 class AutoreviewMixedTargetTests(unittest.TestCase):
